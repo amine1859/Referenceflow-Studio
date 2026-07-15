@@ -2,6 +2,20 @@
 
 RefFlow Studio is a Windows desktop reference-board app for artists, designers, and developers. It provides a floating always-on-top workspace for images, PDFs, notes, sketches, local boards, and visual search.
 
+## Screenshots
+
+### Work directly over Photoshop
+
+![RefFlow Studio references floating over a Photoshop project](screenshots/photoshop-workflow.png)
+
+### Build a flexible floating reference board
+
+![RefFlow Studio with floating images, a note, and a sketch](screenshots/floating-reference-board.png)
+
+### Inspect references and extract color palettes
+
+![RefFlow Studio reference controls and extracted color palette](screenshots/color-palette-tools.png)
+
 ## Features
 
 - Floating pill control panel for quick actions.
