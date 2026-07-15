@@ -33,6 +33,10 @@ RefFlow Studio is a Windows desktop reference-board app for artists, designers, 
 - Windows 10 or later for the packaged app.
 - Node.js 20 or later for development.
 
+## Support RefFlow Studio
+
+RefFlow Studio is free for everyone. If you would like to support ongoing bug fixes, improvements, and new features, you can become a supporter on [Patreon](https://www.patreon.com/RefFlowStudio).
+
 ## Development
 
 Install dependencies:

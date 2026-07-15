@@ -502,6 +502,23 @@ ipcMain.handle('get-launch-context', async () => ({
   shouldRevealPill: !isBackgroundLaunch
 }));
 
+ipcMain.handle('open-external-url', async (_event, targetUrl) => {
+  if (typeof targetUrl !== 'string') return false;
+
+  try {
+    const parsedUrl = new URL(targetUrl);
+    const isAllowedPatreonUrl = parsedUrl.protocol === 'https:' &&
+      (parsedUrl.hostname === 'patreon.com' || parsedUrl.hostname === 'www.patreon.com');
+    if (!isAllowedPatreonUrl) return false;
+
+    await shell.openExternal(parsedUrl.toString());
+    return true;
+  } catch (error) {
+    console.error('Failed to open external URL:', error);
+    return false;
+  }
+});
+
 ipcMain.on('register-global-shortcuts', (event, shortcuts) => {
   globalShortcut.unregisterAll();
   if (!shortcuts) return;

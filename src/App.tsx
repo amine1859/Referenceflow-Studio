@@ -1,7 +1,7 @@
 ﻿import React, { useState, useCallback, useRef, useEffect } from 'react';
 import { 
   Settings, Plus, X, Trash2, Maximize2, Minimize2, Move, Lock, Unlock, SlidersHorizontal, ChevronLeft, ChevronRight, RotateCw, Palette, FileText, Monitor, Check, Edit2, Download,
-  Pin, PinOff, Eye, EyeOff, Edit3, ChevronDown, ChevronUp, PenTool, Eraser, ZoomIn, ZoomOut, Maximize, Bold, Italic, List, Search, Loader2, Link as LinkIcon
+  Pin, PinOff, Eye, EyeOff, Edit3, ChevronDown, ChevronUp, PenTool, Eraser, ZoomIn, ZoomOut, Maximize, Bold, Italic, List, Search, Loader2, Heart, Link as LinkIcon
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import Markdown from 'react-markdown';
@@ -17,6 +17,8 @@ pdfjs.GlobalWorkerOptions.workerSrc = new URL(
   'pdfjs-dist/build/pdf.worker.min.mjs',
   import.meta.url
 ).toString();
+
+const PATREON_URL = 'https://www.patreon.com/RefFlowStudio';
 
 const dataUrlToUint8Array = (dataUrl: string): Uint8Array => {
   const base64 = dataUrl.split(',')[1] || '';
@@ -1863,6 +1865,20 @@ export default function App() {
   };
 
   const getElectron = () => ((window as any).require ? (window as any).require('electron') : null);
+
+  const openSupportPage = async () => {
+    const electron = getElectron();
+    if (electron?.ipcRenderer) {
+      try {
+        const opened = await electron.ipcRenderer.invoke('open-external-url', PATREON_URL);
+        if (opened) return;
+      } catch (error) {
+        console.warn('Could not open the support page in the default browser:', error);
+      }
+    }
+
+    window.open(PATREON_URL, '_blank', 'noopener,noreferrer');
+  };
 
   const sanitizeProjectFolderName = (name: string) =>
     (name || 'board')
@@ -3762,6 +3778,19 @@ export default function App() {
                   </div>
                 </div>
               ))}
+            </div>
+
+            <div className={`pt-3 border-t ${theme === 'light' ? 'border-black/10' : 'border-white/5'}`}>
+              <button
+                onClick={openSupportPage}
+                className="w-full flex items-center justify-center gap-2 rounded-lg border border-pink-500/25 bg-pink-500/10 px-3 py-2.5 text-xs font-semibold text-pink-600 dark:text-pink-300 hover:bg-pink-500 hover:text-white transition-colors"
+                title="Support RefFlow Studio on Patreon"
+              >
+                <Heart className="w-3.5 h-3.5" /> Support RefFlow Studio
+              </button>
+              <p className="mt-2 text-[10px] leading-4 text-center text-slate-500 dark:text-slate-400">
+                Help fund bug fixes, improvements, and new features.
+              </p>
             </div>
             
             <div 
