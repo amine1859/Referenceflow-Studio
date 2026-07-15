@@ -4556,17 +4556,26 @@ export default function App() {
                       }}
                       onDragStart={(event) => {
                         event.stopPropagation();
-                        event.dataTransfer.effectAllowed = 'copy';
-                        event.dataTransfer.setData('text/uri-list', img.url);
                         const electron = getElectron();
                         if (electron?.ipcRenderer) {
+                          // Electron's native file drag replaces Chromium's HTML5
+                          // drag operation. Keeping both alive can leave Chromium
+                          // stuck in a drag session when a desktop app rejects or
+                          // cancels the drop, which makes the cursor and window
+                          // interactions appear permanently grabbed.
+                          event.preventDefault();
                           electron.ipcRenderer.send('start-reference-drag', {
                             id: img.id,
                             source: img.url,
                             cachedPath: dragFilePathsRef.current.get(img.id) || '',
                             type: img.type || 'image'
                           });
+                          return;
                         }
+
+                        // Preserve ordinary browser drag behavior outside Electron.
+                        event.dataTransfer.effectAllowed = 'copy';
+                        event.dataTransfer.setData('text/uri-list', img.url);
                       }}
                     />
                   )}
