@@ -1,0 +1,5135 @@
+﻿import React, { useState, useCallback, useRef, useEffect } from 'react';
+import { 
+  Settings, Plus, X, Trash2, Maximize2, Minimize2, Move, Lock, Unlock, SlidersHorizontal, ChevronLeft, ChevronRight, RotateCw, Palette, FileText, Monitor, Check, Edit2, Download,
+  Pin, PinOff, Eye, EyeOff, Edit3, ChevronDown, ChevronUp, PenTool, Eraser, ZoomIn, ZoomOut, Maximize, Bold, Italic, List, Search, Loader2, Link as LinkIcon
+} from 'lucide-react';
+import { motion, AnimatePresence } from 'motion/react';
+import Markdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
+import { FloatingImage, FloatingNote, FloatingSketch, FloatingSketchLine, Project, getProjects, createProject, updateProject, deleteProject, getActiveProjectId, setActiveProjectId, fileToBase64 } from './lib/store';
+
+import { FloatingSketchWindow } from './components/FloatingSketchWindow';
+import { pdfjs } from 'react-pdf';
+
+// PDF.js requires an explicit worker URL in packaged Electron builds. Keeping
+// this beside the pdfjs import ensures Vite emits the worker into dist/assets.
+pdfjs.GlobalWorkerOptions.workerSrc = new URL(
+  'pdfjs-dist/build/pdf.worker.min.mjs',
+  import.meta.url
+).toString();
+
+const dataUrlToUint8Array = (dataUrl: string): Uint8Array => {
+  const base64 = dataUrl.split(',')[1] || '';
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes;
+};
+
+const getPdfFileSource = (url: string) => {
+  if (url.startsWith('data:application/pdf')) {
+    return { data: dataUrlToUint8Array(url) };
+  }
+  return { url };
+};
+
+function PdfCanvas({
+  url,
+  pageNumber,
+  width,
+  scale,
+  onLoadSuccess,
+  onLoadError
+}: {
+  url: string;
+  pageNumber: number;
+  width: number;
+  scale: number;
+  onLoadSuccess: (numPages: number) => void;
+  onLoadError: (error: Error) => void;
+}) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const [isLoadingPdf, setIsLoadingPdf] = useState(true);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+
+    let cancelled = false;
+    let renderTask: any = null;
+    let loadingTask: any = null;
+    setIsLoadingPdf(true);
+
+    try {
+      loadingTask = pdfjs.getDocument(getPdfFileSource(url) as any);
+    } catch (error) {
+      const normalizedError = error instanceof Error ? error : new Error(String(error));
+      console.error('PDF worker failed to initialize:', normalizedError);
+      setIsLoadingPdf(false);
+      onLoadError(normalizedError);
+      return;
+    }
+
+    loadingTask.promise
+      .then(async (pdf) => {
+        if (cancelled) return;
+        onLoadSuccess(pdf.numPages);
+        const page = await pdf.getPage(pageNumber);
+        if (cancelled) return;
+
+        const baseViewport = page.getViewport({ scale: 1 });
+        const fitScale = width / baseViewport.width;
+        const viewport = page.getViewport({ scale: fitScale * scale });
+        const context = canvas.getContext('2d');
+        if (!context) throw new Error('Canvas context is unavailable.');
+
+        const deviceScale = window.devicePixelRatio || 1;
+        canvas.width = Math.floor(viewport.width * deviceScale);
+        canvas.height = Math.floor(viewport.height * deviceScale);
+        canvas.style.width = `${viewport.width}px`;
+        canvas.style.height = `${viewport.height}px`;
+
+        context.setTransform(deviceScale, 0, 0, deviceScale, 0, 0);
+        context.clearRect(0, 0, viewport.width, viewport.height);
+        renderTask = page.render({ canvas, canvasContext: context, viewport });
+        await renderTask.promise;
+        if (!cancelled) setIsLoadingPdf(false);
+      })
+      .catch((error: Error) => {
+        if (cancelled) return;
+        console.error('PDF canvas render failed:', error);
+        setIsLoadingPdf(false);
+        onLoadError(error);
+      });
+
+    return () => {
+      cancelled = true;
+      if (renderTask) {
+        try {
+          renderTask.cancel();
+        } catch {
+          // Ignore render cancellation during fast page/zoom changes.
+        }
+      }
+      loadingTask?.destroy();
+    };
+  }, [url, pageNumber, width, scale]);
+
+  return (
+    <div className="relative flex justify-center">
+      {isLoadingPdf && (
+        <div className="absolute inset-0 min-h-32 flex items-center justify-center bg-slate-900/50 text-slate-200 text-sm">
+          Loading PDF...
+        </div>
+      )}
+      <canvas ref={canvasRef} className="block max-w-none" />
+    </div>
+  );
+}
+
+const extractPalette = (imgUrl: string): Promise<string[]> => {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.crossOrigin = "Anonymous";
+    img.onload = () => {
+      const canvas = document.createElement("canvas");
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return resolve([]);
+      
+      // Scale image down to 100x100 to obtain rich, high-density sample pixels while maintaining super fast performance
+      const width = 100;
+      const height = 100;
+      canvas.width = width;
+      canvas.height = height;
+      
+      try {
+        ctx.drawImage(img, 0, 0, width, height);
+        const imgData = ctx.getImageData(0, 0, width, height);
+        const data = imgData.data;
+        
+        // Implement K-Means clustering for more accurate dominant color extraction
+        const pixels: {r: number, g: number, b: number}[] = [];
+        
+        for (let i = 0; i < data.length; i += 4) {
+          // Skip highly transparent background pixels
+          if (data[i + 3] >= 150) {
+            pixels.push({ r: data[i], g: data[i + 1], b: data[i + 2] });
+          }
+        }
+
+        if (pixels.length === 0) {
+          resolve([]);
+          return;
+        }
+
+        const K = Math.min(6, pixels.length);
+        
+        // Initialize centroids using K-Means++ style initialization
+        const centroids: {r: number, g: number, b: number}[] = [];
+        centroids.push(pixels[Math.floor(Math.random() * pixels.length)]);
+        
+        for (let i = 1; i < K; i++) {
+          let maxDist = -1;
+          let nextCentroid = pixels[0];
+          
+          for (const p of pixels) {
+            let minDist = Infinity;
+            for (const c of centroids) {
+              const d = Math.pow(p.r - c.r, 2) + Math.pow(p.g - c.g, 2) + Math.pow(p.b - c.b, 2);
+              if (d < minDist) minDist = d;
+            }
+            if (minDist > maxDist) {
+              maxDist = minDist;
+              nextCentroid = p;
+            }
+          }
+          centroids.push(nextCentroid);
+        }
+
+        // Run K-Means iterations
+        const maxIterations = 10;
+        const assignments = new Array(pixels.length).fill(0);
+        
+        for (let iter = 0; iter < maxIterations; iter++) {
+          let changed = false;
+          const sums = Array.from({ length: K }, () => ({ r: 0, g: 0, b: 0, count: 0 }));
+          
+          for (let pIdx = 0; pIdx < pixels.length; pIdx++) {
+            const p = pixels[pIdx];
+            let minDist = Infinity;
+            let bestCluster = 0;
+            
+            for (let cIdx = 0; cIdx < K; cIdx++) {
+              const c = centroids[cIdx];
+              const d = Math.pow(p.r - c.r, 2) + Math.pow(p.g - c.g, 2) + Math.pow(p.b - c.b, 2);
+              if (d < minDist) {
+                minDist = d;
+                bestCluster = cIdx;
+              }
+            }
+            
+            if (assignments[pIdx] !== bestCluster) {
+              changed = true;
+              assignments[pIdx] = bestCluster;
+            }
+            
+            sums[bestCluster].r += p.r;
+            sums[bestCluster].g += p.g;
+            sums[bestCluster].b += p.b;
+            sums[bestCluster].count++;
+          }
+          
+          if (!changed && iter > 0) break;
+          
+          for (let cIdx = 0; cIdx < K; cIdx++) {
+            if (sums[cIdx].count > 0) {
+              centroids[cIdx] = {
+                r: Math.round(sums[cIdx].r / sums[cIdx].count),
+                g: Math.round(sums[cIdx].g / sums[cIdx].count),
+                b: Math.round(sums[cIdx].b / sums[cIdx].count)
+              };
+            }
+          }
+        }
+
+        // Count assignments
+        const clusterCounts = new Array(K).fill(0);
+        for (const a of assignments) {
+          clusterCounts[a]++;
+        }
+
+        // Organize and sort by cluster popularity
+        const paletteObjects = centroids.map((c, i) => ({ ...c, count: clusterCounts[i] })).filter(c => c.count > 0);
+        paletteObjects.sort((a, b) => b.count - a.count);
+
+        // Filter for visually distinct colors and format to hex
+        const toHex = (c: number) => c.toString(16).padStart(2, '0').toUpperCase();
+        const hexPalette: string[] = [];
+        const minDistance = 30; // Threshold to ensure colors are distinct
+        
+        for (const col of paletteObjects) {
+          let isDistinct = true;
+          for (const palHex of hexPalette) {
+            const pr = parseInt(palHex.substring(1, 3), 16);
+            const pg = parseInt(palHex.substring(3, 5), 16);
+            const pb = parseInt(palHex.substring(5, 7), 16);
+            
+            const dist = Math.sqrt(Math.pow(col.r - pr, 2) + Math.pow(col.g - pg, 2) + Math.pow(col.b - pb, 2));
+            if (dist < minDistance) {
+              isDistinct = false;
+              break;
+            }
+          }
+          
+          if (isDistinct) {
+            hexPalette.push(`#${toHex(col.r)}${toHex(col.g)}${toHex(col.b)}`);
+          }
+        }
+        
+        // If filtering removed too many colors, fallback to returning all non-empty centroids
+        if (hexPalette.length < 3) {
+          resolve([...new Set(paletteObjects.map(c => `#${toHex(c.r)}${toHex(c.g)}${toHex(c.b)}`))]);
+        } else {
+          resolve(hexPalette);
+        }
+        
+      } catch (e) {
+        console.error("Advanced palette extraction failed due to security/CORS, falling back gracefully:", e);
+        // Direct horizontal pixel sampling fallback
+        canvas.width = 5;
+        canvas.height = 1;
+        try {
+          ctx.drawImage(img, 0, 0, 5, 1);
+          const toHex = (c: number) => c.toString(16).padStart(2, '0').toUpperCase();
+          const colors: string[] = [];
+          for (let i = 0; i < 5; i++) {
+            const data = ctx.getImageData(i, 0, 1, 1).data;
+            colors.push(`#${toHex(data[0])}${toHex(data[1])}${toHex(data[2])}`);
+          }
+          resolve([...new Set(colors)]);
+        } catch (err) {
+          resolve([]);
+        }
+      }
+    };
+    img.onerror = () => resolve([]);
+    img.src = imgUrl;
+  });
+};
+
+const getCorsProxyUrl = (url: string): string => {
+  if (!url) return url;
+  if (url.startsWith('data:') || url.startsWith('blob:') || url.includes('localhost') || url.includes('corsproxy.io')) {
+    return url;
+  }
+  return `https://corsproxy.io/?${encodeURIComponent(url)}`;
+};
+
+const loadSafeImage = async (url: string): Promise<HTMLImageElement> => {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.crossOrigin = "Anonymous";
+    img.onload = () => resolve(img);
+    img.onerror = () => {
+      const proxied = getCorsProxyUrl(url);
+      if (proxied === url) {
+        reject(new Error(`Failed to load image: ${url}`));
+        return;
+      }
+      const img2 = new Image();
+      img2.crossOrigin = "Anonymous";
+      img2.onload = () => resolve(img2);
+      img2.onerror = () => reject(new Error(`Failed to load image via proxy: ${proxied}`));
+      img2.src = proxied;
+    };
+    img.src = url;
+  });
+};
+
+const getImageResolution = async (url: string): Promise<{width: number, height: number}> => {
+  try {
+    const img = await loadSafeImage(url);
+    return { width: img.width, height: img.height };
+  } catch (e) {
+    console.warn("[getImageResolution] failed, using fallback:", e);
+    return { width: 0, height: 0 };
+  }
+};
+
+const calculatePHash = async (imageUrl: string): Promise<string> => {
+  try {
+    const img = await loadSafeImage(imageUrl);
+    const canvas = document.createElement("canvas");
+    const size = 8;
+    canvas.width = size;
+    canvas.height = size;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) throw new Error("Canvas not supported");
+    
+    ctx.drawImage(img, 0, 0, size, size);
+    const imgData = ctx.getImageData(0, 0, size, size);
+    const data = imgData.data;
+    
+    let total = 0;
+    const grays: number[] = [];
+    for (let i = 0; i < data.length; i += 4) {
+      const gray = data[i] * 0.299 + data[i + 1] * 0.587 + data[i + 2] * 0.114;
+      grays.push(gray);
+      total += gray;
+    }
+    const avg = total / grays.length;
+    let hash = "";
+    for (let i = 0; i < grays.length; i++) {
+      hash += grays[i] >= avg ? "1" : "0";
+    }
+    return parseInt(hash, 2).toString(16).padStart(16, "0");
+  } catch (e) {
+    console.warn("[calculatePHash] failed:", e);
+    return "unknown";
+  }
+};
+
+const calculateHammingSimilarity = (hash1: string, hash2: string): number => {
+  if (!hash1 || !hash2 || hash1 === "unknown" || hash2 === "unknown") return 0.5;
+  if (hash1.length !== hash2.length) return 0;
+  let matches = 0;
+  for (let i = 0; i < hash1.length; i++) {
+    const hex1 = parseInt(hash1[i], 16);
+    const hex2 = parseInt(hash2[i], 16);
+    const xor = hex1 ^ hex2;
+    let bitMatches = 4;
+    for (let bit = 0; bit < 4; bit++) {
+      if ((xor & (1 << bit)) !== 0) {
+        bitMatches--;
+      }
+    }
+    matches += bitMatches;
+  }
+  return matches / (hash1.length * 4);
+};
+
+const getAverageColor = async (imgUrl: string): Promise<{r: number, g: number, b: number}> => {
+  try {
+    const img = await loadSafeImage(imgUrl);
+    const canvas = document.createElement('canvas');
+    canvas.width = 1;
+    canvas.height = 1;
+    const ctx = canvas.getContext('2d');
+    if (ctx) {
+      ctx.drawImage(img, 0, 0, 1, 1);
+      const data = ctx.getImageData(0, 0, 1, 1).data;
+      return { r: data[0], g: data[1], b: data[2] };
+    }
+    return { r: 127, g: 127, b: 127 };
+  } catch (e) {
+    return { r: 127, g: 127, b: 127 };
+  }
+};
+
+const calculateColorSimilarity = (c1: {r: number, g: number, b: number}, c2: {r: number, g: number, b: number}): number => {
+  const diffR = c1.r - c2.r;
+  const diffG = c1.g - c2.g;
+  const diffB = c1.b - c2.b;
+  const maxDist = Math.sqrt(255*255 * 3);
+  const dist = Math.sqrt(diffR*diffR + diffG*diffG + diffB*diffB);
+  return 1 - (dist / maxDist);
+};
+
+const calculateAspectRatioSimilarity = (ar1: number, ar2: number): number => {
+  if (!ar1 || !ar2) return 1.0;
+  return Math.min(ar1, ar2) / Math.max(ar1, ar2);
+};
+
+const fetchImageAsBase64 = async (url: string): Promise<string> => {
+  const tryFetch = async (targetUrl: string): Promise<string> => {
+    const response = await fetch(targetUrl);
+    if (!response.ok) throw new Error(`HTTP Error ${response.status}`);
+    const blob = await response.blob();
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onloadend = () => {
+        if (typeof reader.result === 'string') {
+          resolve(reader.result);
+        } else {
+          reject(new Error("Failed to read downloaded image as data URL"));
+        }
+      };
+      reader.onerror = (e) => reject(e);
+      reader.readAsDataURL(blob);
+    });
+  };
+
+  try {
+    return await tryFetch(url);
+  } catch (e: any) {
+    try {
+      console.warn(`[Auto High-Res] Direct fetch failed for base64 conversion (${e.message}). Retrying with CORS proxy...`);
+      return await tryFetch(getCorsProxyUrl(url));
+    } catch (proxyError: any) {
+      console.warn("[Auto High-Res] CORS prevented converting image to base64 even with proxy. Using direct URL as fallback.");
+      return url;
+    }
+  }
+};
+
+
+
+const matchShortcut = (combo: string, e: KeyboardEvent) => {
+  if (!combo) return false;
+  const parts = combo.toLowerCase().split('+');
+  const requiresCtrl = parts.includes('ctrl');
+  const requiresShift = parts.includes('shift');
+  const requiresAlt = parts.includes('alt');
+  const key = parts[parts.length - 1];
+
+  const isCtrlMatched = requiresCtrl === (e.ctrlKey || e.metaKey);
+  const isShiftMatched = requiresShift === e.shiftKey;
+  const isAltMatched = requiresAlt === e.altKey;
+  
+  let isKeyMatched = false;
+  if (key === 'escape' || key === 'esc') {
+    isKeyMatched = e.key.toLowerCase() === 'escape';
+  } else if (key === 'comma') {
+    isKeyMatched = e.key === ',';
+  } else {
+    isKeyMatched = e.key.toLowerCase() === key || (e.code.toLowerCase().replace('key', '') === key);
+  }
+
+  return isCtrlMatched && isShiftMatched && isAltMatched && isKeyMatched;
+};
+
+const ensureTempLocalFile = async (url: string, id: string): Promise<string> => {
+  const electron = (window as any).require ? (window as any).require('electron') : null;
+  if (!electron) return "";
+  const fs = electron.require('fs');
+  const path = electron.require('path');
+  const os = electron.require('os');
+  
+  try {
+    let ext = '.jpg';
+    if (url.toLowerCase().includes('.png') || url.startsWith('data:image/png')) ext = '.png';
+    else if (url.toLowerCase().includes('.webp') || url.startsWith('data:image/webp')) ext = '.webp';
+    else if (url.toLowerCase().includes('.gif') || url.startsWith('data:image/gif')) ext = '.gif';
+    else if (url.toLowerCase().includes('.pdf') || url.startsWith('data:application/pdf')) ext = '.pdf';
+    else if (url.startsWith('data:image/jpeg') || url.startsWith('data:image/jpg')) ext = '.jpg';
+    
+    let dataRoot = '';
+    try {
+      dataRoot = await electron.ipcRenderer.invoke('get-default-data-directory');
+    } catch (e) {
+      console.warn("Could not read ReferenceFlow data folder, using Documents fallback:", e);
+    }
+    const documentsDir = path.join(os.homedir(), 'Documents');
+    const baseDir = dataRoot || (documentsDir ? path.join(documentsDir, 'ReferenceFlow') : '');
+    if (!baseDir) return "";
+
+    const exportDir = path.join(baseDir, 'Clipboard');
+    fs.mkdirSync(exportDir, { recursive: true });
+
+    const safeId = String(id || 'reference').replace(/[^a-z0-9._-]+/gi, '_').slice(0, 80) || 'reference';
+    const tempPath = path.join(exportDir, `refflow_export_${safeId}${ext}`);
+    
+    if (fs.existsSync(tempPath)) return tempPath;
+
+    if (url.startsWith('data:')) {
+       const base64Data = url.split(',')[1] || '';
+       fs.writeFileSync(tempPath, Buffer.from(base64Data, 'base64'));
+       return tempPath;
+    }
+
+    const res = await fetch(url);
+    const arrayBuffer = await res.arrayBuffer();
+    fs.writeFileSync(tempPath, Buffer.from(arrayBuffer));
+    return tempPath;
+  } catch (e) {
+    console.error("Failed to cache temp file:", e);
+    return "";
+  }
+};
+
+const copyImageToClipboard = async (url: string, id: string) => {
+  const electron = (window as any).require ? (window as any).require('electron') : null;
+  if (electron) {
+    const tempPath = await ensureTempLocalFile(url, id);
+    if (tempPath) {
+      const copied = await electron.ipcRenderer.invoke('copy-image-to-clipboard', tempPath);
+      if (copied) {
+        console.log(`[Copy Image] Natively copied bitmap to clipboard via: ${tempPath}`);
+      } else {
+        await electron.ipcRenderer.invoke('copy-file-to-clipboard', tempPath);
+        console.log(`[Copy Image] Copied file path because bitmap clipboard was unavailable: ${tempPath}`);
+      }
+    }
+  } else {
+    // Web fallback using ClipboardItem
+    try {
+      const res = await fetch(url);
+      const blob = await res.blob();
+      if (blob.type === 'image/png' || blob.type === 'image/jpeg') {
+         const item = new ClipboardItem({ [blob.type]: blob });
+         await navigator.clipboard.write([item]);
+         console.log("[ClipboardFallback] Copied image to browser clipboard successfully.");
+      } else {
+         // Fallback via Canvas drawing
+         const canvas = document.createElement('canvas');
+         const img = new Image();
+         img.crossOrigin = 'anonymous';
+         img.onload = async () => {
+           canvas.width = img.width;
+           canvas.height = img.height;
+           const ctx = canvas.getContext('2d');
+           if (ctx) {
+             ctx.drawImage(img, 0, 0);
+             canvas.toBlob(async (pngBlob) => {
+               if (pngBlob) {
+                 const item = new ClipboardItem({ 'image/png': pngBlob });
+                 await navigator.clipboard.write([item]);
+                 console.log("[ClipboardFallback] Copied non-standard image to browser clipboard as PNG.");
+               }
+             }, 'image/png');
+           }
+         };
+         img.src = url;
+      }
+    } catch (e) {
+      console.warn("[ClipboardFallback] Clipboard API block or fail in sandbox preview:", e);
+    }
+  }
+};
+
+const copyFileToClipboard = async (url: string, id: string) => {
+  const electron = (window as any).require ? (window as any).require('electron') : null;
+  if (!electron) {
+    console.warn("[Copy File] Windows Explorer file copying is only supported in native Desktop App mode.");
+    return;
+  }
+  const tempPath = await ensureTempLocalFile(url, id);
+  if (tempPath) {
+    await electron.ipcRenderer.invoke('copy-file-to-clipboard', tempPath);
+    console.log(`[Copy File] Copied native Windows Explorer reference: ${tempPath}`);
+  }
+};
+
+const copyReferenceForOtherApps = async (url: string, id: string) => {
+  const electron = (window as any).require ? (window as any).require('electron') : null;
+  if (electron) {
+    const tempPath = await ensureTempLocalFile(url, id);
+    if (tempPath) {
+      await electron.ipcRenderer.invoke('copy-file-to-clipboard', tempPath);
+      return tempPath;
+    }
+  }
+  await copyImageToClipboard(url, id);
+  return "";
+};
+
+const exportOriginalImage = async (url: string, id: string, formatType: 'png' | 'jpg' | 'webp') => {
+  const canvas = document.createElement('canvas');
+  const img = new Image();
+  img.crossOrigin = 'anonymous';
+  img.onload = async () => {
+    canvas.width = img.width;
+    canvas.height = img.height;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    ctx.drawImage(img, 0, 0);
+    
+    const mimeType = formatType === 'png' ? 'image/png' : formatType === 'jpg' ? 'image/jpeg' : 'image/webp';
+    const dataUrl = canvas.toDataURL(mimeType, formatType === 'png' ? undefined : 0.95);
+    const electron = (window as any).require ? (window as any).require('electron') : null;
+    
+    if (electron) {
+      const result = await electron.ipcRenderer.invoke('show-save-dialog', {
+        title: `Export Original as ${formatType.toUpperCase()}`,
+        defaultPath: `export_${id}.${formatType}`,
+        filters: [
+          { name: `${formatType.toUpperCase()} Image`, extensions: [formatType] }
+        ]
+      });
+      if (!result.canceled && result.filePath) {
+        const fs = electron.require('fs');
+        const base64Data = dataUrl.split(',')[1];
+        fs.writeFileSync(result.filePath, Buffer.from(base64Data, 'base64'));
+        console.log(`[Export ${formatType}] Saved original natively to: ${result.filePath}`);
+      }
+    } else {
+      // Fallback: Web browser anchor download
+      const a = document.createElement('a');
+      a.href = dataUrl;
+      a.download = `export_${id}.${formatType}`;
+      a.target = '_blank';
+      a.click();
+      console.log(`[Export ${formatType}] Web fallback download triggered.`);
+    }
+  };
+  img.src = url;
+};
+
+if (typeof window !== 'undefined') {
+  const electron = (window as any).require ? (window as any).require('electron') : null;
+  const ipcRenderer = electron ? electron.ipcRenderer : null;
+  if (!(window as any).electronAPI) {
+    (window as any).electronAPI = {
+      setIgnoreMouseEvents: (ignore: boolean, options?: any) => {
+        console.log(`[preload.cjs] window.electronAPI.setIgnoreMouseEvents(${ignore}, ${options ? JSON.stringify(options) : 'undefined'}) called`);
+        if (ipcRenderer) {
+          try {
+            ipcRenderer.send('set-ignore-mouse-events', ignore, options);
+          } catch (err: any) {
+            console.error(`[preload.cjs] IPC send error:`, err);
+          }
+        } else {
+          console.warn("[preload.cjs] ipcRenderer not found. Running in browser?");
+        }
+      }
+    };
+  }
+}
+
+export default function App() {
+  type DisplayLayout = {
+    virtual: { x: number; y: number; width: number; height: number };
+    primary: { x: number; y: number; width: number; height: number };
+    displays: Array<{
+      id: string;
+      label: string;
+      bounds: { x: number; y: number; width: number; height: number };
+      workArea: { x: number; y: number; width: number; height: number };
+      scaleFactor: number;
+      isPrimary: boolean;
+    }>;
+  };
+
+  const [images, setImages] = useState<string[]>([]);
+  const [floatingImages, setFloatingImages] = useState<FloatingImage[]>([]);
+  const [floatingNotes, setFloatingNotes] = useState<FloatingNote[]>([]);
+  const [showSettings, setShowSettings] = useState(false);
+  const [showSearchComponent, setShowSearchComponent] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchProvider, setSearchProvider] = useState("All Native");
+  const [searchResults, setSearchResults] = useState<any[]>([]);
+  const [searchStatus, setSearchStatus] = useState("idle");
+  const [searchFilters, setSearchFilters] = useState<string[]>([]);
+  const [searchHistory, setSearchHistory] = useState<string[]>(() => {
+    try {
+      const saved = localStorage.getItem('ref-flow-search-history');
+      return saved ? JSON.parse(saved) : [];
+    } catch (e) {
+      return [];
+    }
+  });
+  const [activeProviderSearching, setActiveProviderSearching] = useState<string>("None");
+  const [lastResultsCount, setLastResultsCount] = useState<number>(0);
+  const [searchLog, setSearchLog] = useState<string[]>([]);
+  const [searchPage, setSearchPage] = useState(1);
+  const [searchContextMenu, setSearchContextMenu] = useState<{x: number, y: number, result: any} | null>(null);
+  const [floatingContextMenu, setFloatingContextMenu] = useState<{x: number, y: number, id: string, url: string, type?: 'image' | 'pdf'} | null>(null);
+  const [contextMenuTempPath, setContextMenuTempPath] = useState<string>('');
+  const dragFilePathsRef = useRef<Map<string, string>>(new Map());
+  const NATIVE_PROVIDERS = ['All Native', 'Wikimedia Commons', 'Openverse', 'Pixabay', 'Pexels', 'Unsplash', 'SerpAPI'];
+  const BROWSER_PROVIDERS = ['Google Images', 'Pinterest', 'DuckDuckGo Images', 'Bing Images', 'ArtStation', 'Behance'];
+  const FILTER_OPTIONS = ['Portrait', 'Landscape', 'Square', 'Black & White', 'Transparent', 'High Resolution'];
+  const [isRetracted, setIsRetracted] = useState(false);
+  const [showInTaskbar, setShowInTaskbar] = useState(() => {
+    const saved = localStorage.getItem('ref-flow-show-in-taskbar');
+    return saved ? saved === 'true' : false;
+  });
+  const [isPillVisible, setIsPillVisible] = useState(() => {
+    const saved = localStorage.getItem('ref-flow-pill-visible');
+    return saved ? saved === 'true' : true;
+  });
+  
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [activeProjectId, setActiveProjectIdState] = useState<string | null>(null);
+  const [showManager, setShowManager] = useState(false);
+  const [isLoading, setIsLoading] = useState(true);
+  const [managingProjectId, setManagingProjectId] = useState<string | null>(null);
+  const [editingProjectId, setEditingProjectId] = useState<string | null>(null);
+  const [editingProjectName, setEditingProjectName] = useState("");
+  const [needsPermission, setNeedsPermission] = useState(false);
+  const [dragError, setDragError] = useState<string>('');
+  const [defaultAutosaveRoot, setDefaultAutosaveRoot] = useState<string>("");
+  const [copiedColor, setCopiedColor] = useState<string | null>(null);
+  const [editingNotes, setEditingNotes] = useState<Record<string, boolean>>({});
+  const [topWindowId, setTopWindowId] = useState<string | null>(null);
+  const [displayLayout, setDisplayLayout] = useState<DisplayLayout | null>(null);
+
+  const [floatingSketches, setFloatingSketches] = useState<FloatingSketch[]>([]);
+
+  const fetchAndAddImage = async (url: string, asReference: boolean = false) => {
+    try {
+      // Attempt to cache as base64 to prevent hotlinking and improve offline support
+      const response = await fetch(url);
+      const blob = await response.blob();
+      const reader = new FileReader();
+      reader.onloadend = () => {
+        const base64Url = reader.result as string;
+        addSearchResultToWorkspace(base64Url);
+      };
+      reader.readAsDataURL(blob);
+    } catch (e) {
+      console.warn("[Search] CORS prevented downloading image as blob. Using direct URL as fallback.");
+      addSearchResultToWorkspace(url);
+    }
+  };
+
+  const addSearchResultToWorkspace = (url: string) => {
+    setIsRetracted(false);
+    setFloatingImages(prev => [
+      ...prev,
+      {
+        id: Math.random().toString(36).substr(2, 9),
+        url,
+        x: position.x + pillDimensions.width + 100 + (Math.random() * 50),
+        y: position.y + (Math.random() * 50),
+        width: 400,
+        opacity: 1,
+        isLocked: false,
+        rotation: 0,
+        isCollapsed: false,
+        zoom: 1,
+      }
+    ]);
+  };
+
+  const createFloatingMediaItems = (
+    files: File[],
+    urls: string[],
+    origin: { x: number; y: number },
+    collapsed = false
+  ): FloatingImage[] => {
+    return urls.map((url, i) => {
+      const isPdf = files[i]?.type === 'application/pdf';
+      return {
+        id: Math.random().toString(36).substr(2, 9),
+        url,
+        x: origin.x + (i * 20),
+        y: origin.y + (i * 20),
+        width: isPdf ? 420 : 400,
+        opacity: 1,
+        isLocked: false,
+        rotation: 0,
+        palette: [],
+        zoom: 1,
+        type: isPdf ? 'pdf' : 'image',
+        documentPage: isPdf ? 1 : undefined,
+        isCollapsed: collapsed
+      };
+    });
+  };
+
+  const importMediaFiles = async (
+    files: File[],
+    origin: { x: number; y: number } = { x: position.x + pillDimensions.width + 20, y: position.y },
+    collapsed = false
+  ): Promise<FloatingImage[]> => {
+    const mediaFiles = files.filter(f => f.type.startsWith('image/') || f.type === 'application/pdf');
+    if (mediaFiles.length === 0) return [];
+
+    const newMedia = await Promise.all(mediaFiles.map(fileToBase64));
+    const newFloatingImages = createFloatingMediaItems(mediaFiles, newMedia, origin, collapsed);
+    setIsRetracted(false);
+    setFloatingImages(prev => [...prev, ...newFloatingImages]);
+    return newFloatingImages;
+  };
+
+  const scoreResult = (resultTitle: string, queryStr: string): number => {
+    if (!resultTitle) return 0;
+    const title = resultTitle.toLowerCase().trim();
+    const query = queryStr.toLowerCase().trim();
+
+    // Stop words
+    const stopWords = new Set(["the", "a", "an", "and", "or", "but", "in", "on", "at", "to", "for", "with", "of", "about", "is", "are", "was", "were", "by", "from", "as"]);
+
+    // Stemming/normalization for simple plural/singular
+    const normalizeWord = (w: string) => {
+      let word = w.toLowerCase().trim().replace(/[.,\/#!$%\^&\*;:{}=\-_`~()]/g, "");
+      if (word.endsWith("ies")) {
+        return word.slice(0, -3) + "y";
+      }
+      if (word.endsWith("es") && !word.endsWith("ees") && !word.endsWith("o_es")) {
+        return word.slice(0, -2);
+      }
+      if (word.endsWith("s") && !word.endsWith("ss") && !word.endsWith("us") && !word.endsWith("as") && !word.endsWith("is")) {
+        return word.slice(0, -1);
+      }
+      return word;
+    };
+
+    let score = 0;
+
+    // 1. Exact phrase match
+    if (title.includes(query)) {
+      score += 150;
+    }
+
+    // Quoted phrase checks
+    const phraseRegex = /"([^"]+)"/g;
+    let match;
+    const phrases: string[] = [];
+    while ((match = phraseRegex.exec(query)) !== null) {
+      phrases.push(match[1]);
+    }
+
+    const queryCleaned = query.replace(/"([^"]+)"/g, " ");
+    const queryWords = queryCleaned.split(/\s+/).filter(w => w && !stopWords.has(w));
+
+    for (const phrase of phrases) {
+      if (title.includes(phrase)) {
+        score += 200;
+      }
+    }
+
+    const originalCleanQuery = query.replace(/["]/g, "").trim();
+    if (originalCleanQuery.split(/\s+/).length > 1 && title.includes(originalCleanQuery)) {
+      score += 80;
+    }
+
+    // Token word matches
+    const titleWords = title.split(/\s+/).map(normalizeWord);
+    const normalizedQueryWords = queryWords.map(normalizeWord);
+
+    let wordMatches = 0;
+    for (const qw of normalizedQueryWords) {
+      if (titleWords.includes(qw)) {
+        wordMatches++;
+        score += 30; // exact word match
+      } else {
+        const subMatch = titleWords.some(tw => tw.includes(qw) || qw.includes(tw));
+        if (subMatch) {
+          score += 10;
+        }
+      }
+    }
+
+    if (wordMatches === normalizedQueryWords.length && normalizedQueryWords.length > 0) {
+      score += 50; // all words match
+    }
+
+    // Start matches bonus
+    const firstWord = originalCleanQuery.split(/\s+/)[0];
+    if (firstWord && title.startsWith(firstWord.toLowerCase())) {
+      score += 20;
+    }
+
+    return score;
+  };
+
+  const rankSearchResults = (results: any[], query: string): any[] => {
+    return results.map(res => {
+      // Relevance
+      const relevance = scoreResult(res.title || "", query);
+
+      // Resolution area
+      const area = (res.width || 800) * (res.height || 600);
+      const resolutionScore = Math.min(area / 1000000, 10) * 15; // up to 150 pts
+
+      // Aspect ratio: prefer 0.5 to 2.2
+      const ar = res.width && res.height ? res.width / res.height : 1.0;
+      const arScore = (ar >= 0.5 && ar <= 2.2) ? 20 : 0;
+
+      // Sharpness approximation
+      const urlLower = (res.url || "").toLowerCase();
+      let sharpnessScore = 0;
+      if (urlLower.includes("original") || urlLower.includes("full") || urlLower.includes("raw") || urlLower.includes("high")) {
+        sharpnessScore += 30;
+      }
+      if (res.provider === 'Unsplash' || res.provider === 'Pexels') {
+        sharpnessScore += 20;
+      }
+
+      const finalScore = relevance + resolutionScore + arScore + sharpnessScore;
+
+      return {
+        ...res,
+        finalScore
+      };
+    }).sort((a, b) => b.finalScore - a.finalScore);
+  };
+
+  const filterDuplicates = (existing: any[], incoming: any[]): any[] => {
+    const seenUrls = new Set(existing.map(item => item.url.toLowerCase()));
+    const seenThumbnails = new Set(existing.map(item => (item.thumbnail || "").toLowerCase()));
+    const seenDimensions = new Set(existing.map(item => `${item.width}x${item.height}`));
+
+    const result: any[] = [...existing];
+
+    for (const item of incoming) {
+      const urlLower = item.url.toLowerCase();
+      const thumbLower = (item.thumbnail || "").toLowerCase();
+      const dimKey = `${item.width}x${item.height}`;
+
+      const isUnverifiedDim = item.width === 0 || item.height === 0;
+
+      if (seenUrls.has(urlLower)) {
+        continue;
+      }
+      if (thumbLower && seenThumbnails.has(thumbLower)) {
+        continue;
+      }
+      if (!isUnverifiedDim && seenDimensions.has(dimKey)) {
+        const duplicateTitle = existing.some(ext => ext.title && item.title && ext.title.toLowerCase() === item.title.toLowerCase());
+        if (duplicateTitle) {
+          continue;
+        }
+      }
+      seenUrls.add(urlLower);
+      if (thumbLower) seenThumbnails.add(thumbLower);
+      if (!isUnverifiedDim) seenDimensions.add(dimKey);
+
+      result.push(item);
+    }
+
+    return result;
+  };
+
+  const applyLocalFilters = (results: any[], activeFilters: string[]): any[] => {
+    if (activeFilters.length === 0) return results;
+
+    return results.filter(item => {
+      for (const f of activeFilters) {
+        if (f === 'Portrait') {
+          if (item.width && item.height && item.width >= item.height) return false;
+        }
+        if (f === 'Landscape') {
+          if (item.width && item.height && item.height >= item.width) return false;
+        }
+        if (f === 'Square') {
+          if (item.width && item.height) {
+            const ratio = item.width / item.height;
+            if (ratio < 0.95 || ratio > 1.05) return false;
+          }
+        }
+        if (f === 'Transparent') {
+          const isPng = item.url.toLowerCase().split('?')[0].endsWith('.png');
+          const transparentMeta = (item.title || "").toLowerCase().includes("transparent") || (item.title || "").toLowerCase().includes("png") || (item.url || "").toLowerCase().includes("transparent");
+          if (!isPng && !transparentMeta && item.provider !== 'SerpAPI') {
+            return false;
+          }
+        }
+        if (f === 'High Resolution') {
+          if (item.width && item.height) {
+            if (item.width < 1600 && item.height < 1600) return false;
+          }
+        }
+        if (f === 'Black & White') {
+          const titleLower = (item.title || "").toLowerCase();
+          const bwMeta = titleLower.includes("black and white") || titleLower.includes("grayscale") || titleLower.includes("monochrome") || titleLower.includes("b&w");
+          if (!bwMeta && item.provider !== 'SerpAPI' && item.provider !== 'Unsplash' && item.provider !== 'Pixabay') {
+            return false;
+          }
+        }
+      }
+      return true;
+    });
+  };
+
+  const performSearch = async (isLoadMore = false) => {
+    if (!searchQuery.trim()) return;
+    
+    if (BROWSER_PROVIDERS.includes(searchProvider)) {
+        const BrowserSearchURLs: Record<string, string> = {
+            'Google Images': `https://www.google.com/search?tbm=isch&q=${encodeURIComponent(searchQuery)}`,
+            'Pinterest': `https://www.pinterest.com/search/pins/?q=${encodeURIComponent(searchQuery)}`,
+            'DuckDuckGo Images': `https://duckduckgo.com/?q=${encodeURIComponent(searchQuery)}&iar=images&iax=images&ia=images`,
+            'Bing Images': `https://www.bing.com/images/search?q=${encodeURIComponent(searchQuery)}`,
+            'ArtStation': `https://www.artstation.com/search?sort_by=relevance&query=${encodeURIComponent(searchQuery)}`,
+            'Behance': `https://www.behance.net/search/projects?search=${encodeURIComponent(searchQuery)}`
+        };
+        const url = BrowserSearchURLs[searchProvider];
+        if (url) {
+            window.open(url, '_blank');
+            setSearchLog(prev => [...prev, `[Search] Opened ${searchProvider} in a new tab.`]);
+        }
+        return;
+    }
+
+    const nextPage = isLoadMore ? searchPage + 1 : 1;
+    if (!isLoadMore) {
+        setSearchPage(1);
+        setSearchResults([]);
+        setSearchHistory(prev => {
+          const filtered = prev.filter(q => q.toLowerCase() !== searchQuery.trim().toLowerCase());
+          const updated = [searchQuery.trim(), ...filtered].slice(0, 10);
+          localStorage.setItem('ref-flow-search-history', JSON.stringify(updated));
+          return updated;
+        });
+        setSearchLog(prev => [...prev, `[Search] Started search for "${searchQuery}" using provider: ${searchProvider}`]);
+    } else {
+        setSearchPage(nextPage);
+        setSearchLog(prev => [...prev, `[Search] Loading page ${nextPage}...`]);
+    }
+    
+    setSearchStatus(isLoadMore ? "loading-more" : "loading");
+
+    let newResults: any[] = [];
+    const providersToTry = searchProvider === "All Native" 
+      ? providerOrder.filter(p => !['Google Images', 'Pinterest', 'DuckDuckGo Images', 'Bing Images', 'ArtStation', 'Behance'].includes(p) && (providerStatus[p]?.enabled ?? true))
+      : [searchProvider];
+    
+    for (const p of providersToTry) {
+        const pConfig = getProviderConfig(p);
+        if (!pConfig.isEnabled) {
+            if (!isLoadMore) setSearchLog(prev => [...prev, `[Search] Skipped ${p}: Disabled.`]);
+            continue;
+        }
+        if (pConfig.badge === 'ðŸ”‘ API Key Required') {
+            if (!isLoadMore) setSearchLog(prev => [...prev, `[Search] Skipped ${p}: Requires API Key.`]);
+            continue;
+        }
+
+        setActiveProviderSearching(p);
+        setSearchLog(prev => [...prev, `[Search] Querying ${p}...`]);
+        const startTime = Date.now();
+        let errorStr = '';
+        let reqUrl = '';
+        let sortOrder = 'default';
+        let providerQueryTerms = searchQuery;
+        let pFiltersApplied: string[] = [];
+        let fetchedHits = 0;
+        let providerHits: any[] = [];
+
+        try {
+            if (p === 'Wikimedia Commons') {
+                const sroffset = (nextPage - 1) * 20;
+                reqUrl = `https://en.wikipedia.org/w/api.php?action=query&generator=search&gsrsearch=${encodeURIComponent(searchQuery)}&gsrnamespace=6&gsrlimit=20${isLoadMore ? `&gsroffset=${sroffset}` : ''}&prop=imageinfo&iiprop=url|size&origin=*&format=json`;
+                
+                const res = await fetch(reqUrl);
+                if (!res.ok) throw new Error(`HTTP Error ${res.status}: ${res.statusText}`);
+                const data = await res.json();
+                if (data.query?.pages) {
+                    const pages = Object.values(data.query.pages) as any[];
+                    providerHits = pages.filter(page => page.imageinfo && page.imageinfo.length > 0).map(page => ({
+                        url: page.imageinfo[0].url,
+                        thumbnail: page.imageinfo[0].url,
+                        provider: 'Wikimedia Commons',
+                        title: page.title,
+                        width: page.imageinfo[0].width || 0,
+                        height: page.imageinfo[0].height || 0
+                    }));
+                }
+            } else if (p === 'Openverse') {
+                const ok = apiKeys['Openverse'];
+                reqUrl = `https://api.openverse.org/v1/images/?q=${encodeURIComponent(searchQuery)}&page=${nextPage}`;
+                const headers: any = {};
+                if (ok) headers['Authorization'] = `Bearer ${ok}`;
+                const res = await fetch(reqUrl, { headers });
+                if (!res.ok) throw new Error(`HTTP Error ${res.status}: ${res.statusText}`);
+                const data = await res.json();
+                if (data.results && data.results.length > 0) {
+                    providerHits = data.results.map((item: any) => ({
+                        url: item.url,
+                        thumbnail: item.thumbnail || item.url,
+                        provider: 'Openverse',
+                        title: item.title,
+                        width: 0, 
+                        height: 0
+                    }));
+                }
+            } else if (p === 'Pixabay') {
+                const pk = apiKeys['Pixabay'];
+                sortOrder = 'latest'; 
+                let extraParams = `&order=${sortOrder}`;
+
+                if (searchFilters.includes('Portrait')) {
+                  extraParams += `&orientation=vertical`;
+                  pFiltersApplied.push('Portrait (vertical)');
+                } else if (searchFilters.includes('Landscape')) {
+                  extraParams += `&orientation=horizontal`;
+                  pFiltersApplied.push('Landscape (horizontal)');
+                }
+                
+                if (searchFilters.includes('Black & White')) {
+                  extraParams += `&colors=grayscale`;
+                  pFiltersApplied.push('Black & White (grayscale)');
+                }
+                if (searchFilters.includes('Transparent')) {
+                  extraParams += `&colors=transparent`;
+                  pFiltersApplied.push('Transparent');
+                }
+
+                reqUrl = `https://pixabay.com/api/?key=${pk}&image_type=photo&q=${encodeURIComponent(searchQuery)}&page=${nextPage}${extraParams}`;
+                const res = await fetch(reqUrl);
+                if (!res.ok) throw new Error(`HTTP Error ${res.status}: ${res.statusText}`);
+                const data = await res.json();
+                if (data.hits && data.hits.length > 0) {
+                    providerHits = data.hits.map((item: any) => ({
+                        url: item.largeImageURL,
+                        thumbnail: item.webformatURL,
+                        provider: 'Pixabay',
+                        title: item.tags,
+                        width: item.imageWidth,
+                        height: item.imageHeight
+                    }));
+                }
+            } else if (p === 'Unsplash') {
+                const uk = apiKeys['Unsplash'];
+                sortOrder = 'latest'; 
+                let extraParams = `&order_by=${sortOrder}`;
+
+                if (searchFilters.includes('Portrait')) {
+                  extraParams += `&orientation=portrait`;
+                  pFiltersApplied.push('Portrait');
+                } else if (searchFilters.includes('Landscape')) {
+                  extraParams += `&orientation=landscape`;
+                  pFiltersApplied.push('Landscape');
+                } else if (searchFilters.includes('Square')) {
+                  extraParams += `&orientation=squarish`;
+                  pFiltersApplied.push('Square');
+                }
+
+                if (searchFilters.includes('Black & White')) {
+                  extraParams += `&color=black_and_white`;
+                  pFiltersApplied.push('Black & White');
+                }
+
+                reqUrl = `https://api.unsplash.com/search/photos?query=${encodeURIComponent(searchQuery)}&page=${nextPage}&per_page=20${extraParams}`;
+                const res = await fetch(reqUrl, { headers: { 'Authorization': `Client-ID ${uk}` } });
+                if (!res.ok) throw new Error(`HTTP Error ${res.status}: ${res.statusText}`);
+                const data = await res.json();
+                if (data.results && data.results.length > 0) {
+                    providerHits = data.results.map((item: any) => ({
+                        url: item.urls.full,
+                        thumbnail: item.urls.small,
+                        provider: 'Unsplash',
+                        title: item.alt_description || "Unsplash Image",
+                        width: item.width,
+                        height: item.height
+                    }));
+                }
+            } else if (p === 'Pexels') {
+                const pxk = apiKeys['Pexels'];
+                let extraParams = '';
+
+                if (searchFilters.includes('Portrait')) {
+                  extraParams += `&orientation=portrait`;
+                  pFiltersApplied.push('Portrait');
+                } else if (searchFilters.includes('Landscape')) {
+                  extraParams += `&orientation=landscape`;
+                  pFiltersApplied.push('Landscape');
+                } else if (searchFilters.includes('Square')) {
+                  extraParams += `&orientation=square`;
+                  pFiltersApplied.push('Square');
+                }
+
+                reqUrl = `https://api.pexels.com/v1/search?query=${encodeURIComponent(searchQuery)}&page=${nextPage}&per_page=20${extraParams}`;
+                const res = await fetch(reqUrl, { headers: { 'Authorization': pxk } });
+                if (!res.ok) throw new Error(`HTTP Error ${res.status}: ${res.statusText}`);
+                const data = await res.json();
+                if (data.photos && data.photos.length > 0) {
+                    providerHits = data.photos.map((item: any) => ({
+                        url: item.src.original,
+                        thumbnail: item.src.medium,
+                        provider: 'Pexels',
+                        title: item.alt || "Pexels Image",
+                        width: item.width,
+                        height: item.height
+                    }));
+                }
+            } else if (p === 'SerpAPI') {
+                const sk = apiKeys['SerpAPI'];
+                let extraParams = '';
+                
+                let tbsParts: string[] = [];
+                if (searchFilters.includes('High Resolution')) {
+                  tbsParts.push('isz:l');
+                  pFiltersApplied.push('High Resolution');
+                }
+                if (searchFilters.includes('Black & White')) {
+                  tbsParts.push('ic:gray');
+                  pFiltersApplied.push('Black & White (gray)');
+                }
+                if (searchFilters.includes('Transparent')) {
+                  tbsParts.push('ic:trans');
+                  pFiltersApplied.push('Transparent');
+                }
+                if (searchFilters.includes('Portrait')) {
+                  tbsParts.push('iar:p');
+                  pFiltersApplied.push('Portrait');
+                } else if (searchFilters.includes('Landscape')) {
+                  tbsParts.push('iar:l');
+                  pFiltersApplied.push('Landscape');
+                } else if (searchFilters.includes('Square')) {
+                  tbsParts.push('iar:s');
+                  pFiltersApplied.push('Square');
+                }
+
+                if (tbsParts.length > 0) {
+                  extraParams += `&tbs=${tbsParts.join(',')}`;
+                }
+
+                reqUrl = `https://serpapi.com/search.json?engine=google_images&q=${encodeURIComponent(searchQuery)}&ijn=${nextPage - 1}&api_key=${sk}${extraParams}`;
+                const res = await fetch(reqUrl);
+                if (!res.ok) throw new Error(`HTTP Error ${res.status}: ${res.statusText}`);
+                const data = await res.json();
+                if (data.images_results && data.images_results.length > 0) {
+                    providerHits = data.images_results.map((item: any) => ({
+                        url: item.original,
+                        thumbnail: item.thumbnail,
+                        provider: 'SerpAPI',
+                        title: item.title,
+                        width: item.original_width || 0,
+                        height: item.original_height || 0
+                    }));
+                }
+            }
+
+            const locallyFiltered = applyLocalFilters(providerHits, searchFilters);
+            fetchedHits = locallyFiltered.length;
+
+            newResults = [...newResults, ...locallyFiltered];
+            
+            const timeTaken = Date.now() - startTime;
+            setSearchLog(prev => [
+              ...prev,
+              `[Diagnostics - ${p}]`,
+              `- Request URL: ${reqUrl || 'N/A'}`,
+              `- Query: "${providerQueryTerms}"`,
+              `- Filters: ${searchFilters.length > 0 ? searchFilters.join(', ') : 'None'} (API mapped: ${pFiltersApplied.join(', ') || 'None'})`,
+              `- Sort order: ${sortOrder}`,
+              `- Response count: ${providerHits.length} (Locally filtered: ${locallyFiltered.length})`,
+              `- Page number: ${nextPage}`,
+              `- Time taken: ${timeTaken}ms`
+            ]);
+
+        } catch (err: any) {
+            errorStr = err.message || 'Unknown error.';
+            console.error(`[Search] Error with ${p}:`, err);
+            setSearchLog(prev => [...prev, `[Search] Error querying ${p}: ${errorStr}`]);
+        }
+
+        setSearchDiagnostics(prev => ({
+          lastSearch: new Date(),
+          reqCount: prev.reqCount + 1,
+          resCount: prev.resCount + fetchedHits,
+          errors: errorStr ? [...prev.errors, `${p}: ${errorStr}`] : prev.errors
+        }));
+    }
+
+    setActiveProviderSearching("None");
+    setLastResultsCount(newResults.length);
+
+    const rankedNewResults = rankSearchResults(newResults, searchQuery);
+
+    if (rankedNewResults.length > 0) {
+        setSearchResults(prev => {
+          const combined = isLoadMore ? filterDuplicates(prev, rankedNewResults) : filterDuplicates([], rankedNewResults);
+          return combined;
+        });
+        setSearchStatus("idle");
+        setSearchLog(prev => [...prev, `[Search] Ready. Appended ${rankedNewResults.length} scored results.`]);
+    } else {
+        setSearchStatus(isLoadMore ? "idle" : "no-results");
+        setSearchLog(prev => [...prev, `[Search] Complete. No ${isLoadMore ? 'more' : 'usable'} results match filters.`]);
+    }
+  };
+
+  const handleSearchScroll = (e: React.UIEvent<HTMLDivElement>) => {
+    const { scrollTop, scrollHeight, clientHeight } = e.currentTarget;
+    if (scrollHeight - scrollTop <= clientHeight + 50 && searchStatus === 'idle') {
+      performSearch(true);
+    }
+  };
+
+  const handleAutoHighRes = async (img: FloatingImage) => {
+    console.log(`[Auto High-Res] Starting pipeline for image ID: ${img.id}`);
+    
+    // Add to searchLogs
+    setSearchLog(prev => [...prev, `[Auto High-Res] Starting multi-stage pipeline for image ID ${img.id}`]);
+
+    // Set initial status to stage 1: Generating image fingerprint
+    setFloatingImages(prev => prev.map(f => f.id === img.id ? {
+      ...f, 
+      isSearchInProgress: true, 
+      searchStatus: "Generating image fingerprint..."
+    } : f));
+
+    // STAGE 1: Image Fingerprinting
+    let pHash = "";
+    try {
+      pHash = await calculatePHash(img.url);
+      console.log(`[Auto High-Res Fingerprint] pHash: ${pHash}`);
+    } catch (e) {
+      console.error(`[Auto High-Res] Failed to calculate pHash`, e);
+      pHash = "unknown";
+    }
+
+    let originalRes = { width: 0, height: 0 };
+    try {
+      originalRes = await getImageResolution(img.url);
+      console.log(`[Auto High-Res Fingerprint] Dimensions: ${originalRes.width}x${originalRes.height}`);
+    } catch (e) {
+      console.warn(`[Auto High-Res] Could not determine original resolution.`);
+    }
+
+    const originalAspect = originalRes.width && originalRes.height ? originalRes.width / originalRes.height : 1.0;
+    
+    let dominantColors: string[] = [];
+    try {
+      dominantColors = await extractPalette(img.url);
+      console.log(`[Auto High-Res Fingerprint] Dominant colors: ${dominantColors.join(', ')}`);
+    } catch (e) {
+      console.warn(`[Auto High-Res] Could not extract palette.`);
+    }
+
+    let originalAvgColor = { r: 127, g: 127, b: 127 };
+    try {
+      originalAvgColor = await getAverageColor(img.url);
+      console.log(`[Auto High-Res Fingerprint] Average Color: r:${originalAvgColor.r} g:${originalAvgColor.g} b:${originalAvgColor.b}`);
+    } catch (e) {
+      console.warn(`[Auto High-Res] Could not extract average color.`);
+    }
+
+    const fingerprint = {
+      pHash,
+      width: originalRes.width,
+      height: originalRes.height,
+      aspectRatio: originalAspect,
+      dominantColors,
+      averageColor: originalAvgColor
+    };
+
+    console.log(`[Auto High-Res Fingerprint] Generated visual fingerprint:`, fingerprint);
+    setSearchLog(prev => [...prev, `[Auto High-Res Fingerprint] pHash: ${pHash}, Size: ${originalRes.width}x${originalRes.height}, Aspect: ${originalAspect.toFixed(2)}`]);
+
+    // STAGE 2: Reverse Image Search
+    const candidates: Array<{ url: string; provider: string }> = [];
+    const providersAttempted: string[] = [];
+    const providerErrors: string[] = [];
+
+    // Keys checks
+    const serpKey = apiKeys['SerpAPI'] || (import.meta as any).env?.VITE_SERPAPI_KEY;
+    const bingKey = apiKeys['BingVisualSearch'];
+    const tineyeKey = apiKeys['TinEye'];
+    const yandexKey = apiKeys['YandexImages'];
+
+    const isAnyReverseProviderConfigured = !!(serpKey || bingKey || tineyeKey || yandexKey);
+
+    // Direct pattern checks as "Other supported reverse-image providers"
+    let hasMatchedDirectResolver = false;
+    let directResolverName = "";
+    let directResolvedUrl = "";
+
+    if (img.url.includes("upload.wikimedia.org") && img.url.includes("/thumb/")) {
+      const parts = img.url.split('/');
+      const thumbIndex = parts.indexOf('thumb');
+      if (thumbIndex !== -1) {
+        hasMatchedDirectResolver = true;
+        directResolverName = "Wikimedia Commons";
+        directResolvedUrl = [...parts.slice(0, thumbIndex), ...parts.slice(thumbIndex + 1, parts.length - 1)].join('/');
+      }
+    } else if (img.url.includes('images.unsplash.com')) {
+      hasMatchedDirectResolver = true;
+      directResolverName = "Unsplash";
+      let newUrl = img.url.replace(/&w=\d+/, '').replace(/\?w=\d+/, '');
+      newUrl = newUrl.replace(/w=\d+&/, '');
+      newUrl += newUrl.includes('?') ? '&w=4000' : '?w=4000';
+      directResolvedUrl = newUrl;
+    } else if (img.url.includes('images.pexels.com')) {
+      hasMatchedDirectResolver = true;
+      directResolverName = "Pexels";
+      let newUrl = img.url.replace(/&w=\d+/, '').replace(/\?w=\d+/, '');
+      newUrl = newUrl.replace(/w=\d+&/, '');
+      directResolvedUrl = newUrl;
+    }
+
+    // 1. Google Lens (if available through configured provider)
+    providersAttempted.push("Google Lens");
+    if (serpKey) {
+      setFloatingImages(prev => prev.map(f => f.id === img.id ? { ...f, searchStatus: "Searching provider (Google Lens)..." } : f));
+      console.log("[Auto High-Res Search] Querying Google Lens (via SerpAPI)...");
+      try {
+        const url = `https://serpapi.com/search.json?engine=google_lens&url=${encodeURIComponent(img.url)}&api_key=${serpKey}`;
+        const res = await fetch(url);
+        if (!res.ok) throw new Error(`HTTP Error ${res.status}: ${res.statusText}`);
+        const data = await res.json();
+        if (data.error) throw new Error(data.error);
+
+        const visualMatches = data.visual_matches || [];
+        visualMatches.forEach((match: any) => {
+          if (match.thumbnail) candidates.push({ url: match.thumbnail, provider: "Google Lens" });
+          if (match.images && match.images[0] && match.images[0].url) {
+            candidates.push({ url: match.images[0].url, provider: "Google Lens" });
+          }
+        });
+        console.log(`[Auto High-Res Search] Google Lens returned ${visualMatches.length} visual matches.`);
+        setSearchLog(prev => [...prev, `[Google Lens] Found ${visualMatches.length} raw matches.`]);
+      } catch (err: any) {
+        console.error(`[Auto High-Res Search] Google Lens failed:`, err);
+        providerErrors.push(`Google Lens failed: ${err.message || err}`);
+        setSearchLog(prev => [...prev, `[Google Lens] Error: ${err.message || err}`]);
+      }
+    } else {
+      console.warn("[Auto High-Res Search] Google Lens skipped. SerpAPI key is not configured.");
+      setSearchLog(prev => [...prev, `[Google Lens] Skip: API key is not configured in settings.`]);
+    }
+
+    // 2. Bing Visual Search
+    providersAttempted.push("Bing Visual Search");
+    if (bingKey) {
+      setFloatingImages(prev => prev.map(f => f.id === img.id ? { ...f, searchStatus: "Searching provider (Bing)..." } : f));
+      console.log("[Auto High-Res Search] Querying Bing Visual Search...");
+      try {
+        const url = `https://api.bing.microsoft.com/v7.0/images/visualsearch`;
+        const res = await fetch(url, {
+          method: 'POST',
+          headers: {
+            'Ocp-Apim-Subscription-Key': bingKey,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            imageInfo: { url: img.url }
+          })
+        });
+        if (!res.ok) throw new Error(`HTTP Error ${res.status}`);
+        const data = await res.json();
+        const tags = data.tags || [];
+        let rCount = 0;
+        tags.forEach((tag: any) => {
+          if (tag.actions) {
+            tag.actions.forEach((action: any) => {
+              if (action.actionType === 'VisualSearch' && action.data && action.data.value) {
+                action.data.value.forEach((itm: any) => {
+                  if (itm.contentUrl) {
+                    candidates.push({ url: itm.contentUrl, provider: "Bing Visual Search" });
+                    rCount++;
+                  }
+                });
+              }
+            });
+          }
+        });
+        console.log(`[Auto High-Res Search] Bing Visual Search returned ${rCount} candidates.`);
+        setSearchLog(prev => [...prev, `[Bing Visual Search] Found ${rCount} raw matches.`]);
+      } catch (err: any) {
+        console.error(`[Auto High-Res Search] Bing Visual Search failed:`, err);
+        providerErrors.push(`Bing Visual Search failed: ${err.message || err}`);
+        setSearchLog(prev => [...prev, `[Bing Visual Search] Error: ${err.message || err}`]);
+      }
+    } else {
+      console.warn("[Auto High-Res Search] Bing Visual Search skipped. Key is not configured.");
+      setSearchLog(prev => [...prev, `[Bing Visual Search] Skip: API key is not configured.`]);
+    }
+
+    // 3. TinEye
+    providersAttempted.push("TinEye");
+    if (tineyeKey) {
+      setFloatingImages(prev => prev.map(f => f.id === img.id ? { ...f, searchStatus: "Searching provider (TinEye)..." } : f));
+      console.log("[Auto High-Res Search] Querying TinEye...");
+      try {
+        throw new Error("TinEye API configuration requires active commercial account credentials.");
+      } catch (err: any) {
+        console.error(`[Auto High-Res Search] TinEye failed:`, err);
+        providerErrors.push(`TinEye failed: ${err.message || err}`);
+        setSearchLog(prev => [...prev, `[TinEye] Error: ${err.message || err}`]);
+      }
+    } else {
+      console.warn("[Auto High-Res Search] TinEye skipped. Key is not configured.");
+      setSearchLog(prev => [...prev, `[TinEye] Skip: API key is not configured.`]);
+    }
+
+    // 4. Yandex Images
+    providersAttempted.push("Yandex Images");
+    if (yandexKey) {
+      setFloatingImages(prev => prev.map(f => f.id === img.id ? { ...f, searchStatus: "Searching provider (Yandex)..." } : f));
+      console.log("[Auto High-Res Search] Querying Yandex Images...");
+      try {
+        throw new Error("Yandex Images API key requires custom translator proxy.");
+      } catch (err: any) {
+        console.error(`[Auto High-Res Search] Yandex Images failed:`, err);
+        providerErrors.push(`Yandex Images failed: ${err.message || err}`);
+        setSearchLog(prev => [...prev, `[Yandex Images] Error: ${err.message || err}`]);
+      }
+    } else {
+      console.warn("[Auto High-Res Search] Yandex Images skipped. Key is not configured.");
+      setSearchLog(prev => [...prev, `[Yandex Images] Skip: API key is not configured.`]);
+    }
+
+    // 5. Direct Pattern Resolvers (Other supported reverse-image providers)
+    providersAttempted.push("Direct Pattern Resolvers");
+    if (hasMatchedDirectResolver && directResolvedUrl) {
+      setFloatingImages(prev => prev.map(f => f.id === img.id ? { ...f, searchStatus: `Searching provider (${directResolverName})...` } : f));
+      candidates.push({ url: directResolvedUrl, provider: `${directResolverName} Direct Resolver` });
+      console.log(`[Auto High-Res Search] Direct resolver matched and candidate added: ${directResolvedUrl}`);
+      setSearchLog(prev => [...prev, `[Direct Resolver] Added high-res direct pattern match from ${directResolverName}.`]);
+    } else {
+      console.log("[Auto High-Res Search] Direct pattern skipped. Base image URL does not match partner structures.");
+    }
+
+    // If reverse image search cannot be performed because no provider is configured/enabled and no direct pattern matches:
+    if (!isAnyReverseProviderConfigured && !hasMatchedDirectResolver) {
+      const whyExplanation = "To perform reverse search, please configure a Google Lens (SerpAPI) or Bing Visual Search key.";
+      console.warn(`[Auto High-Res Search] Failed: ${whyExplanation}`);
+      setSearchLog(prev => [...prev, `[Auto High-Res] No reverse search providers configured/enabled.`]);
+      
+      setFloatingImages(prev => prev.map(f => f.id === img.id ? {
+        ...f, 
+        isSearchInProgress: false,
+        searchStatus: `Missing keys. ${whyExplanation}`
+      } : f));
+      
+      setTimeout(() => {
+        setFloatingImages(prev => prev.map(f => f.id === img.id ? { ...f, searchStatus: undefined } : f));
+      }, 6000);
+      return;
+    }
+
+    // STAGE 3 & 4: Candidate Ranking & Validation
+    setFloatingImages(prev => prev.map(f => f.id === img.id ? { ...f, searchStatus: "Comparing..." } : f));
+    console.log(`[Auto High-Res Validation] Comparing and validating ${candidates.length} visual matches...`);
+
+    interface RankedCandidate {
+      url: string;
+      provider: string;
+      similarity: number;
+      width: number;
+      height: number;
+      score: number;
+    }
+
+    const rankedCandidates: RankedCandidate[] = [];
+
+    for (const cand of candidates) {
+      const candUrl = cand.url;
+      try {
+        console.log(`[Auto High-Res Validation] Validating candidate: ${candUrl} from ${cand.provider}...`);
+        
+        // Load candidate and verify resolution
+        const candRes = await getImageResolution(candUrl);
+        if (candRes.width <= originalRes.width || candRes.height <= originalRes.height) {
+          console.log(`[Candidate Rejected] ${cand.provider} - ${candUrl} has smaller/equal resolution (${candRes.width}x${candRes.height} vs original ${originalRes.width}x${originalRes.height}).`);
+          setSearchLog(prev => [...prev, `[Validation Rejected] ${cand.provider} match resolution too low: ${candRes.width}x${candRes.height}`]);
+          continue;
+        }
+
+        // Validate aspect ratio similarity
+        const candAspect = candRes.width / candRes.height;
+        const aspectSim = calculateAspectRatioSimilarity(originalAspect, candAspect);
+        if (aspectSim < 0.82) { // Allow slight crop variations up to 18% difference in aspect ratio
+          console.log(`[Candidate Rejected] ${cand.provider} - Aspect ratio mismatch (${candAspect.toFixed(2)} vs original ${originalAspect.toFixed(2)}, similarity: ${aspectSim.toFixed(2)}).`);
+          setSearchLog(prev => [...prev, `[Validation Rejected] ${cand.provider} match aspect mismatch: sim: ${aspectSim.toFixed(2)}`]);
+          continue;
+        }
+
+        // Validate Subject visual matching via pHash Hamming
+        const candPHash = await calculatePHash(candUrl);
+        const hamSim = calculateHammingSimilarity(pHash, candPHash);
+        if (hamSim < 0.70) { // Reject mismatches (similarity must be at least 70%)
+          console.log(`[Candidate Rejected] ${cand.provider} - Subject/composition visual mismatch (Hamming similarity: ${hamSim.toFixed(2)}).`);
+          setSearchLog(prev => [...prev, `[Validation Rejected] ${cand.provider} visual mismatch: sim: ${hamSim.toFixed(2)}`]);
+          continue;
+        }
+
+        // Validate Color matching similarity
+        const candAvgColor = await getAverageColor(candUrl);
+        const colorSim = calculateColorSimilarity(originalAvgColor, candAvgColor);
+        if (colorSim < 0.70) {
+          console.log(`[Candidate Rejected] ${cand.provider} - Color profiling mismatch (Color similarity: ${colorSim.toFixed(2)}).`);
+          setSearchLog(prev => [...prev, `[Validation Rejected] ${cand.provider} color mismatch: sim: ${colorSim.toFixed(2)}`]);
+          continue;
+        }
+
+        // Calculate score for Ranking: Visual similarity is highly critical (50%), area size increase (40%), color/aspect profiling (10%)
+        const origArea = originalRes.width * originalRes.height || 1;
+        const candArea = candRes.width * candRes.height;
+        const sizeMultiplier = Math.min((candArea / origArea) / 20, 1.0); // cap size ratio boost at 20x to prevent overflows
+
+        const finalScore = (hamSim * 0.5) + (sizeMultiplier * 0.4) + (colorSim * 0.05) + (aspectSim * 0.05);
+        
+        rankedCandidates.push({
+          url: candUrl,
+          provider: cand.provider,
+          similarity: hamSim,
+          width: candRes.width,
+          height: candRes.height,
+          score: finalScore
+        });
+
+        console.log(`[Candidate Accepted] ${candUrl} (Provider: ${cand.provider}, Similarity: ${hamSim.toFixed(2)}, Size: ${candRes.width}x${candRes.height}, Score: ${finalScore.toFixed(3)})`);
+        setSearchLog(prev => [...prev, `[Validation Accepted] Match from ${cand.provider}: ${candRes.width}x${candRes.height} (score: ${finalScore.toFixed(2)})`]);
+      } catch (err: any) {
+        console.warn(`[Auto High-Res Validation] Skip candidate due to loading/CORS error: ${candUrl}`, err);
+        setSearchLog(prev => [...prev, `[Validation Warning] Skipped matching candidate due to loading error.`]);
+      }
+    }
+
+    // Sort candidates by ranking score
+    rankedCandidates.sort((a, b) => b.score - a.score);
+
+    if (rankedCandidates.length > 0) {
+      const bestMatch = rankedCandidates[0];
+      console.log(`[Auto High-Res Replacement] Selected best candidate with score ${bestMatch.score.toFixed(3)}: ${bestMatch.url} (${bestMatch.width}x${bestMatch.height})`);
+      setSearchLog(prev => [...prev, `[Auto High-Res] Selection complete. Replacing with: ${bestMatch.width}x${bestMatch.height} via ${bestMatch.provider}.`]);
+
+      // STAGE 5: Replacement & Downloading
+      setFloatingImages(prev => prev.map(f => f.id === img.id ? { ...f, searchStatus: "Downloading..." } : f));
+      
+      try {
+        const base64Url = await fetchImageAsBase64(bestMatch.url);
+        
+        setFloatingImages(prev => prev.map(f => f.id === img.id ? { ...f, searchStatus: "Replacing image..." } : f));
+        await new Promise(r => setTimeout(r, 600));
+
+        // State mutator: Keeps ALL positioning, rotation, scale, zoom, opacities, lock states intact while replacing the backing resource!
+        setFloatingImages(prev => prev.map(f => f.id === img.id ? {
+          ...f,
+          url: base64Url,
+          isHighRes: true,
+          isSearchInProgress: false,
+          searchStatus: undefined,
+          pHash: bestMatch.similarity !== 0.5 ? pHash : f.pHash // update pHash reference if loaded correctly
+        } : f));
+
+        console.log(`[Auto High-Res] Successfully replaced low-res asset ID ${img.id} (${originalRes.width}x${originalRes.height}) with ${bestMatch.width}x${bestMatch.height} visual match!`);
+      } catch (downErr: any) {
+        console.error("[Auto High-Res] Downloading matching image failed:", downErr);
+        setFloatingImages(prev => prev.map(f => f.id === img.id ? { 
+          ...f, 
+          isSearchInProgress: false, 
+          searchStatus: `Download failed: ${downErr.message || downErr}` 
+        } : f));
+        setTimeout(() => {
+          setFloatingImages(prev => prev.map(f => f.id === img.id ? { ...f, searchStatus: undefined } : f));
+        }, 3500);
+      }
+    } else {
+      console.log("[Auto High-Res] No higher resolution versions found across any reverse-search providers.");
+      setSearchLog(prev => [...prev, `[Auto High-Res] Searched all enabled providers but no suitable high-resolution visual matches were validated.`]);
+      
+      setFloatingImages(prev => prev.map(f => f.id === img.id ? { 
+        ...f, 
+        isSearchInProgress: false, 
+        searchStatus: "No higher resolution version found" 
+      } : f));
+
+      setTimeout(() => {
+        setFloatingImages(prev => prev.map(f => f.id === img.id ? { ...f, isSearchInProgress: false, searchStatus: undefined} : f));
+      }, 3500);
+    }
+  };
+
+  const logWindowLockState = useCallback((windowType: 'image' | 'note' | 'sketch', windowId: string, isLocked: boolean) => {
+    console.log(`[LOCK_TOGGLE] Window Type: ${windowType}, ID: ${windowId}, New Lock State (isLocked): ${isLocked}`);
+  }, []);
+
+  // Settings
+  const [pillOpacity, setPillOpacity] = useState<number>(() => {
+    const saved = localStorage.getItem('ref-flow-pill-opacity');
+    return saved ? parseFloat(saved) : 0.95;
+  });
+  const [alwaysOnTop, setAlwaysOnTop] = useState<boolean>(() => {
+    const saved = localStorage.getItem('ref-flow-always-on-top');
+    return saved ? saved === 'true' : true;
+  });
+  const [startOnBoot, setStartOnBoot] = useState<boolean>(() => {
+    const saved = localStorage.getItem('ref-flow-start-on-boot');
+    return saved ? saved === 'true' : false;
+  });
+  const [launchMinimized, setLaunchMinimized] = useState<boolean>(() => {
+    const saved = localStorage.getItem('ref-flow-launch-minimized');
+    return saved ? saved === 'true' : false;
+  });
+  const [theme, setTheme] = useState<'light' | 'dark'>(() => {
+    return (localStorage.getItem('ref-flow-theme') as 'light' | 'dark') || 'dark';
+  });
+  
+  // Search Configuration State
+  const defaultProvidersOrder = ['Wikimedia Commons', 'Openverse', 'Pixabay', 'Pexels', 'Unsplash', 'SerpAPI', 'BingVisualSearch', 'TinEye', 'YandexImages'];
+  const [providerOrder, setProviderOrder] = useState<string[]>(() => {
+    const saved = localStorage.getItem('ref-flow-provider-order');
+    let orderList = saved ? JSON.parse(saved) : [...defaultProvidersOrder];
+    defaultProvidersOrder.forEach(p => {
+      if (!orderList.includes(p)) {
+        orderList.push(p);
+      }
+    });
+    return orderList;
+  });
+  const [providerStatus, setProviderStatus] = useState<Record<string, { enabled: boolean, testStatus?: string }>>(() => {
+    const saved = localStorage.getItem('ref-flow-provider-status');
+    return saved ? JSON.parse(saved) : {};
+  });
+  const [apiKeys, setApiKeys] = useState<Record<string, string>>(() => {
+    const saved = localStorage.getItem('ref-flow-api-keys');
+    const parsed = saved ? JSON.parse(saved) : {};
+    
+    // Auto-inject provided Bing Visual Search key
+    if (parsed['BingVisualSearch'] !== '134fc9b5a245e7125195f046a3487eb79445080f7512f3fd9f814e921650b9be') {
+      parsed['BingVisualSearch'] = '134fc9b5a245e7125195f046a3487eb79445080f7512f3fd9f814e921650b9be';
+      localStorage.setItem('ref-flow-api-keys', JSON.stringify(parsed));
+    }
+    return parsed;
+  });
+  const [configModalProvider, setConfigModalProvider] = useState<string | null>(null);
+  const [showDiagnosticsModal, setShowDiagnosticsModal] = useState<boolean>(false);
+  const [configTestStatus, setConfigTestStatus] = useState<'idle' | 'testing' | 'success' | 'failed'>('idle');
+  const [searchDiagnostics, setSearchDiagnostics] = useState<{lastSearch: Date | null, reqCount: number, resCount: number, errors: string[]}>({
+    lastSearch: null,
+    reqCount: 0,
+    resCount: 0,
+    errors: []
+  });
+
+  const updateApiKeys = (newKeys: Record<string, string>) => {
+    setApiKeys(newKeys);
+    localStorage.setItem('ref-flow-api-keys', JSON.stringify(newKeys));
+  };
+  const updateProviderStatus = (newStatus: Record<string, { enabled: boolean, testStatus?: string }>) => {
+    setProviderStatus(newStatus);
+    localStorage.setItem('ref-flow-provider-status', JSON.stringify(newStatus));
+  };
+  const updateProviderOrder = (newOrder: string[]) => {
+    setProviderOrder(newOrder);
+    localStorage.setItem('ref-flow-provider-order', JSON.stringify(newOrder));
+  };
+
+  const getProviderConfig = (provider: string) => {
+    const isFree = provider === 'Wikimedia Commons' || provider === 'Openverse';
+    const isReady = isFree || (apiKeys[provider] && (providerStatus[provider]?.testStatus === 'success' || providerStatus[provider]?.testStatus === undefined));
+    const isFailed = providerStatus[provider]?.testStatus === 'failed';
+    const isEnabled = providerStatus[provider]?.enabled ?? true;
+    const needsKey = (!isFree && !apiKeys[provider]) || (provider === 'Openverse' && false);
+
+    let badge = 'Ready';
+    if (!isEnabled) badge = 'Disabled';
+    else if (isFailed) badge = 'Connection Failed';
+    else if (needsKey) badge = 'API Key Required';
+
+    const getUrl = () => {
+      switch (provider) {
+        case 'Pixabay': return 'https://pixabay.com/api/docs/';
+        case 'Pexels': return 'https://www.pexels.com/api/';
+        case 'Unsplash': return 'https://unsplash.com/developers';
+        case 'SerpAPI': return 'https://serpapi.com';
+        case 'Openverse': return 'https://docs.openverse.org/api/reference.html';
+        case 'BingVisualSearch': return 'https://learn.microsoft.com/en-us/bing/search-apis/bing-visual-search/';
+        case 'TinEye': return 'https://tineye.com/developers';
+        case 'YandexImages': return 'https://yandex.com/dev/xml/';
+        default: return '';
+      }
+    };
+
+    return { isEnabled, badge, url: getUrl() };
+  };
+
+  const [shortcuts, setShortcuts] = useState(() => {
+    const defaultKeys = {
+      minimize: 'ctrl+alt+m',
+      newNote: 'ctrl+alt+n',
+      newSketch: 'ctrl+alt+s',
+      manager: 'ctrl+alt+p',
+      settings: 'ctrl+alt+c',
+      closeApp: 'ctrl+alt+q',
+      flipBoards: 'ctrl+alt+b',
+      toggleWindows: 'ctrl+alt+w'
+    };
+    const saved = localStorage.getItem('ref-flow-shortcuts');
+    if (saved) {
+      const parsed = JSON.parse(saved);
+      // Ensure all old single-character keys or missing keys get properly migrated to the control+alt configuration
+      const migrated: any = {};
+      Object.keys(defaultKeys).forEach((k) => {
+        const val = parsed[k];
+        if (val && val.startsWith('ctrl+alt+')) {
+          migrated[k] = val;
+        } else if (val) {
+          migrated[k] = `ctrl+alt+${val}`;
+        } else {
+          migrated[k] = (defaultKeys as any)[k];
+        }
+      });
+      return migrated;
+    }
+    return defaultKeys;
+  });
+
+  const selectProjectOfId = async (id: string) => {
+    const p = projects.find(proj => proj.id === id);
+    if (!p) return;
+    setActiveProjectIdState(p.id);
+    await setActiveProjectId(p.id);
+    setImages(p.images || []);
+    setFloatingImages(p.floatingImages || []);
+    setFloatingNotes(p.floatingNotes || []);
+    setFloatingSketches(p.floatingSketches || []);
+    
+    if (p.directoryPath) {
+        setNeedsPermission(false);
+    } else if (p.directoryHandle) {
+        const perm = await p.directoryHandle.queryPermission({ mode: 'readwrite' });
+        setNeedsPermission(perm !== 'granted');
+    } else {
+        setNeedsPermission(false);
+    }
+  };
+
+  const flipThroughBoards = async () => {
+    if (projects.length <= 1) return;
+    const currentIndex = projects.findIndex(p => p.id === activeProjectId);
+    const nextIndex = currentIndex === -1 ? 0 : (currentIndex + 1) % projects.length;
+    const nextProject = projects[nextIndex];
+    if (nextProject) {
+      await selectProjectOfId(nextProject.id);
+    }
+  };
+
+  const toggleAllCollapsedState = () => {
+    const allCollapsed = floatingNotes.every(n => n.isCollapsed) && floatingImages.every(i => i.isCollapsed) && floatingSketches.every(s => s.isCollapsed);
+    setFloatingNotes(prev => prev.map(n => ({...n, isCollapsed: !allCollapsed})));
+    setFloatingImages(prev => prev.map(i => ({...i, isCollapsed: !allCollapsed})));
+    setFloatingSketches(prev => prev.map(s => ({...s, isCollapsed: !allCollapsed})));
+  };
+
+  const getElectron = () => ((window as any).require ? (window as any).require('electron') : null);
+
+  const sanitizeProjectFolderName = (name: string) =>
+    (name || 'board')
+      .replace(/[^a-z0-9._-]+/gi, '_')
+      .replace(/^_+|_+$/g, '')
+      .toLowerCase()
+      .slice(0, 80) || 'board';
+
+  const getInstalledAutosaveRoot = async () => {
+    const electron = getElectron();
+    if (!electron?.ipcRenderer) return "";
+    try {
+      return await electron.ipcRenderer.invoke('get-default-data-directory');
+    } catch (e) {
+      console.warn("Could not read default data directory:", e);
+      return "";
+    }
+  };
+
+  useEffect(() => {
+    const electron = getElectron();
+    if (!electron?.ipcRenderer) return;
+
+    let isMounted = true;
+    electron.ipcRenderer.invoke('get-display-layout').then((layout: DisplayLayout) => {
+      if (isMounted && layout?.primary) setDisplayLayout(layout);
+    }).catch((e: any) => {
+      console.warn("Could not read display layout:", e);
+    });
+
+    const handleLayoutChange = (_event: any, layout: DisplayLayout) => {
+      if (layout?.primary) setDisplayLayout(layout);
+    };
+    electron.ipcRenderer.on('display-layout-changed', handleLayoutChange);
+
+    return () => {
+      isMounted = false;
+      electron.ipcRenderer.removeListener('display-layout-changed', handleLayoutChange);
+    };
+  }, []);
+
+  useEffect(() => {
+    const electron = getElectron();
+    if (!electron?.ipcRenderer) return;
+    const sendHeartbeat = () => electron.ipcRenderer.send('renderer-heartbeat');
+    sendHeartbeat();
+    const heartbeat = window.setInterval(sendHeartbeat, 1000);
+    return () => window.clearInterval(heartbeat);
+  }, []);
+
+  useEffect(() => {
+    const electron = getElectron();
+    if (!electron?.ipcRenderer) return;
+    let clearTimer = 0;
+    const handleDragError = (_event: any, _id: string, message: string) => {
+      setDragError(message || 'This reference could not be dragged into the other app.');
+      window.clearTimeout(clearTimer);
+      clearTimer = window.setTimeout(() => setDragError(''), 3500);
+    };
+    electron.ipcRenderer.on('reference-drag-error', handleDragError);
+    return () => {
+      window.clearTimeout(clearTimer);
+      electron.ipcRenderer.removeListener('reference-drag-error', handleDragError);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (theme === 'dark') {
+      document.documentElement.classList.add('dark');
+    } else {
+      document.documentElement.classList.remove('dark');
+    }
+  }, [theme]);
+
+  // Initialize DB
+  useEffect(() => {
+    async function init() {
+      const installedRoot = await getInstalledAutosaveRoot();
+      if (installedRoot) setDefaultAutosaveRoot(installedRoot);
+      const allProjects = await getProjects();
+      let currentActiveId = await getActiveProjectId();
+      
+      if (allProjects.length === 0) {
+        const defaultProj = await createProject('Default Board');
+        setProjects([defaultProj]);
+        setActiveProjectIdState(defaultProj.id);
+        await setActiveProjectId(defaultProj.id);
+        if (installedRoot) {
+          const electron = getElectron();
+          const path = electron?.require ? electron.require('path') : null;
+          const dirPath = path ? path.join(installedRoot, sanitizeProjectFolderName(defaultProj.name)) : "";
+          if (dirPath) {
+            await updateProject(defaultProj.id, { directoryPath: dirPath });
+            await syncBoardToPath({ ...defaultProj, directoryPath: dirPath }, dirPath);
+            setProjects(await getProjects());
+          }
+        }
+      } else {
+        setProjects(allProjects);
+        if (!currentActiveId || !allProjects.find(p => p.id === currentActiveId)) {
+          currentActiveId = allProjects[0].id;
+          await setActiveProjectId(currentActiveId);
+        }
+        
+        setActiveProjectIdState(currentActiveId);
+        const activeProj = allProjects.find(p => p.id === currentActiveId);
+        if (activeProj) {
+          setImages(activeProj.images || []);
+          setFloatingImages(activeProj.floatingImages || []);
+          setFloatingNotes(activeProj.floatingNotes || []);
+          setFloatingSketches(activeProj.floatingSketches || []);
+          
+          if (activeProj.directoryPath) {
+             setNeedsPermission(false);
+          } else if (installedRoot) {
+             const electron = getElectron();
+             const path = electron?.require ? electron.require('path') : null;
+             const dirPath = path ? path.join(installedRoot, sanitizeProjectFolderName(activeProj.name)) : "";
+             if (dirPath) {
+               await updateProject(activeProj.id, { directoryPath: dirPath });
+               await syncBoardToPath({ ...activeProj, directoryPath: dirPath }, dirPath);
+               setProjects(await getProjects());
+               setNeedsPermission(false);
+             }
+          } else if (activeProj.directoryHandle) {
+             const perm = await activeProj.directoryHandle.queryPermission({ mode: 'readwrite' });
+             setNeedsPermission(perm !== 'granted');
+          } else {
+             setNeedsPermission(false);
+          }
+        }
+      }
+      setIsLoading(false);
+    }
+    init();
+  }, []);
+
+  const syncBoardToHandle = async (project: Project, dirHandle: any) => {
+    try {
+      if ((await dirHandle.queryPermission({ mode: 'readwrite' })) !== 'granted') {
+          return;
+      }
+
+      const sanitizeName = (value: string) => (value || 'untitled')
+        .replace(/[^a-z0-9._-]+/gi, '_')
+        .replace(/^_+|_+$/g, '')
+        .slice(0, 80) || 'untitled';
+
+      const extensionForUrl = (url: string, fallback = 'bin') => {
+        const lower = (url || '').toLowerCase();
+        if (lower.startsWith('data:image/png') || lower.includes('.png')) return 'png';
+        if (lower.startsWith('data:image/webp') || lower.includes('.webp')) return 'webp';
+        if (lower.startsWith('data:image/gif') || lower.includes('.gif')) return 'gif';
+        if (lower.startsWith('data:application/pdf') || lower.includes('.pdf')) return 'pdf';
+        if (lower.startsWith('data:image/jpeg') || lower.startsWith('data:image/jpg') || lower.includes('.jpg') || lower.includes('.jpeg')) return 'jpg';
+        return fallback;
+      };
+
+      const writeTextFile = async (fileName: string, content: string) => {
+        const fileHandle = await dirHandle.getFileHandle(fileName, { create: true });
+        const writable = await fileHandle.createWritable();
+        await writable.write(content);
+        await writable.close();
+      };
+      
+      const saveBase64 = async (b64: string, fileName: string) => {
+        if (!b64 || !b64.startsWith('data:')) return;
+        try {
+          const res = await fetch(b64);
+          const blob = await res.blob();
+          const fileHandle = await dirHandle.getFileHandle(fileName, { create: true });
+          const writable = await fileHandle.createWritable();
+          await writable.write(blob);
+          await writable.close();
+        } catch (e) {
+          console.error(`Failed to export image:`, e);
+        }
+      };
+
+      const manifestProject = {
+        ...project,
+        directoryHandle: undefined,
+        exportedAt: new Date().toISOString()
+      };
+      await writeTextFile('board.json', JSON.stringify(manifestProject, null, 2));
+
+      if (project.images && project.images.length > 0) {
+        let i = 1;
+        for (const img of project.images) {
+          await saveBase64(img, `background_${i}.${extensionForUrl(img, 'png')}`);
+          i++;
+        }
+      }
+
+      if (project.floatingImages && project.floatingImages.length > 0) {
+        for (const img of project.floatingImages) {
+          await saveBase64(img.url, `floating_${sanitizeName(img.id)}.${extensionForUrl(img.url, img.type === 'pdf' ? 'pdf' : 'png')}`);
+        }
+      }
+
+      let content = `# Notes for ${project.name}\n\n`;
+      if (project.floatingNotes && project.floatingNotes.length > 0) {
+        project.floatingNotes.forEach((n, idx) => {
+          content += `## Note ${idx + 1}\n${n.text}\n\n---\n\n`;
+        });
+      } else {
+        content += `No notes available.\n`;
+      }
+      await writeTextFile('notes.md', content);
+      await writeTextFile('sketches.json', JSON.stringify(project.floatingSketches || [], null, 2));
+    } catch (err: any) {
+      console.error("Auto-sync failed", err);
+    }
+  };
+
+  const syncBoardToPath = async (project: Project, directoryPath: string) => {
+    const electron = (window as any).require ? (window as any).require('electron') : null;
+    if (!electron || !directoryPath) return;
+
+    try {
+      const fs = electron.require('fs');
+      const path = electron.require('path');
+      fs.mkdirSync(directoryPath, { recursive: true });
+
+      const sanitizeName = (value: string) => (value || 'untitled')
+        .replace(/[^a-z0-9._-]+/gi, '_')
+        .replace(/^_+|_+$/g, '')
+        .slice(0, 80) || 'untitled';
+
+      const extensionForUrl = (url: string, fallback = 'bin') => {
+        const lower = (url || '').toLowerCase();
+        if (lower.startsWith('data:image/png') || lower.includes('.png')) return 'png';
+        if (lower.startsWith('data:image/webp') || lower.includes('.webp')) return 'webp';
+        if (lower.startsWith('data:image/gif') || lower.includes('.gif')) return 'gif';
+        if (lower.startsWith('data:application/pdf') || lower.includes('.pdf')) return 'pdf';
+        if (lower.startsWith('data:image/jpeg') || lower.startsWith('data:image/jpg') || lower.includes('.jpg') || lower.includes('.jpeg')) return 'jpg';
+        return fallback;
+      };
+
+      const writeText = (fileName: string, content: string) => {
+        fs.writeFileSync(path.join(directoryPath, fileName), content, 'utf8');
+      };
+
+      const writeDataUrl = (dataUrl: string, fileName: string) => {
+        if (!dataUrl || !dataUrl.startsWith('data:')) return;
+        const base64Data = dataUrl.split(',')[1] || '';
+        fs.writeFileSync(path.join(directoryPath, fileName), Buffer.from(base64Data, 'base64'));
+      };
+
+      const manifestProject = {
+        ...project,
+        directoryHandle: undefined,
+        exportedAt: new Date().toISOString()
+      };
+
+      writeText('board.json', JSON.stringify(manifestProject, null, 2));
+      writeText('sketches.json', JSON.stringify(project.floatingSketches || [], null, 2));
+
+      let notes = `# Notes for ${project.name}\n\n`;
+      if (project.floatingNotes && project.floatingNotes.length > 0) {
+        project.floatingNotes.forEach((n, idx) => {
+          notes += `## Note ${idx + 1}\n${n.text}\n\n---\n\n`;
+        });
+      } else {
+        notes += `No notes available.\n`;
+      }
+      writeText('notes.md', notes);
+
+      (project.images || []).forEach((img, idx) => {
+        writeDataUrl(img, `background_${idx + 1}.${extensionForUrl(img, 'png')}`);
+      });
+      (project.floatingImages || []).forEach((img) => {
+        writeDataUrl(img.url, `floating_${sanitizeName(img.id)}.${extensionForUrl(img.url, img.type === 'pdf' ? 'pdf' : 'png')}`);
+      });
+    } catch (err) {
+      console.error("Native folder sync failed", err);
+    }
+  };
+
+  // Save changes automatically
+  const debounceTimer = useRef<number | null>(null);
+  useEffect(() => {
+    if (isLoading || !activeProjectId) return;
+    
+    if (debounceTimer.current) window.clearTimeout(debounceTimer.current);
+    debounceTimer.current = window.setTimeout(async () => {
+      await updateProject(activeProjectId, {
+        images,
+        floatingImages,
+        floatingNotes,
+        floatingSketches
+      });
+      const all = await getProjects();
+      setProjects(all);
+      
+      const activeProj = all.find(p => p.id === activeProjectId);
+      if (activeProj?.directoryPath) {
+        await syncBoardToPath(activeProj, activeProj.directoryPath);
+      } else if (activeProj?.directoryHandle) {
+        await syncBoardToHandle(activeProj, activeProj.directoryHandle);
+      }
+    }, 1000);
+    
+    return () => {
+      if (debounceTimer.current) window.clearTimeout(debounceTimer.current);
+    }
+  }, [images, floatingImages, floatingNotes, floatingSketches, activeProjectId, isLoading]);
+
+  const exportBoard = async (project: Project) => {
+    try {
+      const electron = getElectron();
+      if (electron?.ipcRenderer) {
+        const path = electron.require('path');
+        const result = await electron.ipcRenderer.invoke('show-open-dialog', {
+          title: 'Choose ReferenceFlow autosave folder',
+          defaultPath: defaultAutosaveRoot || undefined,
+          properties: ['openDirectory', 'createDirectory']
+        });
+        if (result.canceled || !result.filePaths?.[0]) return;
+
+        const selectedRoot = result.filePaths[0];
+        setDefaultAutosaveRoot(selectedRoot);
+        await electron.ipcRenderer.invoke('set-default-data-directory', selectedRoot);
+        const folderName = sanitizeProjectFolderName(project.name);
+        const dirPath = path.join(selectedRoot, folderName);
+        const updatedProject = {
+          ...project,
+          images,
+          floatingImages,
+          floatingNotes,
+          floatingSketches,
+          directoryPath: dirPath
+        };
+        await updateProject(project.id, { directoryPath: dirPath });
+        const updatedProjects = await getProjects();
+        setProjects(updatedProjects);
+        await syncBoardToPath(updatedProject, dirPath);
+        if (project.id === activeProjectId) setNeedsPermission(false);
+        alert('Autosave folder enabled. ReferenceFlow will keep this board mirrored locally.');
+        return;
+      }
+
+      if (!('showDirectoryPicker' in window)) {
+        alert("Folder export is not supported in this browser.");
+        return;
+      }
+      
+      const rootHandle = await (window as any).showDirectoryPicker();
+      const folderName = project.name.replace(/[^a-z0-9]/gi, '_').toLowerCase() || 'board';
+      const dirHandle = await rootHandle.getDirectoryHandle(folderName, { create: true });
+      
+      await updateProject(project.id, { directoryHandle: dirHandle });
+      const updatedProjects = await getProjects();
+      setProjects(updatedProjects);
+      
+      // Re-find to get identical reference if needed
+      const updatedProject = updatedProjects.find(p => p.id === project.id) || project;
+      await syncBoardToHandle(updatedProject, dirHandle);
+      
+      if (project.id === activeProjectId) {
+         setNeedsPermission(false);
+      }
+      
+      alert('Export complete & Auto-save enabled for this folder!');
+    } catch (err: any) {
+      if (err.name !== 'AbortError') {
+        console.error("Export failed", err);
+        alert("Export failed: " + err.message);
+      }
+    }
+  };
+
+  // Dragging the pill around
+  const [position, setPosition] = useState(() => {
+    try {
+      const saved = localStorage.getItem('ref-flow-pill-position');
+      const parsed = saved ? JSON.parse(saved) : null;
+      if (parsed && Number.isFinite(parsed.x) && Number.isFinite(parsed.y)) return parsed;
+    } catch (error) {
+      console.warn('Could not restore the pill position:', error);
+    }
+    return { x: 50, y: 50 };
+  });
+  const hadSavedPillPositionRef = useRef(localStorage.getItem('ref-flow-pill-position') !== null);
+  const [isDraggingPill, setIsDraggingPill] = useState(false);
+  const dragStartPos = useRef({ x: 0, y: 0 });
+
+  // Resizing the pill
+  const [pillDimensions, setPillDimensions] = useState(() => {
+    const saved = localStorage.getItem('ref-flow-pill-dim-vert');
+    if (saved) return JSON.parse(saved);
+    return { width: 180, height: 400 };
+  });
+  const getPrimaryWorkspaceOrigin = useCallback(() => {
+    const primary = displayLayout?.primary;
+    if (!primary) return { x: position.x + pillDimensions.width + 20, y: position.y };
+    return {
+      x: Math.min(primary.x + primary.width - 460, Math.max(primary.x + 80, position.x + pillDimensions.width + 20)),
+      y: Math.min(primary.y + primary.height - 260, Math.max(primary.y + 80, position.y))
+    };
+  }, [displayLayout, position, pillDimensions]);
+
+  const clampPillToConnectedDisplay = useCallback((candidate: { x: number; y: number }) => {
+    if (!displayLayout) return candidate;
+    const displays = displayLayout.displays?.length
+      ? displayLayout.displays
+      : [{ bounds: displayLayout.primary, workArea: displayLayout.primary, isPrimary: true } as any];
+    const pillWidth = isRetracted ? 48 : pillDimensions.width;
+    const pillHeight = isRetracted ? 48 : pillDimensions.height;
+    const center = { x: candidate.x + pillWidth / 2, y: candidate.y + pillHeight / 2 };
+    const distanceToBounds = (bounds: { x: number; y: number; width: number; height: number }) => {
+      const dx = Math.max(bounds.x - center.x, 0, center.x - (bounds.x + bounds.width));
+      const dy = Math.max(bounds.y - center.y, 0, center.y - (bounds.y + bounds.height));
+      return (dx * dx) + (dy * dy);
+    };
+    const target = displays.reduce((best, display) =>
+      distanceToBounds(display.bounds) < distanceToBounds(best.bounds) ? display : best
+    , displays.find(display => display.isPrimary) || displays[0]);
+    const bounds = target.workArea || target.bounds;
+    const margin = 12;
+    const maxX = Math.max(bounds.x + margin, bounds.x + bounds.width - Math.min(pillWidth, bounds.width) - margin);
+    const maxY = Math.max(bounds.y + margin, bounds.y + bounds.height - Math.min(pillHeight, bounds.height) - margin);
+    return {
+      x: Math.min(maxX, Math.max(bounds.x + margin, candidate.x)),
+      y: Math.min(maxY, Math.max(bounds.y + margin, candidate.y))
+    };
+  }, [displayLayout, isRetracted, pillDimensions]);
+
+  useEffect(() => {
+    if (!displayLayout) return;
+    setPosition(current => {
+      const candidate = hadSavedPillPositionRef.current
+        ? current
+        : { x: displayLayout.primary.x + 28, y: displayLayout.primary.y + 28 };
+      hadSavedPillPositionRef.current = true;
+      const next = clampPillToConnectedDisplay(candidate);
+      return next.x === current.x && next.y === current.y ? current : next;
+    });
+  }, [displayLayout, clampPillToConnectedDisplay]);
+
+  useEffect(() => {
+    localStorage.setItem('ref-flow-pill-position', JSON.stringify(position));
+  }, [position]);
+
+  useEffect(() => {
+    const electron = getElectron();
+    if (!electron?.ipcRenderer) return;
+    electron.ipcRenderer.invoke('get-launch-context').then((context: { shouldRevealPill?: boolean }) => {
+      if (context?.shouldRevealPill) {
+        setIsPillVisible(true);
+        setIsRetracted(false);
+      }
+    }).catch((error: any) => console.warn('Could not read launch context:', error));
+  }, []);
+  const [isResizingPill, setIsResizingPill] = useState(false);
+  const resizePillStart = useRef({ x: 0, y: 0, width: 0, height: 0 });
+
+  // Handle Dragging global floating images
+  const [draggingFloatingId, setDraggingFloatingId] = useState<string | null>(null);
+  const dragFloatingOffset = useRef({ x: 0, y: 0 });
+  const opacityFrameRef = useRef<number | null>(null);
+  const pendingOpacityRef = useRef<{ id: string; opacity: number } | null>(null);
+
+  const updateFloatingOpacity = useCallback((id: string, opacity: number) => {
+    pendingOpacityRef.current = { id, opacity };
+    if (opacityFrameRef.current !== null) return;
+
+    opacityFrameRef.current = window.requestAnimationFrame(() => {
+      const pending = pendingOpacityRef.current;
+      opacityFrameRef.current = null;
+      if (!pending) return;
+      setFloatingImages(prev => prev.map(f => f.id === pending.id ? { ...f, opacity: pending.opacity } : f));
+    });
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (opacityFrameRef.current !== null) {
+        window.cancelAnimationFrame(opacityFrameRef.current);
+      }
+    };
+  }, []);
+
+  // Handle Resizing global floating images
+  const [resizingFloatingId, setResizingFloatingId] = useState<string | null>(null);
+  const resizeStart = useRef({ x: 0, width: 0 });
+
+  // Handle Dragging global floating notes
+  const [draggingNoteId, setDraggingNoteId] = useState<string | null>(null);
+  const dragNoteOffset = useRef({ x: 0, y: 0 });
+
+  // Handle Resizing global floating notes
+  const [resizingNoteId, setResizingNoteId] = useState<string | null>(null);
+  const resizeNoteStart = useRef({ x: 0, y: 0, width: 0, height: 0 });
+
+  // Handle Dragging global floating sketches
+  const [draggingSketchId, setDraggingSketchId] = useState<string | null>(null);
+  const dragSketchOffset = useRef({ x: 0, y: 0 });
+
+  // Handle Resizing global floating sketches
+  const [resizingSketchId, setResizingSketchId] = useState<string | null>(null);
+  const resizeSketchStart = useRef({ x: 0, y: 0, width: 0, height: 0 });
+
+  // Ticking ref for requestAnimationFrame throttling of mousemove events
+  const ticking = useRef(false);
+
+  const executeShortcutAction = useCallback((actionKey: string) => {
+    switch (actionKey) {
+      case 'minimize':
+        setIsRetracted(prev => !prev);
+        break;
+      case 'manager':
+        setShowManager(prev => !prev);
+        break;
+      case 'settings':
+        setShowSettings(prev => !prev);
+        break;
+      case 'newNote': {
+        const newId = Math.random().toString(36).substr(2, 9);
+        setFloatingNotes(prev => [...prev, {
+          id: newId,
+          text: '',
+          x: position.x + pillDimensions.width + 20,
+          y: position.y + 100,
+          width: 320,
+          height: 150,
+          color: '#fef3c7',
+          isCollapsed: false,
+          isLocked: false
+        }]);
+        setTopWindowId(newId);
+        break;
+      }
+      case 'newSketch': {
+        const newId = Math.random().toString(36).substr(2, 9);
+        setFloatingSketches(prev => [...prev, {
+          id: newId,
+          lines: [],
+          x: position.x + pillDimensions.width + 20,
+          y: position.y + 200,
+          width: 300,
+          height: 300,
+          backgroundColor: '#ffffff',
+          isCollapsed: false,
+          isLocked: false
+        }]);
+        setTopWindowId(newId);
+        break;
+      }
+      case 'closeApp': {
+        const electron = (window as any).require ? (window as any).require('electron') : null;
+        const ipcRenderer = electron ? electron.ipcRenderer : null;
+        if (ipcRenderer) {
+          ipcRenderer.send('close-app');
+        } else {
+          window.close();
+        }
+        break;
+      }
+      case 'flipBoards':
+        flipThroughBoards();
+        break;
+      case 'toggleWindows':
+        toggleAllCollapsedState();
+        break;
+      default:
+        break;
+    }
+  }, [position, pillDimensions, flipThroughBoards, toggleAllCollapsedState]);
+
+  // Synchronize taskbar option to Electron
+  useEffect(() => {
+    localStorage.setItem('ref-flow-show-in-taskbar', showInTaskbar.toString());
+    const electron = (window as any).require ? (window as any).require('electron') : null;
+    if (electron && electron.ipcRenderer) {
+      electron.ipcRenderer.send('set-skip-taskbar', !showInTaskbar);
+    }
+  }, [showInTaskbar]);
+
+  useEffect(() => {
+    localStorage.setItem('ref-flow-always-on-top', alwaysOnTop.toString());
+    const electron = (window as any).require ? (window as any).require('electron') : null;
+    if (electron && electron.ipcRenderer) {
+      electron.ipcRenderer.send('set-always-on-top', alwaysOnTop);
+    }
+  }, [alwaysOnTop]);
+
+  useEffect(() => {
+    localStorage.setItem('ref-flow-start-on-boot', startOnBoot.toString());
+    const electron = (window as any).require ? (window as any).require('electron') : null;
+    if (electron && electron.ipcRenderer) {
+      electron.ipcRenderer.send('set-start-on-boot', startOnBoot);
+    }
+  }, [startOnBoot]);
+
+  useEffect(() => {
+    localStorage.setItem('ref-flow-launch-minimized', launchMinimized.toString());
+    const electron = (window as any).require ? (window as any).require('electron') : null;
+    if (electron && electron.ipcRenderer) {
+      electron.ipcRenderer.send('set-launch-minimized', launchMinimized);
+    }
+  }, [launchMinimized]);
+
+  // Synchronize pill visibility to local storage
+  useEffect(() => {
+    localStorage.setItem('ref-flow-pill-visible', isPillVisible.toString());
+  }, [isPillVisible]);
+
+  // Sync / Register active global shortcuts in Electron main process
+  useEffect(() => {
+    const electron = (window as any).require ? (window as any).require('electron') : null;
+    if (electron && electron.ipcRenderer) {
+      console.log("[IPC] Registering global shortcuts in Electron...", shortcuts);
+      electron.ipcRenderer.send('register-global-shortcuts', shortcuts);
+    }
+  }, [shortcuts]);
+
+  // Listen to Tray Action events from the native menu
+  useEffect(() => {
+    const handleTrayAction = (event: any, action: string) => {
+      console.log(`[Tray Action] Received action: ${action}`);
+      switch (action) {
+        case 'show-pill':
+          setIsPillVisible(true);
+          setIsRetracted(false);
+          break;
+        case 'toggle-pill':
+          setIsPillVisible(prev => !prev);
+          break;
+        case 'toggle-manager':
+          setShowManager(prev => !prev);
+          break;
+        case 'toggle-search':
+          setShowSearchComponent(prev => !prev);
+          break;
+        case 'toggle-settings':
+          setShowSettings(prev => !prev);
+          break;
+        case 'show-all-references':
+          setFloatingImages(prev => prev.map(i => ({ ...i, isCollapsed: false })));
+          setFloatingNotes(prev => prev.map(n => ({ ...n, isCollapsed: false })));
+          setFloatingSketches(prev => prev.map(s => ({ ...s, isCollapsed: false })));
+          break;
+        case 'hide-all-references':
+          setFloatingImages(prev => prev.map(i => ({ ...i, isCollapsed: true })));
+          setFloatingNotes(prev => prev.map(n => ({ ...n, isCollapsed: true })));
+          setFloatingSketches(prev => prev.map(s => ({ ...s, isCollapsed: true })));
+          break;
+        case 'lock-all-references':
+          setFloatingImages(prev => prev.map(i => ({ ...i, isLocked: true })));
+          setFloatingNotes(prev => prev.map(n => ({ ...n, isLocked: true })));
+          setFloatingSketches(prev => prev.map(s => ({ ...s, isLocked: true })));
+          break;
+        case 'unlock-all-references':
+          setFloatingImages(prev => prev.map(i => ({ ...i, isLocked: false })));
+          setFloatingNotes(prev => prev.map(n => ({ ...n, isLocked: false })));
+          setFloatingSketches(prev => prev.map(s => ({ ...s, isLocked: false })));
+          break;
+        default:
+          break;
+      }
+    };
+
+    const electron = (window as any).require ? (window as any).require('electron') : null;
+    if (electron && electron.ipcRenderer) {
+      electron.ipcRenderer.on('tray-action', handleTrayAction);
+    }
+
+    return () => {
+      if (electron && electron.ipcRenderer) {
+        electron.ipcRenderer.removeListener('tray-action', handleTrayAction);
+      }
+    };
+  }, []);
+
+  // Listen to Global Shortcut triggers from the Electron main process
+  useEffect(() => {
+    const handleGlobalShortcutTrigger = (event: any, actionKey: string) => {
+      console.log(`[Global Shortcut Trigger] Key: ${actionKey}`);
+      executeShortcutAction(actionKey);
+    };
+
+    const electron = (window as any).require ? (window as any).require('electron') : null;
+    if (electron && electron.ipcRenderer) {
+      electron.ipcRenderer.on('global-shortcut-trigger', handleGlobalShortcutTrigger);
+    }
+
+    return () => {
+      if (electron && electron.ipcRenderer) {
+        electron.ipcRenderer.removeListener('global-shortcut-trigger', handleGlobalShortcutTrigger);
+      }
+    };
+  }, [executeShortcutAction]);
+
+  useEffect(() => {
+    const handleGlobalKeydown = (e: KeyboardEvent) => {
+      if ((e.target as HTMLElement).tagName === 'INPUT' || (e.target as HTMLElement).tagName === 'TEXTAREA') return;
+
+      if (matchShortcut(shortcuts.minimize, e)) {
+        executeShortcutAction('minimize');
+      } else if (matchShortcut(shortcuts.manager, e)) {
+        executeShortcutAction('manager');
+      } else if (matchShortcut(shortcuts.settings, e)) {
+        executeShortcutAction('settings');
+      } else if (matchShortcut(shortcuts.newNote, e)) {
+        executeShortcutAction('newNote');
+      } else if (matchShortcut(shortcuts.newSketch, e)) {
+        executeShortcutAction('newSketch');
+      } else if (matchShortcut(shortcuts.closeApp, e)) {
+        executeShortcutAction('closeApp');
+      } else if (matchShortcut(shortcuts.flipBoards, e)) {
+        executeShortcutAction('flipBoards');
+      } else if (matchShortcut(shortcuts.toggleWindows, e)) {
+        executeShortcutAction('toggleWindows');
+      }
+    };
+    window.addEventListener('keydown', handleGlobalKeydown);
+    
+    const handleGlobalClick = () => {
+       setSearchContextMenu(null);
+       setFloatingContextMenu(null);
+    };
+    window.addEventListener('click', handleGlobalClick);
+
+    return () => {
+      window.removeEventListener('keydown', handleGlobalKeydown);
+      window.removeEventListener('click', handleGlobalClick);
+    };
+  }, [shortcuts, projects, activeProjectId, floatingImages, floatingNotes, floatingSketches, position, pillDimensions, topWindowId, executeShortcutAction]);
+
+  // Pre-cache context menu target file
+  useEffect(() => {
+    if (floatingContextMenu) {
+      console.log(`[Context Menu] Pre-caching file for ID: ${floatingContextMenu.id}`);
+      ensureTempLocalFile(floatingContextMenu.url, floatingContextMenu.id).then(path => {
+        if (path) {
+          console.log(`[Context Menu] Pre-cached successfully to: ${path}`);
+          setContextMenuTempPath(path);
+        }
+      }).catch(err => {
+        console.error(`[Context Menu] Failed to pre-cache file:`, err);
+      });
+    } else {
+      setContextMenuTempPath('');
+    }
+  }, [floatingContextMenu]);
+
+  // Centralized interaction state references and definitions
+  const lastAppliedIgnoreRef = useRef<boolean | null>(null);
+
+  const applyCentralizedIgnoreMouseEvents = useCallback((ignore: boolean, options?: any) => {
+    if (lastAppliedIgnoreRef.current === ignore) return;
+    lastAppliedIgnoreRef.current = ignore;
+    console.log(`setIgnoreMouseEvents(${ignore})`);
+    
+    if ((window as any).electronAPI && (window as any).electronAPI.setIgnoreMouseEvents) {
+      (window as any).electronAPI.setIgnoreMouseEvents(ignore, options);
+    } else {
+      const electron = (window as any).require ? (window as any).require('electron') : null;
+      const ipcRenderer = electron ? electron.ipcRenderer : null;
+      if (ipcRenderer) {
+        try {
+          ipcRenderer.send('set-ignore-mouse-events', ignore, options);
+        } catch (e) {
+          console.warn("[Interaction State] Failed to send set-ignore-mouse-events through ipcRenderer:", e);
+        }
+      }
+    }
+  }, []);
+
+  const prevActivePanelsRef = useRef<Record<string, boolean>>({});
+
+  // Effect to log opens and closes of panels
+  useEffect(() => {
+    const panels = {
+      "Quick Reference Search": !!showSearchComponent,
+      "Settings": !!showSettings,
+      "Search Providers": !!configModalProvider,
+      "API Configuration": !!configModalProvider,
+      "Project Manager": !!showManager,
+      "Diagnostics Modal": !!showDiagnosticsModal,
+      "Search Context Menu": !!searchContextMenu,
+      "Floating Context Menu": !!floatingContextMenu,
+      "Rename Board": !!editingProjectId,
+      "Managing Project": !!managingProjectId,
+      "Note Editing": Object.values(editingNotes).some(v => v)
+    };
+
+    for (const [name, isOpen] of Object.entries(panels)) {
+      const wasOpen = !!prevActivePanelsRef.current[name];
+      if (isOpen && !wasOpen) {
+        console.log(`Panel opened: ${name}`);
+      } else if (!isOpen && wasOpen) {
+        console.log(`Panel closed: ${name}`);
+      }
+    }
+    prevActivePanelsRef.current = panels;
+  }, [
+    showSearchComponent,
+    showSettings,
+    configModalProvider,
+    showManager,
+    showDiagnosticsModal,
+    searchContextMenu,
+    floatingContextMenu,
+    editingProjectId,
+    managingProjectId,
+    editingNotes
+  ]);
+
+  // Publish real interactive rectangles to the main process. The main process
+  // polls the native cursor, so click-through can recover even when Chromium no
+  // longer receives normal pointer events over a transparent desktop area.
+  useEffect(() => {
+    const isDragActive = !!(
+      isDraggingPill || 
+      draggingFloatingId || 
+      draggingNoteId || 
+      draggingSketchId || 
+      resizingFloatingId || 
+      resizingNoteId || 
+      resizingSketchId || 
+      isResizingPill
+    );
+
+    const electron = getElectron();
+    const ipcRenderer = electron?.ipcRenderer;
+    if (!ipcRenderer) return;
+
+    let animationFrame = 0;
+    const publishInteractiveRegions = () => {
+      window.cancelAnimationFrame(animationFrame);
+      animationFrame = window.requestAnimationFrame(() => {
+        const elements = Array.from(document.querySelectorAll<HTMLElement>('.pointer-events-auto, [data-native-interactive="true"]'));
+        const regions = elements.flatMap(element => {
+          const floatingWindow = element.closest<HTMLElement>('.floating-window');
+          if (floatingWindow?.dataset.collapsed === 'true') return [];
+          if (floatingWindow?.dataset.clickThrough === 'true') {
+            const isUnlockSurface = !!element.closest('.floating-drag-handle, .floating-note-drag-handle, .floating-sketch-drag-handle');
+            if (!isUnlockSurface) return [];
+          }
+          const style = window.getComputedStyle(element);
+          if (style.display === 'none' || style.visibility === 'hidden' || style.pointerEvents === 'none') return [];
+          const rect = element.getBoundingClientRect();
+          if (rect.width < 1 || rect.height < 1 || rect.right <= 0 || rect.bottom <= 0 || rect.left >= window.innerWidth || rect.top >= window.innerHeight) return [];
+          return [{
+            x: Math.max(0, rect.left),
+            y: Math.max(0, rect.top),
+            width: Math.min(window.innerWidth, rect.right) - Math.max(0, rect.left),
+            height: Math.min(window.innerHeight, rect.bottom) - Math.max(0, rect.top)
+          }];
+        });
+        ipcRenderer.send('update-interactive-regions', { regions, forceInteractive: isDragActive });
+      });
+    };
+
+    publishInteractiveRegions();
+    const interval = window.setInterval(publishInteractiveRegions, 120);
+    window.addEventListener('resize', publishInteractiveRegions);
+    return () => {
+      window.cancelAnimationFrame(animationFrame);
+      window.clearInterval(interval);
+      window.removeEventListener('resize', publishInteractiveRegions);
+    };
+  }, [
+    isDraggingPill, 
+    draggingFloatingId, 
+    draggingNoteId, 
+    draggingSketchId, 
+    resizingFloatingId, 
+    resizingNoteId, 
+    resizingSketchId, 
+    isResizingPill,
+    floatingImages,
+    floatingNotes,
+    floatingSketches,
+    isPillVisible,
+    isRetracted,
+    showSearchComponent,
+    showSettings,
+    configModalProvider,
+    showManager,
+    showDiagnosticsModal,
+    searchContextMenu,
+    floatingContextMenu,
+    editingProjectId,
+    managingProjectId,
+    editingNotes
+  ]);
+
+  const handlePillResizeMouseDown = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    setIsResizingPill(true);
+    resizePillStart.current = {
+      x: e.clientX,
+      y: e.clientY,
+      width: pillDimensions.width,
+      height: pillDimensions.height,
+    };
+  };
+
+  const handlePillMouseDown = (e: React.MouseEvent) => {
+    if ((e.target as HTMLElement).closest('button')) {
+      return;
+    }
+    if ((e.target as HTMLElement).closest('.drag-handle')) {
+      setIsDraggingPill(true);
+      dragStartPos.current = {
+        x: e.clientX - position.x,
+        y: e.clientY - position.y
+      };
+    }
+  };
+
+  const handleSketchMouseDown = (e: React.MouseEvent, id: string) => {
+    if ((e.target as HTMLElement).closest('.floating-sketch-drag-handle')) {
+      e.stopPropagation();
+      setDraggingSketchId(id);
+      const sketch = floatingSketches.find(s => s.id === id);
+      if (sketch) {
+        dragSketchOffset.current = {
+          x: e.clientX - sketch.x,
+          y: e.clientY - sketch.y
+        };
+      }
+    }
+  };
+
+  const handleSketchResizeMouseDown = (e: React.MouseEvent, id: string) => {
+    e.stopPropagation();
+    setResizingSketchId(id);
+    const sketch = floatingSketches.find(s => s.id === id);
+    if (sketch) {
+      resizeSketchStart.current = {
+        x: e.clientX,
+        y: e.clientY,
+        width: sketch.width,
+        height: sketch.height
+      };
+    }
+  };
+
+  const handleFloatingMouseDown = (e: React.MouseEvent, id: string) => {
+    // Only drag by the header/drag-handle
+    if ((e.target as HTMLElement).closest('.floating-drag-handle')) {
+      e.stopPropagation();
+      setDraggingFloatingId(id);
+      const img = floatingImages.find(f => f.id === id);
+      if (img) {
+        dragFloatingOffset.current = {
+          x: e.clientX - img.x,
+          y: e.clientY - img.y
+        };
+      }
+    }
+  };
+
+  const startFloatingImageDrag = (e: React.MouseEvent, id: string) => {
+    if (e.button !== 0) return;
+    const target = e.target as HTMLElement;
+    if (target.closest('button, input, textarea, .no-window-drag')) return;
+    const img = floatingImages.find(f => f.id === id);
+    if (!img || img.isLocked || img.type === 'pdf') return;
+
+    e.preventDefault();
+    e.stopPropagation();
+    setTopWindowId(id);
+    setDraggingFloatingId(id);
+    dragFloatingOffset.current = {
+      x: e.clientX - img.x,
+      y: e.clientY - img.y
+    };
+  };
+
+  const handleNoteMouseDown = (e: React.MouseEvent, id: string) => {
+    if ((e.target as HTMLElement).closest('.floating-note-drag-handle')) {
+      e.stopPropagation();
+      setDraggingNoteId(id);
+      const note = floatingNotes.find(n => n.id === id);
+      if (note) {
+        dragNoteOffset.current = {
+          x: e.clientX - note.x,
+          y: e.clientY - note.y
+        };
+      }
+    }
+  };
+
+  const handleFloatingResizeMouseDown = (e: React.MouseEvent, id: string) => {
+    e.stopPropagation();
+    setResizingFloatingId(id);
+    const img = floatingImages.find(f => f.id === id);
+    if (img) {
+      resizeStart.current = {
+        x: e.clientX,
+        width: img.width
+      };
+    }
+  };
+
+  const handleNoteResizeMouseDown = (e: React.MouseEvent, id: string) => {
+    e.stopPropagation();
+    setResizingNoteId(id);
+    const note = floatingNotes.find(n => n.id === id);
+    if (note) {
+      resizeNoteStart.current = {
+        x: e.clientX,
+        y: e.clientY,
+        width: note.width,
+        height: note.height
+      };
+    }
+  };
+
+  useEffect(() => {
+    const handleGlobalMouseMove = (e: MouseEvent) => {
+      if (ticking.current) return;
+      ticking.current = true;
+
+      requestAnimationFrame(() => {
+        ticking.current = false;
+
+        if (isResizingPill) {
+          let diffX = e.clientX - resizePillStart.current.x;
+          let diffY = e.clientY - resizePillStart.current.y;
+          
+          setPillDimensions({
+             width: Math.max(160, resizePillStart.current.width + diffX),
+             height: Math.max(200, resizePillStart.current.height + diffY)
+          });
+        }
+
+        if (isDraggingPill) {
+          let newX = e.clientX - dragStartPos.current.x;
+          let newY = e.clientY - dragStartPos.current.y;
+          
+          setPosition({ x: newX, y: newY });
+        }
+
+        if (draggingFloatingId) {
+          setFloatingImages(prev => prev.map(img => {
+            if (img.id === draggingFloatingId) {
+              let newX = e.clientX - dragFloatingOffset.current.x;
+              let newY = e.clientY - dragFloatingOffset.current.y;
+              
+              return { ...img, x: newX, y: newY };
+            }
+            return img;
+          }));
+        }
+
+        if (draggingNoteId) {
+          setFloatingNotes(prev => prev.map(note => {
+            if (note.id === draggingNoteId) {
+              let newX = e.clientX - dragNoteOffset.current.x;
+              let newY = e.clientY - dragNoteOffset.current.y;
+              
+              return { ...note, x: newX, y: newY };
+            }
+            return note;
+          }));
+        }
+
+        if (draggingSketchId) {
+          setFloatingSketches(prev => prev.map(sketch => {
+            if (sketch.id === draggingSketchId) {
+              let newX = e.clientX - dragSketchOffset.current.x;
+              let newY = e.clientY - dragSketchOffset.current.y;
+              
+              return { ...sketch, x: newX, y: newY };
+            }
+            return sketch;
+          }));
+        }
+
+        if (resizingFloatingId) {
+          setFloatingImages(prev => prev.map(img => {
+            if (img.id === resizingFloatingId) {
+              const diffX = e.clientX - resizeStart.current.x;
+              return {
+                ...img,
+                width: Math.max(100, resizeStart.current.width + diffX)
+              };
+            }
+            return img;
+          }));
+        }
+
+        if (resizingNoteId) {
+          setFloatingNotes(prev => prev.map(note => {
+            if (note.id === resizingNoteId) {
+              const diffX = e.clientX - resizeNoteStart.current.x;
+              const diffY = e.clientY - resizeNoteStart.current.y;
+              return {
+                ...note,
+                width: Math.max(320, resizeNoteStart.current.width + diffX),
+                height: Math.max(100, resizeNoteStart.current.height + diffY)
+              };
+            }
+            return note;
+          }));
+        }
+
+        if (resizingSketchId) {
+          setFloatingSketches(prev => prev.map(sketch => {
+            if (sketch.id === resizingSketchId) {
+              const diffX = e.clientX - resizeSketchStart.current.x;
+              const diffY = e.clientY - resizeSketchStart.current.y;
+              return {
+                ...sketch,
+                width: Math.max(200, resizeSketchStart.current.width + diffX),
+                height: Math.max(200, resizeSketchStart.current.height + diffY)
+              };
+            }
+            return sketch;
+          }));
+        }
+      });
+    };
+    const handleGlobalMouseUp = () => {
+      // Save pill dimensions if they were changed
+      if (isResizingPill) {
+        localStorage.setItem('ref-flow-pill-dim-vert', JSON.stringify(pillDimensions));
+      }
+      if (isDraggingPill || isResizingPill) {
+        setPosition(current => clampPillToConnectedDisplay(current));
+      }
+
+      setIsResizingPill(false);
+      setIsDraggingPill(false);
+      setDraggingFloatingId(null);
+      setResizingFloatingId(null);
+      setDraggingNoteId(null);
+      setResizingNoteId(null);
+      setDraggingSketchId(null);
+      setResizingSketchId(null);
+    };
+
+    if (isResizingPill || isDraggingPill || draggingFloatingId || resizingFloatingId || draggingNoteId || resizingNoteId || draggingSketchId || resizingSketchId) {
+      window.addEventListener('mousemove', handleGlobalMouseMove);
+      window.addEventListener('mouseup', handleGlobalMouseUp);
+    }
+    return () => {
+      window.removeEventListener('mousemove', handleGlobalMouseMove);
+      window.removeEventListener('mouseup', handleGlobalMouseUp);
+    };
+  }, [isResizingPill, isDraggingPill, draggingFloatingId, resizingFloatingId, draggingNoteId, resizingNoteId, draggingSketchId, resizingSketchId, pillDimensions, clampPillToConnectedDisplay]);
+
+  // Handle Drag & Drop of Images
+  const [isDragOver, setIsDragOver] = useState(false);
+
+  useEffect(() => {
+    const handleGlobalDragOver = (e: DragEvent) => {
+      e.preventDefault();
+      setIsDragOver(true);
+    };
+
+    const handleGlobalDragLeave = (e: DragEvent) => {
+      e.preventDefault();
+      if (!e.relatedTarget) {
+        setIsDragOver(false);
+      }
+    };
+
+    const handleGlobalDrop = async (e: DragEvent) => {
+      e.preventDefault();
+      setIsDragOver(false);
+      
+      const refUrl = e.dataTransfer?.getData('application/x-reference-url');
+      if (refUrl && e.dataTransfer?.getData('text/plain')) {
+        const urlParams = e.dataTransfer.getData('text/plain');
+        fetchAndAddImage(urlParams);
+        return;
+      }
+      
+      if (e.dataTransfer?.files && e.dataTransfer.files.length > 0) {
+        try {
+          const files = Array.from(e.dataTransfer.files) as File[];
+          await importMediaFiles(files, { x: e.clientX, y: e.clientY });
+        } catch (error) {
+          console.error("Failed to load media", error);
+        }
+      }
+    };
+
+    window.addEventListener('dragover', handleGlobalDragOver);
+    window.addEventListener('dragleave', handleGlobalDragLeave);
+    window.addEventListener('drop', handleGlobalDrop);
+
+    return () => {
+      window.removeEventListener('dragover', handleGlobalDragOver);
+      window.removeEventListener('dragleave', handleGlobalDragLeave);
+      window.removeEventListener('drop', handleGlobalDrop);
+    };
+  }, [position, pillDimensions]);
+
+  const triggerNativeFilePicker = () => {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = 'image/*,application/pdf';
+    input.multiple = true;
+    input.onchange = async (e: any) => {
+      if (e.target.files) {
+        const files = Array.from(e.target.files) as File[];
+        try {
+          await importMediaFiles(files, getPrimaryWorkspaceOrigin());
+        } catch (error) {
+          console.error("Failed to load media", error);
+        }
+      }
+    };
+    input.click();
+  };
+
+  const removeImage = (idxToRemove: number) => {
+    setImages(prev => prev.filter((_, idx) => idx !== idxToRemove));
+  };
+
+  const popOutImage = (idxToRemove: number) => {
+    const url = images[idxToRemove];
+    const newId = Math.random().toString(36).substr(2, 9);
+    setFloatingImages(prev => [
+      ...prev,
+      {
+        id: newId,
+        url,
+        x: position.x + pillDimensions.width + 20,
+        y: position.y,
+        width: 300,
+        opacity: 1,
+        isLocked: false,
+        rotation: 0,
+        isCollapsed: true
+      }
+    ]);
+  };
+
+  const closeFloatingImage = (idToClose: string) => {
+    setFloatingImages(prev => prev.map(img => img.id === idToClose ? { ...img, isCollapsed: true } : img));
+  };
+
+  const createSketch = () => {
+    const newId = Math.random().toString(36).substr(2, 9);
+    const origin = getPrimaryWorkspaceOrigin();
+    setFloatingSketches(prev => [
+      ...prev,
+      {
+        id: newId,
+        lines: [],
+        x: origin.x,
+        y: origin.y + 200,
+        width: 300,
+        height: 300,
+        backgroundColor: '#ffffff',
+        isCollapsed: false
+      }
+    ]);
+    setTopWindowId(newId);
+  };
+
+  const closeSketch = (idToClose: string) => {
+    setFloatingSketches(prev => prev.map(s => s.id === idToClose ? { ...s, isCollapsed: true } : s));
+  };
+
+  const createNote = () => {
+    const newId = Math.random().toString(36).substr(2, 9);
+    const origin = getPrimaryWorkspaceOrigin();
+    setFloatingNotes(prev => [
+      ...prev,
+      {
+        id: newId,
+        text: '',
+        x: origin.x,
+        y: origin.y + 100,
+        width: 320,
+        height: 150,
+        color: '#fef3c7',
+        isCollapsed: false
+      }
+    ]);
+    setTopWindowId(newId);
+  };
+
+  const closeNote = (idToClose: string) => {
+    setFloatingNotes(prev => prev.map(n => n.id === idToClose ? { ...n, isCollapsed: true } : n));
+  };
+
+  const updateNoteText = (id: string, text: string) => {
+    setFloatingNotes(prev => prev.map(n => n.id === id ? { ...n, text } : n));
+  };
+
+  const extractPaletteForImage = async (id: string, url: string) => {
+    const palette = await extractPalette(url);
+    if (palette.length > 0) {
+      setFloatingImages(prev => prev.map(img => img.id === id ? { ...img, palette } : img));
+    }
+  };
+
+  const openProjectManager = () => {
+    setShowManager(true);
+    setIsRetracted(true);
+    setFloatingImages(prev => prev.map(img => ({ ...img, isCollapsed: true })));
+    setFloatingNotes(prev => prev.map(note => ({ ...note, isCollapsed: true })));
+    setFloatingSketches(prev => prev.map(sketch => ({ ...sketch, isCollapsed: true })));
+  };
+
+  const emptyBoardBounds = displayLayout?.primary;
+  const managerBounds = displayLayout?.primary;
+
+  return (
+    <div className="w-screen h-screen overflow-hidden pointer-events-none relative" style={{ WebkitAppRegion: 'no-drag' } as any}>
+      {/* Global Drag Overlay to prevent mouse events being swallowed by canvas/iframes/pill while dragging */}
+      {(isDraggingPill || draggingFloatingId || draggingNoteId || draggingSketchId || resizingFloatingId || resizingNoteId || resizingSketchId || isResizingPill) && (
+        <div className={`absolute inset-0 z-[100000] pointer-events-auto ${(resizingFloatingId || resizingNoteId || resizingSketchId || isResizingPill) ? 'cursor-nwse-resize' : 'cursor-move'}`} />
+      )}
+
+      {!isLoading && floatingImages.length === 0 && floatingNotes.length === 0 && floatingSketches.length === 0 && !showManager && !showSearchComponent && !showSettings && (
+        <motion.div
+          initial={{ opacity: 0, y: 8 }}
+          animate={{ opacity: 1, y: 0 }}
+          className={`absolute z-10 flex items-center justify-center px-6 pointer-events-none ${emptyBoardBounds ? '' : 'inset-0'}`}
+          style={emptyBoardBounds ? {
+            left: emptyBoardBounds.x,
+            top: emptyBoardBounds.y,
+            width: emptyBoardBounds.width,
+            height: emptyBoardBounds.height
+          } : undefined}
+        >
+          <div className={`pointer-events-auto w-full max-w-xl border rounded-2xl p-6 shadow-2xl backdrop-blur-xl ${theme === 'light' ? 'bg-white/85 border-black/10 text-slate-800' : 'bg-slate-950/75 border-white/10 text-slate-100'}`}>
+            <div className="flex items-start gap-4">
+              <div className="w-11 h-11 rounded-xl bg-sky-500/15 text-sky-400 flex items-center justify-center shrink-0">
+                <Palette className="w-5 h-5" />
+              </div>
+              <div className="min-w-0">
+                <h2 className="text-lg font-semibold tracking-tight">Start a reference board</h2>
+                <p className="mt-1 text-sm text-slate-500 dark:text-slate-400 leading-6">
+                  Drop images or PDFs anywhere, paste a URL from search, or create notes and sketches beside your references.
+                </p>
+              </div>
+            </div>
+            <div className="mt-5 grid grid-cols-1 sm:grid-cols-3 gap-2">
+              <button onClick={triggerNativeFilePicker} className="flex items-center justify-center gap-2 rounded-lg bg-sky-500 px-3 py-2.5 text-sm font-semibold text-white hover:bg-sky-400 transition-colors">
+                <Plus className="w-4 h-4" /> Add media
+              </button>
+              <button onClick={createNote} className="flex items-center justify-center gap-2 rounded-lg bg-black/5 dark:bg-white/10 px-3 py-2.5 text-sm font-semibold hover:bg-black/10 dark:hover:bg-white/15 transition-colors">
+                <FileText className="w-4 h-4" /> New note
+              </button>
+              <button onClick={createSketch} className="flex items-center justify-center gap-2 rounded-lg bg-black/5 dark:bg-white/10 px-3 py-2.5 text-sm font-semibold hover:bg-black/10 dark:hover:bg-white/15 transition-colors">
+                <PenTool className="w-4 h-4" /> Sketch
+              </button>
+            </div>
+          </div>
+        </motion.div>
+      )}
+
+      {/* 
+        ============================================================
+        THE FLOATING PILL UI
+        ============================================================
+      */}
+      <AnimatePresence initial={false}>
+      {isPillVisible && (
+        <motion.div 
+          initial={{ opacity: 0, scale: 0.92, y: 10 }}
+          animate={{
+            width: isRetracted ? 48 : pillDimensions.width,
+            height: isRetracted ? 48 : pillDimensions.height,
+            opacity: pillOpacity,
+            scale: 1,
+            y: 0,
+          }}
+          exit={{ opacity: 0, scale: 0.92, y: 8 }}
+          transition={isResizingPill ? { duration: 0 } : { type: "tween", duration: 0.18, ease: [0.22, 1, 0.36, 1] }}
+          className="absolute floating-window floating-pill pill-shell"
+          data-id="pill"
+          style={{
+            left: position.x,
+            top: position.y,
+            zIndex: 4000,
+          }}
+        >
+          <div 
+             className={`w-full h-full relative pointer-events-auto border overflow-hidden ${theme === 'light' ? 'bg-white border-black/10' : 'bg-[#1e1e24] border-white/10'} ${isDragOver ? 'ring-4 ring-sky-500 shadow-[0_0_40px_rgba(14,165,233,0.5)]' : 'shadow-2xl'} ${isRetracted ? 'rounded-full flex items-center justify-center drag-handle cursor-move' : 'rounded-[24px] p-2 flex flex-col items-center group'}`}
+             style={{ transition: 'border-radius 180ms cubic-bezier(0.22, 1, 0.36, 1), box-shadow 160ms ease, background-color 160ms ease' }}
+             onMouseDown={handlePillMouseDown}
+          >
+            <AnimatePresence mode="popLayout" initial={false}>
+              {isRetracted ? (
+                  <motion.div 
+                    key="retracted"
+                    initial={{ opacity: 0, scale: 0.5 }}
+                    animate={{ opacity: 1, scale: 1 }}
+                    exit={{ opacity: 0, scale: 0.5 }}
+                    transition={{ duration: 0.12 }}
+                    className="w-full h-full flex items-center justify-center rounded-full transition-colors drag-handle cursor-move group hover:bg-white/5"
+                    title="Drag pill"
+                  >
+                    <button 
+                      onClick={() => setIsRetracted(false)}
+                      className="w-10 h-10 flex items-center justify-center rounded-full text-sky-600 dark:text-sky-300 hover:text-slate-900 dark:hover:text-white hover:bg-black/10 dark:hover:bg-white/10 transition-colors pointer-events-auto"
+                      title="Expand Pill"
+                    >
+                      <ChevronRight className="w-5 h-5 pointer-events-none" />
+                    </button>
+                  </motion.div>
+              ) : (
+                <motion.div 
+                  key="expanded"
+                  initial={{ opacity: 0 }} 
+                  animate={{ opacity: 1 }} 
+                  exit={{ opacity: 0 }}
+                  transition={{ duration: 0.14, delay: 0.04 }}
+                  className="w-full h-full flex flex-col relative"
+                >
+                  {/* Top Drag Handle & Toggle */}
+                  <div className="shrink-0 flex flex-col items-center pb-2 drag-handle cursor-move w-full pt-1">
+                    <div className="w-8 h-1 rounded-full bg-slate-500/50 mb-2 pointer-events-none"></div>
+                    <div className="flex space-x-1">
+                      <button 
+                        onClick={() => {
+                          const allCollapsed = floatingNotes.every(n => n.isCollapsed) && floatingImages.every(i => i.isCollapsed) && floatingSketches.every(s => s.isCollapsed);
+                          setFloatingNotes(prev => prev.map(n => ({...n, isCollapsed: !allCollapsed})));
+                          setFloatingImages(prev => prev.map(i => ({...i, isCollapsed: !allCollapsed})));
+                          setFloatingSketches(prev => prev.map(s => ({...s, isCollapsed: !allCollapsed})));
+                        }}
+                        className="p-1 hover:bg-white/10 rounded-full text-slate-400 transition-colors"
+                        title="Quick Minimize / Restore All"
+                      >
+                        <EyeOff className="w-4 h-4" />
+                      </button>
+                      <button 
+                        onClick={() => setIsRetracted(true)}
+                        className="p-1 hover:bg-white/10 rounded-full text-slate-400 transition-colors"
+                        title="Retract"
+                      >
+                        <ChevronLeft className="w-4 h-4" />
+                      </button>
+                      <button 
+                        onClick={() => setIsPillVisible(false)}
+                        className="p-1 hover:bg-black/10 dark:hover:bg-red-500/20 rounded-full text-slate-400 hover:text-red-500 transition-colors"
+                        title="Close Control Pill (Hides to Tray)"
+                      >
+                        <X className="w-4 h-4" />
+                      </button>
+                    </div>
+                  </div>
+
+                 {/* The Image Viewer / List */}
+                 <div 
+                    className="flex-1 w-full h-full overflow-y-auto overflow-x-hidden no-scrollbar flex flex-wrap justify-center gap-2 py-2 content-start"
+                 >
+                   {floatingImages.length === 0 && floatingNotes.length === 0 && floatingSketches.length === 0 ? (
+                     <div className="text-[10px] text-slate-500 font-medium py-4 px-2 text-center opacity-70 drag-handle cursor-move w-full">
+                       Drop<br/>Media / Notes<br/>Here
+                     </div>
+                   ) : (
+                     <>
+                       {floatingImages.map((img) => (
+                         <div 
+                           key={img.id} 
+                           className={`relative group rounded-xl overflow-hidden border-2 transition-all cursor-pointer shrink-0 w-20 h-20 bg-black/20 flex items-center justify-center ${img.isCollapsed ? 'border-dashed border-slate-500/50 opacity-60' : 'border-transparent hover:border-sky-400'}`}
+                         >
+                           {img.type === 'pdf' ? (
+                             <div 
+                               className="text-[10px] text-slate-400 font-mono text-center w-full h-full flex flex-col items-center justify-center" 
+                               onClick={() => {
+                                 setFloatingImages(prev => prev.map(f => f.id === img.id ? {...f, isCollapsed: false} : f));
+                                 setTopWindowId(img.id);
+                               }}
+                             >
+                               <FileText className="w-5 h-5 mb-1 text-sky-400" />
+                               <span className="text-[9px] truncate max-w-[70px]">PDF</span>
+                             </div>
+                           ) : (
+                             <img 
+                               src={img.url} 
+                               className="w-full h-full object-cover" 
+                               alt="Thumbnail" 
+                               draggable={false}
+                               onClick={() => {
+                                 setFloatingImages(prev => prev.map(f => f.id === img.id ? {...f, isCollapsed: false} : f));
+                                 setTopWindowId(img.id);
+                               }}
+                             />
+                           )}
+                           <div className="absolute top-1 right-1 opacity-0 group-hover:opacity-100 transition-opacity flex space-x-1">
+                             <button 
+                               onClick={(e) => { e.stopPropagation(); setFloatingImages(prev => prev.filter(f => f.id !== img.id)); }}
+                               className="bg-red-500 hover:bg-red-600 text-white p-1 rounded-md shadow-lg"
+                               title="Delete Permanently"
+                             >
+                               <Trash2 className="w-3 h-3" />
+                             </button>
+                           </div>
+                           {img.isCollapsed && (
+                             <div className="absolute inset-x-0 bottom-0 bg-slate-950/80 py-0.5 text-center pointer-events-none">
+                               <span className="text-[8px] text-sky-400 font-mono uppercase tracking-wider">minimized</span>
+                             </div>
+                           )}
+                         </div>
+                       ))}
+
+                       {floatingNotes.map((note) => (
+                         <div 
+                           key={note.id} 
+                           className={`relative group rounded-xl overflow-hidden border-2 transition-all cursor-pointer shrink-0 w-20 h-20 flex flex-col items-center justify-center p-2 ${note.isCollapsed ? 'border-dashed border-slate-500/50 bg-black/10 opacity-60' : 'border-transparent hover:border-sky-400'}`}
+                           style={{ backgroundColor: note.isCollapsed ? undefined : note.color || '#fef3c7' }}
+                         >
+                           <div 
+                             className="text-center w-full h-full flex flex-col items-center justify-center" 
+                             onClick={() => {
+                               setFloatingNotes(prev => prev.map(f => f.id === note.id ? {...f, isCollapsed: false} : f));
+                               setTopWindowId(note.id);
+                             }}
+                           >
+                             <FileText className={`w-5 h-5 mb-1 ${note.isCollapsed ? 'text-yellow-600/60' : 'text-slate-800'}`} />
+                             <span className={`text-[9px] font-medium truncate max-w-[70px] ${note.isCollapsed ? 'text-slate-400' : 'text-slate-800'}`}>
+                               {note.text || 'Note'}
+                             </span>
+                           </div>
+                           <div className="absolute top-1 right-1 opacity-0 group-hover:opacity-100 transition-opacity flex space-x-1">
+                             <button 
+                               onClick={(e) => { e.stopPropagation(); setFloatingNotes(prev => prev.filter(f => f.id !== note.id)); }}
+                               className="bg-red-500 hover:bg-red-600 text-white p-1 rounded-md shadow-lg"
+                               title="Delete Permanently"
+                             >
+                               <Trash2 className="w-3 h-3" />
+                             </button>
+                           </div>
+                           {note.isCollapsed && (
+                             <div className="absolute inset-x-0 bottom-0 bg-slate-950/80 py-0.5 text-center pointer-events-none">
+                               <span className="text-[8px] text-sky-400 font-mono uppercase tracking-wider">minimized</span>
+                             </div>
+                           )}
+                         </div>
+                       ))}
+
+                       {floatingSketches.map((sketch) => (
+                         <div 
+                           key={sketch.id} 
+                           className={`relative group rounded-xl overflow-hidden border-2 transition-all cursor-pointer shrink-0 w-20 h-20 bg-black/20 flex items-center justify-center ${sketch.isCollapsed ? 'border-dashed border-slate-500/50 opacity-60' : 'border-transparent hover:border-sky-400'}`}
+                         >
+                           <div 
+                             className="text-center w-full h-full flex flex-col items-center justify-center" 
+                             onClick={() => {
+                               setFloatingSketches(prev => prev.map(f => f.id === sketch.id ? {...f, isCollapsed: false} : f));
+                               setTopWindowId(sketch.id);
+                             }}
+                           >
+                             <PenTool className="w-5 h-5 mb-1 text-purple-400" />
+                             <span className="text-[9px] font-medium truncate max-w-[70px] text-slate-400">Sketch</span>
+                           </div>
+                           <div className="absolute top-1 right-1 opacity-0 group-hover:opacity-100 transition-opacity flex space-x-1">
+                             <button 
+                               onClick={(e) => { e.stopPropagation(); setFloatingSketches(prev => prev.filter(f => f.id !== sketch.id)); }}
+                               className="bg-red-500 hover:bg-red-600 text-white p-1 rounded-md shadow-lg"
+                               title="Delete Permanently"
+                             >
+                               <Trash2 className="w-3 h-3" />
+                             </button>
+                           </div>
+                           {sketch.isCollapsed && (
+                             <div className="absolute inset-x-0 bottom-0 bg-slate-950/80 py-0.5 text-center pointer-events-none">
+                               <span className="text-[8px] text-sky-400 font-mono uppercase tracking-wider">minimized</span>
+                             </div>
+                           )}
+                         </div>
+                       ))}
+                     </>
+                   )}
+                 </div>
+
+                {/* Bottom Controls */}
+                <div className="mt-2 shrink-0 border-t border-white/5 pt-2 w-full flex flex-wrap justify-center gap-2 drag-handle cursor-move">
+                  <button 
+                    onClick={openProjectManager}
+                    className="w-10 h-10 rounded-xl bg-sky-500/10 border border-sky-500/30 flex items-center justify-center hover:bg-sky-500/20 transition-colors text-sky-400 group"
+                    title="Full Screen Manager"
+                  >
+                    <Monitor className="w-5 h-5 group-hover:scale-110 transition-transform" />
+                  </button>
+                  <button 
+                    onClick={createSketch}
+                    className="w-10 h-10 rounded-xl border border-dashed border-purple-500/50 flex items-center justify-center hover:bg-purple-500/20 transition-colors text-purple-500/80 hover:text-purple-400 group bg-purple-500/5"
+                    title="Add Floating Sketch"
+                  >
+                    <PenTool className="w-5 h-5 group-hover:scale-110 transition-transform" />
+                  </button>
+                  <button 
+                    onClick={createNote}
+                    className="w-10 h-10 rounded-xl border border-dashed border-yellow-500/50 flex items-center justify-center hover:bg-yellow-500/20 transition-colors text-yellow-500/80 hover:text-yellow-400 group bg-yellow-500/5"
+                    title="Add Floating Note"
+                  >
+                    <FileText className="w-5 h-5 group-hover:scale-110 transition-transform" />
+                  </button>
+                  <button 
+                    onClick={triggerNativeFilePicker}
+                    className={`w-10 h-10 rounded-xl border border-dashed flex items-center justify-center transition-colors group ${
+                      theme === 'dark'
+                        ? 'border-slate-700 bg-white/5 hover:bg-white/10 text-slate-400 hover:text-white'
+                        : 'border-slate-300 bg-black/5 hover:bg-black/10 text-slate-500 hover:text-slate-900'
+                    }`}
+                    title="Add Media / Drop Zone"
+                  >
+                    <Plus className="w-5 h-5 group-hover:scale-110 transition-transform" />
+                  </button>
+                  <button 
+                    onClick={() => { setShowSearchComponent(!showSearchComponent); setShowSettings(false); }}
+                    className={`w-10 h-10 rounded-xl flex items-center justify-center transition-colors border ${
+                      showSearchComponent
+                        ? 'bg-sky-500 text-white border-sky-500'
+                        : theme === 'dark'
+                          ? 'border-slate-700 bg-white/5 hover:bg-white/10 text-slate-400 hover:text-white'
+                          : 'border-slate-300 bg-black/5 hover:bg-black/10 text-slate-500 hover:text-slate-900'
+                    }`}
+                    title="Quick Reference Search"
+                  >
+                    <Search className="w-5 h-5" />
+                  </button>
+                  
+                  <button 
+                    onClick={() => { setShowSettings(!showSettings); setShowSearchComponent(false); }}
+                    className={`w-10 h-10 rounded-full flex items-center justify-center transition-colors ${
+                      showSettings
+                        ? (theme === 'dark' ? 'bg-white/20 text-white' : 'bg-slate-200 text-slate-900')
+                        : (theme === 'dark'
+                           ? 'hover:bg-white/10 text-slate-400 hover:text-white'
+                           : 'hover:bg-black/10 text-slate-500 hover:text-slate-900')
+                    }`}
+                    title="Settings"
+                  >
+                    <Settings className="w-5 h-5" />
+                  </button>
+                </div>
+              </motion.div>
+            )}
+          </AnimatePresence>
+        </div>
+        
+        {/* Modern Edge-Based Pill Resize Handle */}
+        {!isRetracted && (
+          <div 
+            className="absolute bottom-0 right-0 w-6 h-6 cursor-nwse-resize z-[1000] flex items-end justify-end group/resize pointer-events-auto"
+            onMouseDown={handlePillResizeMouseDown}
+          >
+            <div className={`mr-1 mb-1 w-2.5 h-2.5 border-r-[2px] border-b-[2px] transition-all duration-150 rounded-br-[3px] ${isResizingPill ? 'opacity-100 border-sky-400 scale-110 bg-sky-400/20' : 'opacity-0 group-hover/resize:opacity-100 border-slate-400'}`}></div>
+          </div>
+        )}
+      </motion.div>
+      )}
+
+      {/* 
+        ============================================================
+        THE SETTINGS APP (Attached to Pill)
+        ============================================================
+      */}
+      <AnimatePresence>
+        {showSettings && (
+          <motion.div 
+            initial={{ opacity: 0, x: -10, scale: 0.95 }}
+            animate={{ opacity: 1, x: 0, scale: 1 }}
+            exit={{ opacity: 0, x: -10, scale: 0.95 }}
+            transition={{ duration: 0.2 }}
+                  className={`settings-panel light-contrast-panel absolute pointer-events-auto border p-5 rounded-[24px] shadow-2xl w-64 text-sm font-sans z-[99999] ${theme === 'light' ? 'bg-white border-black/10 text-slate-900' : 'bg-[#1e1e24] border-white/10 text-slate-200'}`}
+            style={{
+              top: position.y,
+              left: position.x + (isRetracted ? 48 : pillDimensions.width) + 16,
+            }}
+          >
+          <div className={`flex items-center justify-between mb-4 pb-2 border-b ${theme === 'light' ? 'border-black/10' : 'border-white/10'}`}>
+            <h3 className="font-bold uppercase tracking-widest text-[11px] text-slate-600 dark:text-slate-400 drag-handle cursor-move flex-1" onMouseDown={handlePillMouseDown}>Settings App</h3>
+            <button onClick={() => setShowSettings(false)} className="text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white p-1 hover:bg-black/10 dark:hover:bg-white/10 rounded">
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+          
+          <div className="space-y-4 max-h-[85vh] overflow-y-auto no-scrollbar pb-2">
+            
+            <div className="flex gap-2 p-1 bg-black/20 rounded-lg border border-white/5">
+              <button
+                onClick={() => {
+                  setTheme('light');
+                  localStorage.setItem('ref-flow-theme', 'light');
+                }}
+                className={`flex-1 py-1 text-xs rounded-md transition-colors ${theme === 'light' ? 'bg-sky-500 text-white' : 'text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'}`}
+              >
+                Light
+              </button>
+              <button
+                onClick={() => {
+                  setTheme('dark');
+                  localStorage.setItem('ref-flow-theme', 'dark');
+                }}
+                className={`flex-1 py-1 text-xs rounded-md transition-colors ${theme === 'dark' ? 'bg-sky-500 text-white' : 'text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'}`}
+              >
+                Dark
+              </button>
+            </div>
+
+            <label className="flex items-center space-x-3 cursor-pointer group">
+              <input 
+                type="checkbox" 
+                className="w-4 h-4 rounded border-slate-600 bg-slate-900 accent-sky-500" 
+                checked={alwaysOnTop} 
+                onChange={(e) => {
+                  setAlwaysOnTop(e.target.checked);
+                }} 
+              />
+              <span className="text-xs text-slate-700 dark:text-slate-300 group-hover:text-slate-950 dark:group-hover:text-white transition-colors">Always on Top</span>
+            </label>
+            
+            <label className="flex items-center space-x-3 cursor-pointer group">
+              <input 
+                type="checkbox" 
+                className="w-4 h-4 rounded border-slate-600 bg-slate-900 accent-sky-500"
+                checked={startOnBoot}
+                onChange={(e) => {
+                  setStartOnBoot(e.target.checked);
+                }}
+              />
+              <span className="text-xs text-slate-700 dark:text-slate-300 group-hover:text-slate-950 dark:group-hover:text-white transition-colors">Start on Boot</span>
+            </label>
+
+            <label className="flex items-center space-x-3 cursor-pointer group">
+              <input
+                type="checkbox"
+                className="w-4 h-4 rounded border-slate-600 bg-slate-900 accent-sky-500"
+                checked={launchMinimized}
+                onChange={(e) => setLaunchMinimized(e.target.checked)}
+              />
+              <span className="text-xs text-slate-700 dark:text-slate-300 group-hover:text-slate-950 dark:group-hover:text-white transition-colors">Start with Windows in tray</span>
+            </label>
+
+            <label className="flex items-center space-x-3 cursor-pointer group">
+              <input 
+                type="checkbox" 
+                className="w-4 h-4 rounded border-slate-600 bg-slate-900 accent-sky-500"
+                checked={showInTaskbar}
+                onChange={(e) => {
+                  setShowInTaskbar(e.target.checked);
+                }}
+              />
+              <span className="text-xs text-slate-700 dark:text-slate-300 group-hover:text-slate-950 dark:group-hover:text-white transition-colors">Show ReferenceFlow in Taskbar</span>
+            </label>
+
+            <div className={`pt-3 border-t space-y-3 ${theme === 'light' ? 'border-black/10' : 'border-white/5'}`}>
+              <div className="space-y-2">
+                <span className="text-[10px] text-slate-500 uppercase tracking-wider block font-bold">Local Board Folder</span>
+                {defaultAutosaveRoot && (
+                  <div className="rounded-md bg-black/5 dark:bg-white/5 border border-black/10 dark:border-white/10 px-2 py-1 text-[9px] leading-4 text-slate-700 dark:text-slate-300 break-all">
+                    {defaultAutosaveRoot}
+                  </div>
+                )}
+                <button
+                  onClick={() => {
+                    const active = projects.find(p => p.id === activeProjectId);
+                    if (active) exportBoard(active);
+                  }}
+                  className="w-full flex items-center justify-center gap-2 rounded-lg bg-sky-500/15 text-sky-600 dark:text-sky-300 hover:bg-sky-500 hover:text-white border border-sky-500/20 px-3 py-2 text-xs font-semibold transition-colors"
+                >
+                  <Download className="w-3.5 h-3.5" /> Choose / Change Autosave Folder
+                </button>
+                <p className="text-[10px] leading-4 text-slate-500 dark:text-slate-400">
+                  Saves board JSON, media, notes, and sketches into an editable local folder.
+                </p>
+              </div>
+            </div>
+
+            <div className={`pt-3 border-t space-y-3 ${theme === 'light' ? 'border-black/10' : 'border-white/5'}`}>
+              <div className="flex justify-between items-center">
+                <span className="text-[10px] text-slate-500 uppercase tracking-wider block font-bold">Search Providers</span>
+                <button 
+                  onClick={() => setShowDiagnosticsModal(true)}
+                  className="text-[9px] text-sky-400 hover:text-sky-300 font-mono transition-colors border border-sky-400/30 bg-sky-400/10 px-1.5 py-0.5 rounded"
+                >
+                  Diagnostics
+                </button>
+              </div>
+              <div className="space-y-2">
+                {providerOrder.map((provider, index) => {
+                  const conf = getProviderConfig(provider);
+                  return (
+                  <div key={provider} className="flex flex-col gap-1.5 bg-slate-100 dark:bg-black/10 border border-slate-300 dark:border-white/5 p-2 rounded-lg">
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        {/* Drag Handle / Reorder */}
+                        <div className="flex flex-col items-center justify-center shrink-0 w-4">
+                           <button 
+                               className={`text-[8px] ${index === 0 ? 'text-transparent pointer-events-none' : 'text-slate-600 dark:text-slate-400 hover:text-sky-500'}`}
+                               onClick={() => {
+                                   const newOrd = [...providerOrder];
+                                   [newOrd[index - 1], newOrd[index]] = [newOrd[index], newOrd[index - 1]];
+                                   updateProviderOrder(newOrd);
+                               }}
+                           >
+                               ▲
+                           </button>
+                           <button 
+                               className={`text-[8px] ${index === providerOrder.length - 1 ? 'text-transparent pointer-events-none' : 'text-slate-600 dark:text-slate-400 hover:text-sky-500'}`}
+                               onClick={() => {
+                                   const newOrd = [...providerOrder];
+                                   [newOrd[index + 1], newOrd[index]] = [newOrd[index], newOrd[index + 1]];
+                                   updateProviderOrder(newOrd);
+                               }}
+                           >
+                               ▼
+                           </button>
+                        </div>
+                        <span className="text-[11px] font-semibold text-slate-950 dark:text-slate-100">
+                          {provider === 'BingVisualSearch' ? 'Bing Visual Search' : provider === 'YandexImages' ? 'Yandex Images' : provider}
+                        </span>
+                      </div>
+                      <div className="flex items-center gap-2">
+                         <button 
+                            onClick={() => {
+                                updateProviderStatus({ ...providerStatus, [provider]: { ...providerStatus[provider], enabled: !conf.isEnabled } });
+                            }}
+                            className={`w-8 h-4 rounded-full flex items-center p-0.5 transition-colors ${conf.isEnabled ? 'bg-sky-500' : 'bg-slate-700'}`}
+                         >
+                            <div className={`w-3 h-3 bg-white rounded-full shadow-sm transition-transform ${conf.isEnabled ? 'translate-x-4' : 'translate-x-0'}`} />
+                         </button>
+                      </div>
+                    </div>
+                    <div className="flex items-center justify-between pl-6">
+                      <span className={`text-[9px] font-mono ${
+                        conf.badge === 'Ready'
+                          ? 'text-green-700 dark:text-green-400'
+                          : conf.badge === 'API Key Required'
+                            ? 'text-amber-700 dark:text-amber-400'
+                            : conf.badge === 'Disabled'
+                              ? 'text-slate-700 dark:text-slate-400'
+                              : 'text-red-700 dark:text-red-400'
+                      }`}>
+                        {conf.badge}
+                      </span>
+                      {provider !== 'Wikimedia Commons' && (
+                        <button 
+                            onClick={() => { setConfigModalProvider(provider); setConfigTestStatus('idle'); }}
+                            className="text-[9px] text-slate-800 dark:text-slate-300 hover:text-slate-950 dark:hover:text-white px-2 py-0.5 bg-white dark:bg-white/5 hover:bg-slate-200 dark:hover:bg-white/10 border border-slate-300 dark:border-white/10 rounded transition-colors"
+                        >
+                            Configure
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                  );
+                })}
+              </div>
+            </div>
+
+            <div className="pt-3 border-t border-white/5 space-y-2">
+              <span className="text-[10px] text-slate-500 uppercase tracking-wider block">Pill Opacity</span>
+              <input 
+                type="range"
+                min="0.2" 
+                max="1" 
+                step="0.01" 
+                value={pillOpacity} 
+                className="w-full smooth-range"
+                onChange={(e) => {
+                  const val = parseFloat(e.target.value);
+                  setPillOpacity(val);
+                  localStorage.setItem('ref-flow-pill-opacity', val.toString());
+                }}
+              />
+            </div>
+
+            <div className="pt-3 border-t border-white/5 space-y-2">
+              <span className="text-[10px] text-slate-500 uppercase tracking-wider block">Shortcuts</span>
+              {[
+                { key: 'minimize', label: 'Minimize/Expand pill' },
+                { key: 'newNote', label: 'New Note' },
+                { key: 'newSketch', label: 'New Sketch' },
+                { key: 'manager', label: 'Project Manager' },
+                { key: 'settings', label: 'Settings' },
+                { key: 'closeApp', label: 'Close Application' },
+                { key: 'flipBoards', label: 'Flip Boards' },
+                { key: 'toggleWindows', label: 'Show/Hide Windows' },
+              ].map(({ key, label }) => (
+                <div key={key} className="flex items-center justify-between py-0.5">
+                  <span className="text-[11px] text-slate-400">{label}</span>
+                  <div className="flex items-center space-x-1 shrink-0">
+                    <span className="text-[10px] text-slate-500 font-mono">ctrl+alt+</span>
+                    <input
+                      type="text"
+                      maxLength={1}
+                      value={((shortcuts as any)[key] || '').replace('ctrl+alt+', '')}
+                      onChange={(e) => {
+                        const char = e.target.value.toLowerCase().trim();
+                        if (!char) return;
+                        const newShortcuts = { ...shortcuts, [key]: `ctrl+alt+${char}` };
+                        setShortcuts(newShortcuts);
+                        localStorage.setItem('ref-flow-shortcuts', JSON.stringify(newShortcuts));
+                      }}
+                      className="w-5 h-6 bg-black/20 border border-white/10 rounded text-center text-xs text-sky-400 font-bold outline-none focus:border-sky-500 font-mono"
+                    />
+                  </div>
+                </div>
+              ))}
+            </div>
+            
+            <div 
+              className="pt-4 text-[10px] text-slate-500 text-center drag-handle cursor-move"
+              onMouseDown={handlePillMouseDown}
+            >
+              Drag this panel from the header.
+            </div>
+          </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      <AnimatePresence>
+        {configModalProvider && (
+          <motion.div 
+            initial={{ opacity: 0, scale: 0.95 }}
+            animate={{ opacity: 1, scale: 1 }}
+            exit={{ opacity: 0, scale: 0.95 }}
+            className={`absolute pointer-events-auto border p-5 rounded-[24px] shadow-2xl w-72 text-sm font-sans z-[100000] flex flex-col ${theme === 'light' ? 'bg-white border-black/10 text-slate-800' : 'bg-[#1e1e24] border-white/10 text-slate-200'}`}
+            style={{
+              top: position.y,
+              left: position.x + (isRetracted ? 48 : pillDimensions.width) + 16 + 280,
+            }}
+          >
+            <div className={`flex items-center justify-between mb-4 pb-2 border-b ${theme === 'light' ? 'border-black/10' : 'border-white/10'}`}>
+              <h3 className="font-bold uppercase tracking-widest text-[11px] text-slate-400">
+                Configure {configModalProvider === 'BingVisualSearch' ? 'Bing Visual Search' : configModalProvider === 'YandexImages' ? 'Yandex Images' : configModalProvider}
+              </h3>
+              <button onClick={() => setConfigModalProvider(null)} className="text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white p-1 hover:bg-black/10 dark:hover:bg-white/10 rounded">
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+            
+            <div className="space-y-4">
+              <div className="space-y-1">
+                <label className="text-[10px] text-slate-400 uppercase tracking-widest">API Key</label>
+                <div className="relative">
+                  <input
+                    type="password"
+                    id="provider-api-key-input"
+                    defaultValue={apiKeys[configModalProvider] || ''}
+                    className="w-full bg-black/5 dark:bg-black/20 border border-black/10 dark:border-white/10 text-sm p-2 rounded-lg text-slate-800 dark:text-slate-200 pr-8 outline-none focus:border-sky-500 font-mono"
+                    placeholder="Enter API Key..."
+                  />
+                  <button 
+                    onClick={() => {
+                        const el = document.getElementById('provider-api-key-input') as HTMLInputElement;
+                        if (el) el.type = el.type === 'password' ? 'text' : 'password';
+                    }}
+                    className="absolute right-2 top-2 text-slate-500 hover:text-slate-300"
+                  >
+                    <div className="w-4 h-4 border border-current rounded flex items-center justify-center text-[8px]">ðŸ‘</div>
+                  </button>
+                </div>
+              </div>
+
+              <div className="flex flex-col gap-2 pt-2">
+                <button 
+                    onClick={async () => {
+                        const el = document.getElementById('provider-api-key-input') as HTMLInputElement;
+                        if (!el || !configModalProvider) return;
+                        const key = el.value.trim();
+                        setConfigTestStatus('testing');
+                        try {
+                            let url = '';
+                            let headers = {};
+                            if (configModalProvider === 'Pixabay') url = `https://pixabay.com/api/?key=${key}&q=test&per_page=3`;
+                            else if (configModalProvider === 'Unsplash') { url = `https://api.unsplash.com/search/photos?query=test&per_page=1`; headers = { 'Authorization': `Client-ID ${key}` }; }
+                            else if (configModalProvider === 'Pexels') { url = `https://api.pexels.com/v1/search?query=test&per_page=1`; headers = { 'Authorization': key }; }
+                            else if (configModalProvider === 'SerpAPI') { url = `https://serpapi.com/search.json?engine=google_images&q=test&api_key=${key}`; }
+                            else if (configModalProvider === 'Openverse') { url = `https://api.openverse.org/v1/images/?q=test`; headers = { 'Authorization': `Bearer ${key}` }; }
+                            else if (configModalProvider === 'BingVisualSearch' || configModalProvider === 'TinEye' || configModalProvider === 'YandexImages') {
+                                // Direct browser testing to these APIs is blocked by CORS, so we perform high-confidence structural key validation
+                                if (key.length >= 10) {
+                                    setConfigTestStatus('success');
+                                    updateProviderStatus({ ...providerStatus, [configModalProvider]: { enabled: true, testStatus: 'success' }});
+                                } else {
+                                    setConfigTestStatus('failed');
+                                }
+                                return;
+                            }
+                            
+                            if (url) {
+                                const res = await fetch(url, { headers });
+                                if (res.ok) {
+                                    setConfigTestStatus('success');
+                                    updateProviderStatus({ ...providerStatus, [configModalProvider]: { enabled: true, testStatus: 'success' }});
+                                } else setConfigTestStatus('failed');
+                            } else {
+                                setConfigTestStatus('success');
+                                updateProviderStatus({ ...providerStatus, [configModalProvider]: { enabled: true, testStatus: 'success' }});
+                            }
+                        } catch (e) {
+                            setConfigTestStatus('failed');
+                        }
+                    }}
+                    className={`text-white py-1.5 rounded-lg text-xs font-semibold transition-colors flex items-center justify-center gap-2 ${configTestStatus === 'success' ? 'bg-green-500 hover:bg-green-600' : configTestStatus === 'failed' ? 'bg-red-500 hover:bg-red-600' : 'bg-slate-700 hover:bg-slate-600'}`}
+                >
+                  {configTestStatus === 'testing' ? <Loader2 className="w-4 h-4 animate-spin" /> : 
+                   configTestStatus === 'success' ? <><span>Connection OK</span></> : 
+                   configTestStatus === 'failed' ? <><span>Connection Failed</span></> : 
+                   'Test Connection'}
+                </button>
+                <button 
+                    onClick={() => {
+                        const el = document.getElementById('provider-api-key-input') as HTMLInputElement;
+                        if (el) {
+                            updateApiKeys({ ...apiKeys, [configModalProvider]: el.value.trim() });
+                            setConfigModalProvider(null);
+                        }
+                    }}
+                    className="bg-sky-500 hover:bg-sky-600 text-white py-1.5 rounded-lg text-xs font-semibold transition-colors"
+                >
+                  Save Config
+                </button>
+                <div className="flex gap-2">
+                    <button 
+                        onClick={() => {
+                            const conf = getProviderConfig(configModalProvider);
+                            if (conf.url) window.open(conf.url, '_blank');
+                        }}
+                        className="flex-1 bg-black/5 dark:bg-white/5 hover:bg-black/10 dark:hover:bg-white/10 text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white py-1.5 rounded-lg text-[10px] transition-colors"
+                    >
+                      Developer Portal
+                    </button>
+                    <button 
+                        onClick={() => {
+                            const newKeys = { ...apiKeys };
+                            delete newKeys[configModalProvider];
+                            updateApiKeys(newKeys);
+                            const el = document.getElementById('provider-api-key-input') as HTMLInputElement;
+                            if (el) el.value = '';
+                        }}
+                        className="flex-1 bg-red-500/10 hover:bg-red-500/20 text-red-400 py-1.5 rounded-lg text-[10px] transition-colors"
+                    >
+                      Clear
+                    </button>
+                </div>
+              </div>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      <AnimatePresence>
+        {showDiagnosticsModal && (
+          <motion.div 
+            initial={{ opacity: 0, scale: 0.95 }}
+            animate={{ opacity: 1, scale: 1 }}
+            exit={{ opacity: 0, scale: 0.95 }}
+            className={`absolute pointer-events-auto border p-5 rounded-[24px] shadow-2xl w-80 text-sm font-sans z-[100000] flex flex-col ${theme === 'light' ? 'bg-white border-black/10 text-slate-800' : 'bg-[#1e1e24] border-white/10 text-slate-200'}`}
+            style={{
+              top: position.y,
+              left: position.x + (isRetracted ? 48 : pillDimensions.width) + 16 + 280,
+            }}
+          >
+            <div className={`flex items-center justify-between mb-4 pb-2 border-b ${theme === 'light' ? 'border-black/10' : 'border-white/10'}`}>
+              <h3 className="font-bold uppercase tracking-widest text-[11px] text-slate-400">Search Diagnostics</h3>
+              <button onClick={() => setShowDiagnosticsModal(false)} className="text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white p-1 hover:bg-black/10 dark:hover:bg-white/10 rounded">
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+            
+            <div className="space-y-4 text-xs">
+              <div>
+                <span className="text-[10px] uppercase text-slate-500 block mb-1">Active Providers</span>
+                <div className="space-y-1 text-slate-700 dark:text-slate-300 font-mono text-[10px]">
+                    {providerOrder.filter(p => getProviderConfig(p).isEnabled).map(p => (
+                        <div key={p}>â€¢ {p} {getProviderConfig(p).badge.includes('ðŸ”‘') ? '(Missing Key)' : ''}</div>
+                    ))}
+                </div>
+              </div>
+              <div className="grid grid-cols-2 gap-2 text-center text-[10px] font-mono">
+                <div className="bg-black/5 dark:bg-white/5 p-2 rounded border border-black/5 dark:border-white/5">
+                    <div className="text-slate-500 mb-1">Total Req</div>
+                    <div className="text-slate-800 dark:text-slate-200 text-sm">{searchDiagnostics.reqCount}</div>
+                </div>
+                <div className="bg-black/5 dark:bg-white/5 p-2 rounded border border-black/5 dark:border-white/5">
+                    <div className="text-slate-500 mb-1">Total Res</div>
+                    <div className="text-slate-800 dark:text-slate-200 text-sm">{searchDiagnostics.resCount}</div>
+                </div>
+              </div>
+              <div>
+                <span className="text-[10px] uppercase text-slate-500 block mb-1">Last Search</span>
+                <div className="text-slate-700 dark:text-slate-300 text-[10px] font-mono">{searchDiagnostics.lastSearch ? searchDiagnostics.lastSearch.toLocaleTimeString() : 'Never'}</div>
+              </div>
+
+              {searchDiagnostics.errors.length > 0 && (
+              <div>
+                <span className="text-[10px] uppercase text-red-500/70 block mb-1">Errors Encountered</span>
+                <div className="max-h-24 overflow-y-auto space-y-1 text-red-400 font-mono text-[9px] bg-red-500/10 p-2 rounded border border-red-500/20">
+                    {searchDiagnostics.errors.map((e, i) => <div key={i}>{e}</div>)}
+                </div>
+              </div>
+              )}
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* 
+        ============================================================
+        THE SEARCH APP (Attached to Pill)
+        ============================================================
+      */}
+      <AnimatePresence>
+        {showSearchComponent && (
+          <motion.div 
+            initial={{ opacity: 0, x: -10, scale: 0.95 }}
+            animate={{ opacity: 1, x: 0, scale: 1 }}
+            exit={{ opacity: 0, x: -10, scale: 0.95 }}
+            transition={{ duration: 0.2 }}
+            className={`absolute pointer-events-auto border p-5 rounded-[24px] shadow-2xl w-[450px] text-sm font-sans z-[99999] overflow-hidden flex flex-col max-h-[85vh] ${theme === 'light' ? 'bg-white border-black/10 text-slate-800' : 'bg-[#1e1e24] border-white/10 text-slate-200'}`}
+            style={{
+              top: position.y,
+              left: position.x + (isRetracted ? 48 : pillDimensions.width) + 16,
+            }}
+            onClick={() => setSearchContextMenu(null)}
+          >
+            <div className={`flex items-center justify-between mb-3 pb-2 border-b shrink-0 ${theme === 'light' ? 'border-black/10' : 'border-white/10'}`}>
+              <h3 className="font-bold uppercase tracking-widest text-[11px] text-slate-400 drag-handle cursor-move flex-1" onMouseDown={handlePillMouseDown}>Quick Reference Search</h3>
+              <button onClick={() => setShowSearchComponent(false)} className="text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white p-1 hover:bg-black/10 dark:hover:bg-white/10 rounded ml-2">
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+            
+            <div className="flex flex-col gap-3 flex-1 overflow-hidden">
+                <div className="flex gap-2 w-full shrink-0">
+                    <input 
+                        type="text"
+                        value={searchQuery}
+                        onChange={(e) => setSearchQuery(e.target.value)}
+                        onKeyDown={(e) => e.key === 'Enter' && performSearch()}
+                        placeholder="Search images..."
+                        className="flex-1 bg-black/5 dark:bg-black/20 border border-black/10 dark:border-white/10 rounded-lg px-3 py-2 text-sm text-slate-800 dark:text-slate-200 placeholder:text-slate-500 outline-none focus:border-sky-500"
+                    />
+                    <button 
+                        onClick={() => performSearch()}
+                        className="bg-sky-500 hover:bg-sky-600 text-white rounded-lg px-4 py-2 font-medium transition-colors flex items-center justify-center min-w-[40px]"
+                    >
+                        {searchStatus === 'loading' ? <Loader2 className="w-4 h-4 animate-spin" /> : <Search className="w-4 h-4" />}
+                    </button>
+                </div>
+
+                {searchHistory.length > 0 && (
+                    <div className="flex flex-col gap-1 shrink-0 px-1 border-b border-white/5 pb-2">
+                        <span className="text-[8px] text-slate-400 uppercase tracking-widest font-bold">Recent Searches</span>
+                        <div className="flex flex-wrap gap-1">
+                            {searchHistory.map((hist, i) => (
+                                <button
+                                    key={i}
+                                    onClick={() => {
+                                        setSearchQuery(hist);
+                                        setTimeout(() => {
+                                          performSearch();
+                                        }, 100);
+                                    }}
+                                    className="px-2 py-0.5 rounded text-[10px] bg-black/5 dark:bg-white/5 text-slate-600 dark:text-slate-400 hover:bg-sky-500 hover:text-white transition-colors"
+                                >
+                                    {hist}
+                                </button>
+                            ))}
+                        </div>
+                    </div>
+                )}
+
+                <div className="flex flex-col gap-2 shrink-0">
+                    <div>
+                        <span className="text-[9px] text-slate-500 uppercase tracking-widest font-bold mb-1 block">In-App Search (Native)</span>
+                        <div className="flex flex-wrap gap-1.5 shrink-0">
+                            {NATIVE_PROVIDERS.map(p => {
+                                let statusIcon = '';
+                                if (p !== 'All Native') {
+                                    const conf = getProviderConfig(p);
+                                    if (conf.badge.includes('ðŸ”‘')) statusIcon = 'ðŸ”‘';
+                                    else if (!conf.isEnabled) statusIcon = 'âŒ';
+                                    else if (conf.badge.includes('âš ')) statusIcon = 'âš ';
+                                }
+                                
+                                return (
+                                <button
+                                    key={p}
+                                    onClick={() => setSearchProvider(p)}
+                                    className={`px-2 py-1 rounded-md text-[10px] font-medium transition-colors flex items-center justify-center gap-1 ${searchProvider === p ? 'bg-sky-500 text-white' : 'bg-black/5 dark:bg-white/5 text-slate-500 dark:text-slate-400 hover:bg-black/10 dark:hover:bg-white/10 hover:text-slate-900 dark:hover:text-white'} ${statusIcon === 'âŒ' ? 'opacity-50' : ''}`}
+                                    title={statusIcon === 'ðŸ”‘' ? 'API Key Required' : statusIcon === 'âŒ' ? 'Disabled in Settings' : statusIcon === 'âš ' ? 'Connection Failed' : 'Ready'}
+                                    disabled={statusIcon === 'âŒ'}
+                                >
+                                    {p} {statusIcon}
+                                </button>
+                                );
+                            })}
+                        </div>
+                    </div>
+                    <div>
+                        <span className="text-[9px] text-slate-500 uppercase tracking-widest font-bold mb-1 block">Open in Browser</span>
+                        <div className="flex flex-wrap gap-1.5 shrink-0">
+                            {BROWSER_PROVIDERS.map(p => (
+                                <button
+                                    key={p}
+                                    onClick={() => setSearchProvider(p)}
+                                    className={`px-2 py-1 rounded-md text-[10px] font-medium transition-colors ${searchProvider === p ? 'bg-amber-500 text-white' : 'bg-black/5 dark:bg-white/5 text-slate-500 dark:text-slate-400 hover:bg-black/10 dark:hover:bg-white/10 hover:text-slate-900 dark:hover:text-white'}`}
+                                >
+                                    {p}
+                                </button>
+                            ))}
+                        </div>
+                    </div>
+                </div>
+                
+                <div className="grid grid-cols-4 gap-1.5 shrink-0 bg-black/10 dark:bg-black/30 p-2 rounded-lg text-[9px] font-mono text-slate-500 border border-black/5 dark:border-white/5">
+                    <div className="flex flex-col">
+                        <span className="text-[8px] uppercase tracking-wider text-slate-400">Searching</span>
+                        <span className="font-semibold text-slate-800 dark:text-slate-300 truncate">{activeProviderSearching}</span>
+                    </div>
+                    <div className="flex flex-col">
+                        <span className="text-[8px] uppercase tracking-wider text-slate-400">Response</span>
+                        <span className="font-semibold text-slate-800 dark:text-slate-300">+{lastResultsCount} hits</span>
+                    </div>
+                    <div className="flex flex-col">
+                        <span className="text-[8px] uppercase tracking-wider text-slate-400">Page</span>
+                        <span className="font-semibold text-slate-800 dark:text-slate-300">#{searchPage}</span>
+                    </div>
+                    <div className="flex flex-col">
+                        <span className="text-[8px] uppercase tracking-wider text-slate-400">Total Loaded</span>
+                        <span className="font-semibold text-slate-800 dark:text-slate-300">{searchResults.length} items</span>
+                    </div>
+                </div>
+
+                <div className="flex flex-wrap gap-1.5 shrink-0 py-1 mb-1 border-b border-white/5">
+                    {FILTER_OPTIONS.map(f => (
+                        <button
+                            key={f}
+                            onClick={() => setSearchFilters(prev => prev.includes(f) ? prev.filter(x => x !== f) : [...prev, f])}
+                            className={`px-2 py-0.5 rounded-full text-[9px] border transition-colors ${searchFilters.includes(f) ? 'border-sky-500 text-sky-400 bg-sky-500/10' : 'border-slate-700 text-slate-500 hover:border-slate-500'}`}
+                        >
+                            {f}
+                        </button>
+                    ))}
+                </div>
+
+                <div 
+                    className="flex-1 overflow-y-auto w-full pr-1 no-scrollbar min-h-[200px]"
+                    onScroll={handleSearchScroll}
+                >
+                    {searchStatus === 'loading' && (
+                        <div className="flex items-center justify-center h-40">
+                             <div className="flex flex-col items-center text-slate-500 gap-2">
+                                 <Loader2 className="w-6 h-6 animate-spin text-sky-500" />
+                                 <span className="text-xs">Searching...</span>
+                             </div>
+                        </div>
+                    )}
+                    
+                    {searchStatus === 'no-results' && (
+                        <div className="flex items-center justify-center p-4 text-slate-500 text-xs text-center border border-white/5 rounded mx-2 my-4 bg-white/5">
+                             No usable results found.<br/>Check the logs panel below to see if providers require API keys or if there were network errors.
+                        </div>
+                    )}
+                    
+                    {searchResults.length > 0 && (
+                        <div className="grid grid-cols-2 gap-2 pb-2">
+                            {searchResults.map((res, idx) => (
+                                <div key={idx} className="relative group rounded-lg overflow-hidden border border-white/5 bg-black/40 aspect-square">
+                                    <img 
+                                        src={res.thumbnail || res.url} 
+                                        alt={res.title || "Search result"} 
+                                        className="w-full h-full object-cover"
+                                        draggable="true"
+                                        onDragStart={(e) => {
+                                            e.dataTransfer.setData("text/plain", res.url);
+                                            e.dataTransfer.setData("application/x-reference-url", "true");
+                                        }}
+                                        onDoubleClick={() => fetchAndAddImage(res.url)}
+                                        onContextMenu={(e) => {
+                                            e.preventDefault();
+                                            e.stopPropagation();
+                                            setSearchContextMenu({ x: e.clientX, y: e.clientY, result: res });
+                                        }}
+                                    />
+                                    <div className="absolute inset-0 bg-black/60 opacity-0 group-hover:opacity-100 transition-opacity flex flex-col justify-between p-2">
+                                        <div className="text-[9px] font-mono text-slate-300 truncate w-full flex justify-between">
+                                            <span>{res.provider}</span>
+                                            {res.width && <span>{res.width}x{res.height}</span>}
+                                        </div>
+                                        <div className="flex flex-wrap gap-1 justify-end">
+                                            <button 
+                                                onClick={() => fetchAndAddImage(res.url)}
+                                                className="bg-sky-500 hover:bg-sky-600 text-white p-1.5 rounded"
+                                                title="Add to Workspace"
+                                            >
+                                                <Plus className="w-3 h-3" />
+                                            </button>
+                                            <button 
+                                                onClick={() => window.open(res.url, '_blank')}
+                                                className="bg-slate-700 hover:bg-slate-600 text-white p-1.5 rounded"
+                                                title="Open Original"
+                                            >
+                                                <LinkIcon className="w-3 h-3" />
+                                            </button>
+                                            <button 
+                                                onClick={() => {
+                                                    navigator.clipboard.writeText(res.url);
+                                                }}
+                                                className="bg-slate-700 hover:bg-slate-600 text-white p-1.5 rounded"
+                                                title="Copy URL"
+                                            >
+                                                <FileText className="w-3 h-3" />
+                                            </button>
+                                        </div>
+                                    </div>
+                                </div>
+                            ))}
+                        </div>
+                    )}
+                    
+                    {searchStatus === 'loading-more' && (
+                        <div className="flex justify-center py-4">
+                            <Loader2 className="w-5 h-5 animate-spin text-sky-500" />
+                        </div>
+                    )}
+                </div>
+
+                <div className="h-20 shrink-0 overflow-y-auto text-[9px] font-mono text-slate-500 bg-black/20 p-2 rounded border border-white/5 no-scrollbar">
+                    {searchLog.map((log, i) => (
+                        <div key={i}>{log}</div>
+                    ))}
+                </div>
+            </div>
+
+            {searchContextMenu && (
+              <div 
+                  className={`fixed w-48 rounded-lg shadow-xl border overflow-hidden z-[100000] py-1 ${theme === 'light' ? 'bg-white border-black/10' : 'bg-slate-800 border-white/10'}`}
+                  style={{ top: searchContextMenu.y, left: searchContextMenu.x }}
+                  onClick={(e) => e.stopPropagation()}
+              >
+                  <button 
+                      className="w-full text-left px-4 py-2 hover:bg-sky-500 hover:text-white transition-colors text-xs flex items-center gap-2"
+                      onClick={() => { fetchAndAddImage(searchContextMenu.result.url); setSearchContextMenu(null); }}
+                  >
+                      <Plus className="w-3 h-3" /> Add Reference
+                  </button>
+                  <button 
+                      className="w-full text-left px-4 py-2 hover:bg-sky-500 hover:text-white transition-colors text-xs flex items-center gap-2"
+                      onClick={() => { window.open(searchContextMenu.result.url, '_blank'); setSearchContextMenu(null); }}
+                  >
+                      <LinkIcon className="w-3 h-3" /> Open Original Page
+                  </button>
+                  <button 
+                      className="w-full text-left px-4 py-2 hover:bg-sky-500 hover:text-white transition-colors text-xs flex items-center gap-2"
+                      onClick={() => {
+                          const a = document.createElement('a');
+                          a.href = searchContextMenu.result.url;
+                          a.download = 'reference_image';
+                          a.target = '_blank';
+                          a.click();
+                          setSearchContextMenu(null);
+                      }}
+                  >
+                      <Download className="w-3 h-3" /> Download Original
+                  </button>
+                  <button 
+                      className="w-full text-left px-4 py-2 hover:bg-sky-500 hover:text-white transition-colors text-xs flex items-center gap-2"
+                      onClick={() => { navigator.clipboard.writeText(searchContextMenu.result.url); setSearchContextMenu(null); }}
+                  >
+                      <FileText className="w-3 h-3" /> Copy Image URL
+                  </button>
+              </div>
+            )}
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      <AnimatePresence>
+         {floatingContextMenu && (() => {
+           const hasElectron = !!((window as any).require);
+           return (
+              <motion.div 
+                  initial={{ opacity: 0, scale: 0.95 }}
+                  animate={{ opacity: 1, scale: 1 }}
+                  exit={{ opacity: 0, scale: 0.95 }}
+                  className={`fixed w-56 rounded-lg shadow-xl border overflow-hidden z-[100000] py-1 pointer-events-auto ${theme === 'light' ? 'bg-white border-black/10 text-slate-800' : 'bg-slate-800 border-white/10 text-slate-200'}`}
+                  style={{ top: floatingContextMenu.y, left: floatingContextMenu.x }}
+                  onContextMenu={(e) => e.preventDefault()}
+                  onPointerDownCapture={(e) => {
+                    e.stopPropagation();
+                    applyCentralizedIgnoreMouseEvents(false);
+                  }}
+                  onMouseDownCapture={(e) => {
+                    e.stopPropagation();
+                  }}
+                  onClick={(e) => e.stopPropagation()}
+              >
+                  {/* Reveal in Explorer */}
+                  <button 
+                      className={`w-full text-left px-4 py-2 transition-colors text-xs flex items-center gap-2 ${
+                          hasElectron
+                          ? 'context-menu-button hover:bg-sky-500 hover:text-white cursor-pointer' 
+                          : 'opacity-40 cursor-not-allowed text-slate-500'
+                      }`}
+                      onClick={async () => { 
+                         if (!hasElectron) return;
+                         const electron = (window as any).require ? (window as any).require('electron') : null;
+                         if (!electron) return;
+                         const targetPath = contextMenuTempPath || await ensureTempLocalFile(floatingContextMenu.url, floatingContextMenu.id);
+                         if (targetPath) await electron.ipcRenderer.invoke('reveal-in-folder', targetPath);
+                         setFloatingContextMenu(null); 
+                      }}
+                  >
+                      <span>Reveal in Explorer</span>
+                      {!hasElectron && <span className="ml-auto text-[8px] italic opacity-70 font-mono">Coming Soon</span>}
+                  </button>
+
+                  <div className={`my-1 border-t ${theme === 'light' ? 'border-black/10' : 'border-white/10'}`} />
+
+                  {/* Save As... */}
+                  <button 
+                      className="context-menu-button w-full text-left px-4 py-2 hover:bg-sky-500 hover:text-white transition-colors text-xs flex items-center gap-2"
+                      onClick={async () => {
+                          const electron = (window as any).require ? (window as any).require('electron') : null;
+                          if (electron) {
+                              const path = electron.require('path');
+                              const originalExt = path.extname(floatingContextMenu.url.split('?')[0]) || '.jpg';
+                              const filename = `reference_image_${floatingContextMenu.id}${originalExt}`;
+                              
+                              const result = await electron.ipcRenderer.invoke('show-save-dialog', {
+                                  title: 'Save Reference Image',
+                                  defaultPath: filename,
+                                  filters: [
+                                      { name: 'Images', extensions: ['jpg', 'jpeg', 'png', 'webp', 'gif'] },
+                                      { name: 'All Files', extensions: ['*'] }
+                                  ]
+                              });
+                              if (!result.canceled && result.filePath) {
+                                  const fs = electron.require('fs');
+                                  const tempPath = contextMenuTempPath || await ensureTempLocalFile(floatingContextMenu.url, floatingContextMenu.id);
+                                  if (tempPath && fs.existsSync(tempPath)) {
+                                      fs.writeFileSync(result.filePath, fs.readFileSync(tempPath));
+                                      console.log(`[Save As] Saved file to chosen path: ${result.filePath}`);
+                                  }
+                              }
+                          } else {
+                              // standard browser download fallback
+                              const a = document.createElement('a');
+                              a.href = floatingContextMenu.url;
+                              a.download = 'reference_image';
+                              a.click();
+                          }
+                          setFloatingContextMenu(null);
+                      }}
+                  >
+                      Save As...
+                  </button>
+
+                  {floatingContextMenu.type !== 'pdf' && (
+                    <>
+                      <button 
+                          className="context-menu-button w-full text-left px-4 py-2 hover:bg-sky-500 hover:text-white transition-colors text-xs flex items-center gap-2"
+                          onClick={() => {
+                              exportOriginalImage(floatingContextMenu.url, floatingContextMenu.id, 'png');
+                              setFloatingContextMenu(null);
+                          }}
+                      >
+                          Export PNG
+                      </button>
+
+                      <button 
+                          className="context-menu-button w-full text-left px-4 py-2 hover:bg-sky-500 hover:text-white transition-colors text-xs flex items-center gap-2"
+                          onClick={() => {
+                              exportOriginalImage(floatingContextMenu.url, floatingContextMenu.id, 'jpg');
+                              setFloatingContextMenu(null);
+                          }}
+                      >
+                          Export JPG
+                      </button>
+
+                      <button 
+                          className="context-menu-button w-full text-left px-4 py-2 hover:bg-sky-500 hover:text-white transition-colors text-xs flex items-center gap-2"
+                          onClick={() => {
+                              exportOriginalImage(floatingContextMenu.url, floatingContextMenu.id, 'webp');
+                              setFloatingContextMenu(null);
+                          }}
+                      >
+                          Export WebP
+                      </button>
+                    </>
+                  )}
+              </motion.div>
+           );
+         })()}
+      </AnimatePresence>
+
+      {/* 
+        ============================================================
+        FLOATING IMAGE WINDOWS
+        ============================================================
+      */}
+      <AnimatePresence>
+        {floatingImages.map(img => (
+          <motion.div 
+            key={img.id}
+            initial={{ opacity: 0, scale: 0.95, y: 10 }}
+            animate={{ 
+              opacity: img.isCollapsed ? 0 : 1, 
+              scale: img.isCollapsed ? 0.95 : 1, 
+              y: img.isCollapsed ? 10 : 0
+            }}
+            exit={{ opacity: 0, scale: 0.95, y: 10 }}
+            transition={(draggingFloatingId === img.id || resizingFloatingId === img.id) ? { type: "tween", duration: 0 } : { type: "spring", damping: 25, stiffness: 300, mass: 0.5 }}
+            className={`absolute bg-transparent flex flex-col group pointer-events-auto floating-window`}
+            data-id={img.id}
+            data-click-through={img.isLocked ? 'true' : 'false'}
+            data-collapsed={img.isCollapsed ? 'true' : 'false'}
+            onMouseDown={(e) => {
+              setTopWindowId(img.id);
+              startFloatingImageDrag(e, img.id);
+            }}
+            onContextMenu={(e) => {
+               e.preventDefault();
+               e.stopPropagation();
+               setTopWindowId(img.id);
+               setContextMenuTempPath('');
+               applyCentralizedIgnoreMouseEvents(false);
+               setFloatingContextMenu({ x: e.clientX, y: e.clientY, id: img.id, url: img.url, type: img.type || 'image' });
+            }}
+            style={{
+              left: img.x,
+              top: img.y,
+              zIndex: topWindowId === img.id ? 6500 : 6000,
+            }}
+          >
+            {/* Drag Handle Overlay */}
+            <div 
+               className={`absolute bottom-full left-0 w-full h-[34px] ${theme === 'light' ? 'bg-white/95 text-slate-700 shadow-lg' : 'bg-slate-900/90 text-slate-300'} backdrop-blur-sm ${img.isCollapsed ? 'rounded-lg' : 'rounded-t-lg'} transition-all flex items-center justify-between px-2 cursor-move border ${theme === 'light' ? 'border-black/10' : 'border-white/10'} pointer-events-auto gap-2 ${img.isCollapsed ? 'opacity-100' : (img.isLocked ? 'opacity-40 hover:opacity-100' : 'opacity-70 hover:opacity-100 group-hover:opacity-100')} floating-drag-handle`}
+               onMouseDown={(e) => {
+                 if (!img.isLocked) handleFloatingMouseDown(e, img.id);
+               }}
+            >
+              <div className="flex items-center space-x-2 shrink-0">
+                <Move className={`w-3 h-3 ${img.isLocked ? 'text-slate-600' : 'text-slate-400'}`} />
+                <input 
+                   type="range" 
+                   min="0.05" max="1" step="0.01" 
+                   value={img.opacity}
+                   onInput={(e) => updateFloatingOpacity(img.id, parseFloat((e.target as HTMLInputElement).value))}
+                   onChange={(e) => updateFloatingOpacity(img.id, parseFloat(e.target.value))}
+                   onMouseDown={(e) => e.stopPropagation()} 
+                   className="w-24 smooth-range text-xs"
+                />
+              </div>
+              
+              <div className="flex flex-nowrap gap-1 items-center justify-end shrink-0" onMouseDown={(e) => e.stopPropagation()}>
+                <button 
+                  onClick={() => setFloatingImages(prev => prev.map(f => f.id === img.id ? {...f, zoom: Math.min((f.zoom || 1) + 0.25, 5)} : f))}
+                  className="hover:bg-black/10 dark:hover:bg-white/10 p-1 rounded transition-colors text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white"
+                  title="Zoom In"
+                >
+                  <ZoomIn className="w-3 h-3 text-sky-400" />
+                </button>
+                <button 
+                  onClick={() => setFloatingImages(prev => prev.map(f => f.id === img.id ? {...f, zoom: Math.max((f.zoom || 1) - 0.25, 0.5)} : f))}
+                  className="hover:bg-black/10 dark:hover:bg-white/10 p-1 rounded transition-colors text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white"
+                  title="Zoom Out"
+                >
+                  <ZoomOut className="w-3 h-3" />
+                </button>
+                <button 
+                  onClick={() => setFloatingImages(prev => prev.map(f => f.id === img.id ? {...f, zoom: 1} : f))}
+                  className="hover:bg-black/10 dark:hover:bg-white/10 p-1 rounded transition-colors text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white text-[9px] font-bold"
+                  title="Reset Zoom"
+                >
+                  1:1
+                </button>
+                <button 
+                  onClick={() => extractPaletteForImage(img.id, img.url)}
+                  className="hover:bg-black/10 dark:hover:bg-white/10 p-1 rounded transition-colors text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white"
+                  title="Extract Color Palette"
+                >
+                  <Palette className="w-3 h-3 text-fuchsia-400" />
+                </button>
+                <button 
+                  onClick={() => setFloatingImages(prev => prev.map(f => f.id === img.id ? {...f, rotation: (f.rotation + 90) % 360} : f))}
+                  className="hover:bg-black/10 dark:hover:bg-white/10 p-1 rounded transition-colors text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white"
+                  title="Rotate 90Â°"
+                >
+                  <RotateCw className="w-3 h-3" />
+                </button>
+                <button 
+                  onClick={() => {
+                    const nextLocked = !img.isLocked;
+                    setFloatingImages(prev => prev.map(f => f.id === img.id ? {...f, isLocked: nextLocked} : f));
+                    logWindowLockState('image', img.id, nextLocked);
+                  }}
+                  className="hover:bg-black/10 dark:hover:bg-white/10 p-1 rounded transition-colors text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white"
+                  title={img.isLocked ? "Unlock Window" : "Lock in Place (Click Through)"}
+                >
+                  {img.isLocked ? <Lock className="w-3 h-3 text-sky-400" /> : <Unlock className="w-3 h-3" />}
+                </button>
+                <button 
+                  onClick={() => setFloatingImages(prev => prev.map(f => f.id === img.id ? {...f, isCollapsed: !f.isCollapsed} : f))}
+                  className="hover:bg-black/10 dark:hover:bg-white/10 p-1 rounded transition-colors text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white"
+                  title={img.isCollapsed ? "Expand Image" : "Collapse Image"}
+                >
+                  {img.isCollapsed ? <ChevronDown className="w-3 h-3 text-sky-400" /> : <ChevronUp className="w-3 h-3" />}
+                </button>
+                <button 
+                  onClick={() => closeFloatingImage(img.id)}
+                  className="hover:bg-red-500/80 p-1 rounded transition-colors text-slate-500 dark:text-slate-400 hover:text-white"
+                  title="Close"
+                >
+                  <X className="w-3 h-3" />
+                </button>
+              </div>
+            </div>
+            
+            <motion.div 
+              animate={{
+                height: img.isCollapsed ? 0 : 'auto',
+                borderWidth: img.isCollapsed ? 0 : 1
+              }}
+              transition={resizingFloatingId === img.id ? { duration: 0 } : { duration: 0.2, ease: "easeInOut" }}
+              className={`relative shadow-2xl rounded-b-lg rounded-t-none border-white/10 overflow-hidden bg-black/40 flex flex-col ${img.isLocked ? 'pointer-events-none' : 'pointer-events-auto'}`}
+              style={{ width: img.width, opacity: img.isCollapsed ? 0 : img.opacity }}
+            >
+              <div className="flex flex-col relative w-full h-full">
+                  {img.searchStatus && (
+                    <div className="absolute inset-0 bg-black/60 backdrop-blur-sm z-50 flex flex-col items-center justify-center p-4">
+                      <div className="bg-slate-900 border border-white/10 rounded-lg shadow-2xl flex flex-col items-center justify-center p-6 text-center max-w-xs transition-opacity duration-300">
+                        {img.isSearchInProgress ? (
+                          <div className="relative">
+                            <Loader2 className="w-6 h-6 text-sky-400 mb-3 animate-spin" />
+                            <div className="absolute inset-0 bg-sky-400 blur-md opacity-20 animate-pulse"></div>
+                          </div>
+                        ) : (
+                          img.searchStatus.includes('failed') || img.searchStatus.includes('Missing') || img.searchStatus.includes('No better') ? 
+                            <X className="w-6 h-6 text-red-400 mb-3" /> : 
+                            <Check className="w-6 h-6 text-green-400 mb-3" />
+                        )}
+                        <p className="text-sm font-medium text-white/90">{img.searchStatus}</p>
+                      </div>
+                    </div>
+                  )}
+
+                  {img.type === 'pdf' ? (
+                    <div className="relative flex flex-col items-center justify-center bg-slate-800/50 w-full">
+                      <div className="overflow-auto no-scrollbar w-full max-h-[75vh]" onMouseDown={(e) => { e.stopPropagation(); /* allow native pan */ }}>
+                        <PdfCanvas
+                          url={img.url}
+                          pageNumber={img.documentPage || 1}
+                          width={img.width}
+                          scale={img.zoom || 1}
+                          onLoadSuccess={(numPages) => setFloatingImages(prev => prev.map(f => f.id === img.id ? { ...f, documentNumPages: numPages } : f))}
+                          onLoadError={(error) => {
+                            console.error("PDF load failed:", error);
+                            setFloatingImages(prev => prev.map(f => f.id === img.id ? { ...f, searchStatus: `PDF failed to load: ${error.message}` } : f));
+                          }}
+                        />
+                      </div>
+                      {/* Page Controls */}
+                      {(img.documentNumPages || 0) > 1 && (
+                        <div className="absolute bottom-4 left-1/2 -translate-x-1/2 bg-slate-900/80 backdrop-blur border border-white/10 rounded-full px-3 py-1 flex items-center space-x-3 shadow-xl z-50 pointer-events-auto">
+                          <button 
+                            onClick={(e) => { e.stopPropagation(); setFloatingImages(prev => prev.map(f => f.id === img.id ? {...f, documentPage: Math.max(1, (f.documentPage || 1) - 1)} : f)); }}
+                            className="p-1 hover:bg-black/10 dark:hover:bg-white/10 rounded-full text-slate-500 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white"
+                          >
+                            <ChevronLeft className="w-4 h-4"/>
+                          </button>
+                          <span className="text-slate-900 dark:text-white text-xs font-medium font-mono">{img.documentPage || 1} / {img.documentNumPages}</span>
+                          <button 
+                            onClick={(e) => { e.stopPropagation(); setFloatingImages(prev => prev.map(f => f.id === img.id ? {...f, documentPage: Math.min((f.documentNumPages || 1), (f.documentPage || 1) + 1)} : f)); }}
+                            className="p-1 hover:bg-black/10 dark:hover:bg-white/10 rounded-full text-slate-500 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white"
+                          >
+                            <ChevronRight className="w-4 h-4"/>
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  ) : (
+                    <img 
+                      src={img.url} 
+                      alt="Floating Reference" 
+                      className="block pointer-events-auto select-none transition-transform duration-300 no-window-drag cursor-grab active:cursor-grabbing"
+                      style={{ width: img.width, transform: `rotate(${img.rotation}deg) scale(${img.zoom || 1})`, objectFit: 'contain' }}
+                      draggable={!img.isLocked}
+                      title={img.isLocked ? 'Unlock this reference to drag it out' : 'Drag into Photoshop or another desktop app'}
+                      onMouseDown={(event) => event.stopPropagation()}
+                      onMouseEnter={() => {
+                        if (dragFilePathsRef.current.has(img.id)) return;
+                        ensureTempLocalFile(img.url, img.id).then(filePath => {
+                          if (filePath) dragFilePathsRef.current.set(img.id, filePath);
+                        });
+                      }}
+                      onDragStart={(event) => {
+                        event.stopPropagation();
+                        event.dataTransfer.effectAllowed = 'copy';
+                        event.dataTransfer.setData('text/uri-list', img.url);
+                        const electron = getElectron();
+                        if (electron?.ipcRenderer) {
+                          electron.ipcRenderer.send('start-reference-drag', {
+                            id: img.id,
+                            source: img.url,
+                            cachedPath: dragFilePathsRef.current.get(img.id) || '',
+                            type: img.type || 'image'
+                          });
+                        }
+                      }}
+                    />
+                  )}
+                  {img.palette && img.palette.length > 0 && (
+                    <div className="flex h-6 w-full mt-auto" style={{ width: img.width }}>
+                      {img.palette.map((color, i) => (
+                        <div 
+                          key={i} 
+                          className="flex-1 h-full cursor-pointer hover:scale-110 origin-bottom transition-transform group/color relative"
+                          style={{ backgroundColor: color }}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            navigator.clipboard.writeText(color);
+                            setCopiedColor(color);
+                            setTimeout(() => setCopiedColor(null), 1500);
+                          }}
+                          title={`Copy ${color}`}
+                        >
+                          <div className="absolute opacity-0 group-hover/color:opacity-100 bottom-full left-1/2 -translate-x-1/2 mb-2 bg-black/80 text-white text-[9px] px-1.5 py-0.5 rounded pointer-events-none whitespace-nowrap">
+                            {copiedColor === color ? 'Copied!' : color}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  {/* Resize Handle */}
+                  {!img.isLocked && (
+                    <div 
+                      className="absolute bottom-0 right-0 w-6 h-6 cursor-se-resize z-50 opacity-0 group-hover:opacity-100 transition-opacity flex items-end justify-end p-1.5"
+                      onMouseDown={(e) => handleFloatingResizeMouseDown(e, img.id)}
+                    >
+                      <div className="w-2.5 h-2.5 border-r-[3px] border-b-[3px] border-slate-400/80 hover:border-sky-400 rounded-br-[2px] transition-colors bg-black/20"></div>
+                    </div>
+                  )}
+              </div>
+            </motion.div>
+          </motion.div>
+        ))}
+      </AnimatePresence>
+
+      {/* 
+        ============================================================
+        FLOATING NOTES
+        ============================================================
+      */}
+      <AnimatePresence>
+        {floatingNotes.map(note => {
+          const isEditing = editingNotes[note.id];
+          return (
+          <motion.div 
+            key={note.id}
+            initial={{ opacity: 0, scale: 0.95, y: 10 }}
+            animate={{ 
+              opacity: note.isCollapsed ? 0 : 1, 
+              scale: note.isCollapsed ? 0.95 : 1, 
+              y: note.isCollapsed ? 10 : 0
+            }}
+            exit={{ opacity: 0, scale: 0.95, y: 10 }}
+            transition={(draggingNoteId === note.id || resizingNoteId === note.id) ? { type: "tween", duration: 0 } : { type: "spring", damping: 25, stiffness: 300, mass: 0.5 }}
+            className={`absolute bg-transparent flex flex-col group drop-shadow-2xl pointer-events-auto floating-window`}
+            data-id={note.id}
+            data-click-through={note.isLocked ? 'true' : 'false'}
+            data-collapsed={note.isCollapsed ? 'true' : 'false'}
+            onMouseDown={() => setTopWindowId(note.id)}
+            style={{
+              left: note.x,
+              top: note.y,
+              width: note.width,
+              zIndex: topWindowId === note.id ? 6500 : 6000,
+            }}
+          >
+            {/* Note Drag Handle Overlay */}
+            <div 
+               className={`absolute bottom-full left-0 w-full h-[32px] ${theme === 'light' ? 'bg-white/80' : 'bg-slate-900/80'} backdrop-blur-sm ${note.isCollapsed ? 'rounded-lg' : 'rounded-t-lg'} transition-all flex items-center justify-between px-2 ${!note.isLocked ? 'cursor-move' : 'cursor-default'} ${theme === 'light' ? 'border-black/10' : 'border-white/10'} ${note.isCollapsed ? 'opacity-100' : (note.isLocked ? 'opacity-20 hover:opacity-100' : 'opacity-0 group-hover:opacity-100')} floating-note-drag-handle z-10 gap-2 pointer-events-auto`}
+               onMouseDown={(e) => {
+                 if (!note.isLocked) handleNoteMouseDown(e, note.id);
+               }}
+            >
+              <div className="flex items-center gap-2 shrink-0">
+                <Move className={`w-3 h-3 shrink-0 ${note.isLocked ? 'text-slate-600' : 'text-slate-400'}`} />
+              </div>
+              <div className="flex flex-nowrap gap-1 items-center justify-end shrink-0" onMouseDown={(e) => e.stopPropagation()}>
+                {!note.isLocked && (
+                  <div className="flex items-center space-x-1 border-r border-slate-700 pr-1 mr-1">
+                    {['#fef08a', '#bfdbfe', '#fbcfe8', '#bbf7d0', '#e2e8f0'].map(c => (
+                      <button
+                        key={c}
+                        onClick={() => setFloatingNotes(prev => prev.map(n => n.id === note.id ? {...n, color: c} : n))}
+                        className={`w-3 h-3 rounded-full border border-black/20 hover:scale-125 transition-transform ${note.color === c ? 'ring-1 ring-white/50' : ''}`}
+                        style={{ backgroundColor: c }}
+                        title="Change Color"
+                      />
+                    ))}
+                  </div>
+                )}
+                
+                {!note.isLocked && isEditing && (
+                  <div className="flex items-center space-x-1 border-r border-slate-700 pr-1 mr-1">
+                    <button 
+                      onClick={() => updateNoteText(note.id, note.text + '**bold**')}
+                      className="hover:bg-black/10 dark:hover:bg-white/10 p-1 rounded transition-colors text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white"
+                      title="Bold"
+                    >
+                      <Bold className="w-3 h-3" />
+                    </button>
+                    <button 
+                      onClick={() => updateNoteText(note.id, note.text + '*italic*')}
+                      className="hover:bg-black/10 dark:hover:bg-white/10 p-1 rounded transition-colors text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white"
+                      title="Italic"
+                    >
+                      <Italic className="w-3 h-3" />
+                    </button>
+                    <button 
+                      onClick={() => updateNoteText(note.id, note.text + '\n- list item')}
+                      className="hover:bg-black/10 dark:hover:bg-white/10 p-1 rounded transition-colors text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white"
+                      title="List"
+                    >
+                      <List className="w-3 h-3" />
+                    </button>
+                  </div>
+                )}
+                
+                <button 
+                  onClick={() => setEditingNotes(prev => ({...prev, [note.id]: !isEditing}))}
+                  className="hover:bg-black/10 dark:hover:bg-white/10 p-1 rounded transition-colors text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white"
+                  title={isEditing ? "Preview Markdown" : "Edit Markdown"}
+                >
+                  {isEditing ? <Eye className="w-3 h-3" /> : <Edit3 className="w-3 h-3" />}
+                </button>
+                <button 
+                  onClick={() => setFloatingNotes(prev => prev.map(n => n.id === note.id ? {...n, isCollapsed: !n.isCollapsed} : n))}
+                  className="hover:bg-black/10 dark:hover:bg-white/10 p-1 rounded transition-colors text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white"
+                  title={note.isCollapsed ? "Expand Note" : "Collapse Note"}
+                >
+                  {note.isCollapsed ? <ChevronDown className="w-3 h-3 text-sky-400" /> : <ChevronUp className="w-3 h-3" />}
+                </button>
+                <button 
+                  onClick={() => {
+                    const nextLocked = !note.isLocked;
+                    setFloatingNotes(prev => prev.map(n => n.id === note.id ? {...n, isLocked: nextLocked} : n));
+                    logWindowLockState('note', note.id, nextLocked);
+                  }}
+                  className="hover:bg-black/10 dark:hover:bg-white/10 p-1 rounded transition-colors text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white"
+                  title={note.isLocked ? "Unpin Note" : "Pin to Background"}
+                >
+                  {note.isLocked ? <Pin className="w-3 h-3 text-sky-400" /> : <PinOff className="w-3 h-3" />}
+                </button>
+                <button 
+                  onClick={() => closeNote(note.id)}
+                  className="hover:bg-red-500/80 p-1 rounded transition-colors text-slate-500 dark:text-slate-400 hover:text-white"
+                  title="Close Note"
+                >
+                  <X className="w-3 h-3" />
+                </button>
+              </div>
+            </div>
+            
+            <motion.div 
+              animate={{
+                height: note.isCollapsed ? 0 : note.height,
+                opacity: note.isCollapsed ? 0 : 1,
+                borderWidth: note.isCollapsed ? 0 : 1
+              }}
+              transition={resizingNoteId === note.id ? { duration: 0 } : { duration: 0.2, ease: "easeInOut" }}
+              className={`relative rounded-b-md rounded-t-none overflow-hidden shadow-xl border-black/10 flex flex-col ${note.isLocked ? 'pointer-events-none' : 'pointer-events-auto'}`}
+              style={{ backgroundColor: note.color }}
+            >
+              <div className="w-full h-full relative" onMouseDown={(e) => { if (note.isLocked) e.stopPropagation(); }}>
+                  {isEditing ? (
+                    <textarea 
+                      value={note.text}
+                      onChange={(e) => updateNoteText(note.id, e.target.value)}
+                      onMouseDown={(e) => e.stopPropagation()}
+                      placeholder="Type a note here (Markdown works!)..."
+                      className="absolute inset-0 w-full h-full bg-transparent p-4 pt-6 resize-none outline-none text-black/80 font-medium placeholder-black/30 font-sans text-sm"
+                      spellCheck={false}
+                    />
+                  ) : (
+                    <div 
+                      className="absolute inset-0 overflow-y-auto p-4 pt-6 prose prose-sm max-w-none text-black/80 font-medium break-words"
+                      onMouseDown={(e) => e.stopPropagation()}
+                      onDoubleClick={() => setEditingNotes(prev => ({...prev, [note.id]: true}))}
+                    >
+                      <Markdown remarkPlugins={[remarkGfm]}>{note.text || '*Empty note (double-click to edit)*'}</Markdown>
+                    </div>
+                  )}
+                </div>
+              
+              {/* Note Resize Handle */}
+              {!note.isLocked && (
+                <div 
+                  className="absolute bottom-0 right-0 w-6 h-6 cursor-se-resize z-50 flex items-end justify-end p-1.5 opacity-0 group-hover:opacity-100 transition-opacity"
+                  onMouseDown={(e) => handleNoteResizeMouseDown(e, note.id)}
+                >
+                  <div className="w-2.5 h-2.5 border-r-[2px] border-b-[2px] border-black/20 rounded-br-[1px]"></div>
+                </div>
+              )}
+            </motion.div>
+          </motion.div>
+        )})}
+      </AnimatePresence>
+
+      {/* 
+        ============================================================
+        FLOATING SKETCHES
+        ============================================================
+      */}
+      <AnimatePresence>
+        {floatingSketches.map(sketch => (
+          <FloatingSketchWindow
+            key={sketch.id}
+            sketch={sketch}
+            updateSketch={(id, updates) => setFloatingSketches(prev => prev.map(s => s.id === id ? { ...s, ...updates } : s))}
+            closeSketch={closeSketch}
+            onMouseDown={handleSketchMouseDown}
+            onResizeMouseDown={handleSketchResizeMouseDown}
+            isActive={topWindowId === sketch.id}
+            onInteraction={() => setTopWindowId(sketch.id)}
+            logWindowLockState={logWindowLockState}
+            isDragging={draggingSketchId === sketch.id}
+            isResizing={resizingSketchId === sketch.id}
+          />
+        ))}
+      </AnimatePresence>
+
+      {needsPermission && (
+        <div className="absolute bottom-6 right-6 z-50 bg-red-500/90 text-white px-4 py-3 rounded-xl shadow-2xl flex items-center space-x-3 pointer-events-auto backdrop-blur-sm border border-red-400">
+           <div className="flex-1">
+             <p className="font-bold text-sm">Auto-Save Paused</p>
+             <p className="text-xs text-red-100">Permission needed to write to folder.</p>
+           </div>
+           <button
+             onClick={async () => {
+               const p = projects.find(proj => proj.id === activeProjectId);
+               if (p && p.directoryHandle) {
+                 try {
+                   const perm = await p.directoryHandle.requestPermission({ mode: 'readwrite' });
+                   if (perm === 'granted') {
+                     setNeedsPermission(false);
+                     syncBoardToHandle(p, p.directoryHandle);
+                   }
+                 } catch (e) {
+                   console.error("Permission request failed", e);
+                 }
+               }
+             }}
+             className="bg-white text-red-600 px-3 py-1.5 rounded-lg text-sm font-semibold hover:bg-red-50 transition-colors"
+           >
+             Resume
+           </button>
+        </div>
+      )}
+
+      <AnimatePresence>
+        {dragError && (
+          <motion.div
+            initial={{ opacity: 0, y: 10, scale: 0.96 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, y: 8, scale: 0.96 }}
+            data-native-interactive="true"
+            className="absolute bottom-6 left-1/2 -translate-x-1/2 z-[100001] max-w-sm rounded-xl border border-amber-300/40 bg-slate-950/95 px-4 py-3 text-sm text-white shadow-2xl pointer-events-auto"
+          >
+            {dragError}
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      <AnimatePresence>
+      {showManager && (
+        <motion.div 
+            initial={{ opacity: 0, scale: 0.95 }}
+            animate={{ opacity: 1, scale: 1 }}
+            exit={{ opacity: 0, scale: 0.95 }}
+            transition={{ duration: 0.2 }}
+            className={`light-contrast-panel absolute z-[999] pointer-events-auto flex flex-col items-center justify-start p-10 overflow-y-auto backdrop-blur-md ${managerBounds ? '' : 'inset-0'} ${theme === 'light' ? 'bg-slate-100/95' : 'bg-slate-900/95'}`}
+            style={managerBounds ? {
+              left: managerBounds.x,
+              top: managerBounds.y,
+              width: managerBounds.width,
+              height: managerBounds.height
+            } : undefined}
+        >
+          <div className="w-full max-w-5xl flex justify-between items-center mb-10 shrink-0">
+            <h1 className="text-3xl text-slate-900 dark:text-white font-bold tracking-tight">Project Boards</h1>
+            <button onClick={() => setShowManager(false)} className="text-slate-900 dark:text-white bg-black/5 dark:bg-white/10 hover:bg-black/10 dark:hover:bg-white/20 p-2 rounded-full transition-colors flex items-center space-x-2 px-4 font-medium backdrop-blur-md border border-black/10 dark:border-white/10">
+               <span>Close Manager</span> <X className="w-5 h-5"/>
+            </button>
+          </div>
+          
+          {!managingProjectId ? (
+            <div className="w-full max-w-5xl grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6 pb-20">
+              {projects.map(p => (
+                <div 
+                  key={p.id} 
+                  className={`flex flex-col bg-white/50 dark:bg-slate-800/50 p-5 rounded-2xl border transition-all ${p.id === activeProjectId ? 'border-sky-500 shadow-[0_0_20px_rgba(14,165,233,0.3)]' : 'border-black/10 hover:border-black/20 dark:border-white/10 dark:hover:border-white/20 cursor-pointer'}`}
+                  onClick={async () => {
+                    if (p.id !== activeProjectId) {
+                       await selectProjectOfId(p.id);
+                    }
+                    setShowManager(false);
+                  }}
+                >
+                   <div className="flex justify-between items-start mb-4">
+                     {editingProjectId === p.id ? (
+                       <div className="flex items-center flex-1 pr-2">
+                         <input 
+                           autoFocus
+                           type="text" 
+                           value={editingProjectName}
+                           onChange={(e) => setEditingProjectName(e.target.value)}
+                           onKeyDown={async (e) => {
+                             if (e.key === 'Enter') {
+                               await updateProject(p.id, { name: editingProjectName });
+                               setProjects(await getProjects());
+                               setEditingProjectId(null);
+                             }
+                           }}
+                           onClick={(e) => e.stopPropagation()}
+                           className="w-full bg-white dark:bg-slate-900 border border-sky-500 rounded px-2 py-1 text-slate-900 dark:text-white text-sm outline-none"
+                         />
+                         <button 
+                           onClick={async (e) => {
+                             e.stopPropagation();
+                             await updateProject(p.id, { name: editingProjectName });
+                             setProjects(await getProjects());
+                             setEditingProjectId(null);
+                           }}
+                           className="ml-2 p-1.5 text-sky-400 hover:text-sky-300 hover:bg-sky-400/10 rounded-md transition-colors shrink-0"
+                         >
+                           <Check className="w-4 h-4"/>
+                         </button>
+                       </div>
+                     ) : (
+                       <h2 className="text-xl text-slate-900 dark:text-white font-semibold flex-1 truncate pr-2 group-hover:text-sky-600 dark:group-hover:text-sky-100 transition-colors">{p.name || 'Untitled Board'}</h2>
+                     )}
+                     <div className="flex space-x-1 shrink-0">
+                       {editingProjectId !== p.id && (
+                         <button 
+                           onClick={(e) => {
+                             e.stopPropagation();
+                             setEditingProjectId(p.id);
+                             setEditingProjectName(p.name);
+                           }}
+                           className="p-1.5 text-slate-400 hover:text-sky-400 hover:bg-sky-400/10 rounded-md transition-colors"
+                           title="Rename Board"
+                         >
+                           <Edit2 className="w-4 h-4"/>
+                         </button>
+                       )}
+                       {p.id !== activeProjectId && projects.length > 1 && (
+                         <button 
+                           onClick={async (e) => { 
+                             e.stopPropagation(); 
+                             await deleteProject(p.id); 
+                             setProjects(await getProjects()); 
+                           }} 
+                           className="p-1.5 text-slate-400 hover:text-red-400 hover:bg-red-400/10 rounded-md transition-colors"
+                           title="Delete Board"
+                         >
+                           <Trash2 className="w-4 h-4"/>
+                         </button>
+                       )}
+                     </div>
+                   </div>
+                   <div className="text-sm text-slate-400 mb-2 font-medium">
+                     {p.floatingImages?.length || 0} Images Â· {p.floatingNotes?.length || 0} Notes Â· {p.floatingSketches?.length || 0} Sketches
+                   </div>
+                   <div className="text-xs text-slate-500">
+                     Updated {new Date(p.updatedAt).toLocaleDateString()}
+                   </div>
+                   
+                   <div className="mt-4 flex items-center justify-between">
+                     {p.id === activeProjectId ? (
+                        <div className="text-[10px] font-bold text-sky-400 uppercase tracking-widest bg-sky-400/10 px-3 py-1 rounded-full border border-sky-400/20">
+                          Active
+                        </div>
+                     ) : <div />}
+                     <div className="flex space-x-2">
+                       <button
+                         onClick={(e) => {
+                           e.stopPropagation();
+                           exportBoard(p);
+                         }}
+                         className="p-2 bg-black/5 dark:bg-slate-700/50 hover:bg-black/10 dark:hover:bg-slate-700 text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white rounded text-xs font-semibold uppercase tracking-wider transition-colors flex items-center space-x-1"
+                         title="Export to Folder"
+                       >
+                         <Download className="w-3.5 h-3.5"/><span>Export</span>
+                       </button>
+                       <button
+                         onClick={(e) => {
+                           e.stopPropagation();
+                           setManagingProjectId(p.id);
+                         }}
+                         className="p-2 bg-black/5 dark:bg-slate-700/50 hover:bg-black/10 dark:hover:bg-slate-700 text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white rounded text-xs font-semibold uppercase tracking-wider transition-colors"
+                       >
+                         Edit Content
+                       </button>
+                     </div>
+                   </div>
+                </div>
+              ))}
+              <div 
+                onClick={async () => {
+                  const p = await createProject(`Board ${projects.length + 1}`);
+                  let createdProject = p;
+                  if (defaultAutosaveRoot) {
+                    const electron = getElectron();
+                    const path = electron?.require ? electron.require('path') : null;
+                    const dirPath = path ? path.join(defaultAutosaveRoot, sanitizeProjectFolderName(p.name)) : "";
+                    if (dirPath) {
+                      createdProject = { ...p, directoryPath: dirPath };
+                      await updateProject(p.id, { directoryPath: dirPath });
+                      await syncBoardToPath(createdProject, dirPath);
+                    }
+                  }
+                  const all = await getProjects();
+                  setProjects(all);
+                  setActiveProjectIdState(p.id);
+                  await setActiveProjectId(p.id);
+                  setImages([]);
+                  setFloatingImages([]);
+                  setFloatingNotes([]);
+                  setFloatingSketches([]);
+                }}
+                className="flex items-center justify-center bg-black/5 dark:bg-white/5 hover:bg-black/10 dark:hover:bg-white/10 p-5 rounded-2xl border border-dashed border-black/20 dark:border-white/20 hover:border-black/40 dark:hover:border-white/40 cursor-pointer transition-all min-h-[160px] group"
+              >
+                <div className="flex flex-col items-center space-y-2 text-slate-500 dark:text-slate-400 group-hover:text-slate-900 dark:group-hover:text-white transition-colors">
+                  <Plus className="w-8 h-8 group-hover:scale-110 transition-transform" />
+                  <span className="font-medium tracking-tight">New Board</span>
+                </div>
+              </div>
+            </div>
+          ) : (
+            (() => {
+              const p = projects.find(proj => proj.id === managingProjectId);
+              if (!p) {
+                setManagingProjectId(null);
+                return null;
+              }
+              return (
+                <div className={`w-full max-w-5xl flex flex-col space-y-6 p-6 rounded-2xl border pb-20 ${theme === 'light' ? 'bg-white/80 border-black/10' : 'bg-slate-800/40 border-white/10'}`}>
+                  <div className="flex items-center justify-between">
+                     <div className="flex items-center space-x-4">
+                       <button onClick={() => setManagingProjectId(null)} className="p-2 hover:bg-black/10 dark:hover:bg-white/10 rounded-full transition-colors text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white">
+                          <ChevronLeft className="w-6 h-6"/>
+                       </button>
+                       <h2 className="text-2xl font-semibold text-slate-900 dark:text-white">{p.name}</h2>
+                     </div>
+                     <div className="flex space-x-3">
+                       <label className="flex items-center space-x-2 bg-sky-500/20 hover:bg-sky-500/30 text-sky-400 px-3 py-1.5 rounded cursor-pointer transition-colors">
+                         <Plus className="w-4 h-4"/><span className="text-sm font-medium pr-1">Add Image</span>
+                         <input 
+                            type="file" 
+                            accept="image/*,application/pdf" 
+                            multiple 
+                            className="hidden" 
+                            onChange={async (e) => {
+                              if (e.target.files) {
+                                const files = Array.from(e.target.files) as File[];
+                                try {
+                                  const mediaFiles = files.filter(f => f.type.startsWith('image/') || f.type === 'application/pdf');
+                                  const base64Images = await Promise.all(mediaFiles.map(fileToBase64));
+                                  const newFloatingImages = createFloatingMediaItems(mediaFiles, base64Images, { x: 100 + Math.random() * 50, y: 100 + Math.random() * 50 });
+                                  const updatedFloatingImages = [...(p.floatingImages || []), ...newFloatingImages];
+                                  await updateProject(p.id, { floatingImages: updatedFloatingImages });
+                                  setProjects(await getProjects());
+                                  if (p.id === activeProjectId) setFloatingImages(updatedFloatingImages);
+                                } catch (error) {
+                                  console.error("Failed to add image", error);
+                                }
+                              }
+                            }} 
+                         />
+                       </label>
+                       <button 
+                         onClick={async () => {
+                            const newNote: FloatingNote = {
+                              id: Math.random().toString(36).substr(2, 9),
+                              text: 'New Note',
+                              x: 100 + Math.random() * 50, 
+                              y: 100 + Math.random() * 50, 
+                              width: 320, 
+                              height: 200, 
+                              color: '#fef08a', 
+                              isLocked: false,
+                              isCollapsed: true
+                            };
+                            const updatedNotes = [...(p.floatingNotes||[]), newNote];
+                            await updateProject(p.id, { floatingNotes: updatedNotes });
+                            setProjects(await getProjects());
+                            if (p.id === activeProjectId) setFloatingNotes(updatedNotes);
+                         }}
+                         className="flex items-center space-x-2 bg-yellow-500/20 hover:bg-yellow-500/30 text-yellow-500 px-3 py-1.5 rounded font-medium transition-colors"
+                       >
+                         <Plus className="w-4 h-4"/><span className="text-sm">Add Note</span>
+                       </button>
+                     </div>
+                  </div>
+                  
+                  <div>
+                    <h3 className="text-sm text-slate-400 uppercase tracking-widest font-bold mb-4 border-b border-white/10 pb-2">Images ({p.floatingImages?.length || 0})</h3>
+                    {p.floatingImages?.length === 0 ? (
+                      <p className="text-slate-500 text-sm">No images in this board yet.</p>
+                    ) : (
+                      <div className="grid grid-cols-2 flex-wrap sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-4">
+                         {p.floatingImages?.map(img => (
+                           <div key={img.id} className="relative group aspect-square bg-slate-900 rounded-lg overflow-hidden border border-white/10">
+                              <img src={img.url} className="w-full h-full object-cover opacity-80 group-hover:opacity-100 transition-opacity" />
+                              <button 
+                                onClick={async (e) => {
+                                  e.stopPropagation();
+                                  const newImages = p.floatingImages.filter(f => f.id !== img.id);
+                                  await updateProject(p.id, { floatingImages: newImages });
+                                  setProjects(await getProjects());
+                                  if(p.id === activeProjectId) setFloatingImages(newImages);
+                                }}
+                                className="absolute top-2 right-2 bg-red-500/80 hover:bg-red-500 text-white p-1 rounded opacity-0 group-hover:opacity-100 transition-opacity"
+                                title="Remove Image"
+                              >
+                                <Trash2 className="w-4 h-4" />
+                              </button>
+                           </div>
+                         ))}
+                      </div>
+                    )}
+                  </div>
+
+                  <div>
+                    <h3 className="text-sm text-slate-400 uppercase tracking-widest font-bold mb-4 mt-6 border-b border-white/10 pb-2">Notes ({p.floatingNotes?.length || 0})</h3>
+                    {p.floatingNotes?.length === 0 ? (
+                      <p className="text-slate-500 text-sm">No notes in this board yet.</p>
+                    ) : (
+                      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-4">
+                        {p.floatingNotes?.map(note => (
+                          <div key={note.id} className="relative group bg-slate-900 p-4 rounded-lg border border-white/10 h-32 overflow-hidden text-sm text-slate-800" style={{ backgroundColor: note.color }}>
+                             <p className="line-clamp-3 w-full h-full pr-6 whitespace-pre-wrap">{note.text || 'Empty note...'}</p>
+                             <button 
+                                onClick={async (e) => {
+                                  e.stopPropagation();
+                                  const newNotes = p.floatingNotes.filter(f => f.id !== note.id);
+                                  await updateProject(p.id, { floatingNotes: newNotes });
+                                  setProjects(await getProjects());
+                                  if(p.id === activeProjectId) setFloatingNotes(newNotes);
+                                }}
+                                className="absolute top-2 right-2 bg-red-500/80 hover:bg-red-500 text-white p-1 rounded opacity-0 group-hover:opacity-100 transition-opacity"
+                                title="Remove Note"
+                              >
+                                <Trash2 className="w-4 h-4" />
+                              </button>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              );
+            })()
+          )}
+        </motion.div>
+      )}
+      </AnimatePresence>
+      </AnimatePresence>
+    </div>
+  );
+}
+
