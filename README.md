@@ -6,18 +6,13 @@ RefFlow Studio is a Windows desktop reference-board app for artists, designers, 
 
 - Floating pill control panel for quick actions.
 - Draggable image and PDF reference windows.
+- Native drag-out of image references into Photoshop and other Windows apps.
+- Monitor-aware placement across mixed multi-display desktop layouts.
+- Native click-through for transparent desktop areas and locked references.
 - Notes and sketch pads for board annotations.
 - Project manager for multiple local boards.
 - Local board export and autosave folder support.
 - Native Windows installer built with Electron Builder.
-
-## Planned Later
-
-These features were intentionally removed from the current release UI because they need a more reliable implementation:
-
-- Copy/paste references into external apps.
-- Drag references from RefFlow Studio into external apps.
-- Auto high-resolution replacement.
 
 ## Requirements
 

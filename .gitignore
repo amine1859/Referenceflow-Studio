@@ -1,0 +1,24 @@
+node_modules/
+dist/
+dist_desktop/
+build/
+coverage/
+.DS_Store
+Thumbs.db
+*.log
+.env*
+!.env.example
+*.local
+*.exe
+*.blockmap
+builder-debug.yml
+builder-effective-config.yaml
+
+# Local one-off audit/fix scratch files
+audit_*.js
+fix_*.js
+fix_*.cjs
+get_*.ts
+buttons*.txt
+colors.txt
+electron/

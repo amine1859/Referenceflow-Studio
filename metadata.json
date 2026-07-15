@@ -1,0 +1,6 @@
+{
+  "name": "ReferenceFlow",
+  "description": "Native-style floating reference window utility. Independent stay-on-top overlays, EXIF metadata inspection, multi-monitor memory profiles, smart color grabber, and transparent tracing modes optimized for 3D modeling, illustration, and architectural design.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
