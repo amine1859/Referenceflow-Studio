@@ -9,6 +9,8 @@ import remarkGfm from 'remark-gfm';
 import { FloatingImage, FloatingNote, FloatingSketch, FloatingSketchLine, ImageAnnotationPoint, Project, getProjects, createProject, updateProject, deleteProject, getActiveProjectId, setActiveProjectId, fileToBase64 } from './lib/store';
 import { createLocalBoardManifest, createProjectMediaSnapshot, getBackgroundMediaFileName, getFloatingMediaFileName, getSavedMediaExtension, projectMediaSnapshotsEqual, sanitizeExportStem } from './lib/projectMedia';
 import type { ProjectMediaSnapshot } from './lib/projectMedia';
+import { resizeWindowHorizontally, snapWindowRect } from './lib/windowGeometry';
+import type { HorizontalResizeEdge, WindowRect } from './lib/windowGeometry';
 
 import { FloatingSketchWindow } from './components/FloatingSketchWindow';
 import { pdfjs } from 'react-pdf';
@@ -77,6 +79,9 @@ const getPdfFileSource = (url: string) => {
 const MAX_REFERENCE_PREVIEW_DIMENSION = 2048;
 const MAX_CONCURRENT_REFERENCE_PREVIEWS = 2;
 const MIN_BOUNDED_PREVIEW_SOURCE_LENGTH = 1_500_000;
+const FLOATING_IMAGE_TOOLBAR_HEIGHT = 34;
+const FLOATING_WINDOW_SNAP_THRESHOLD = 12;
+const FLOATING_WINDOW_SNAP_GAP = 8;
 let activeReferencePreviewJobs = 0;
 const pendingReferencePreviewJobs: Array<() => void> = [];
 
@@ -2961,6 +2966,13 @@ export default function App() {
   // Handle Dragging global floating images
   const [draggingFloatingId, setDraggingFloatingId] = useState<string | null>(null);
   const dragFloatingOffset = useRef({ x: 0, y: 0 });
+  const dragFloatingGeometry = useRef<{
+    width: number;
+    height: number;
+    targets: WindowRect[];
+    bounds: WindowRect[];
+  }>({ width: 0, height: 0, targets: [], bounds: [] });
+  const [imageSnapGuides, setImageSnapGuides] = useState<{ x?: number; y?: number }>({});
   const opacityFrameRef = useRef<number | null>(null);
   const pendingOpacityRef = useRef<{ id: string; opacity: number } | null>(null);
 
@@ -2986,7 +2998,7 @@ export default function App() {
 
   // Handle Resizing global floating images
   const [resizingFloatingId, setResizingFloatingId] = useState<string | null>(null);
-  const resizeStart = useRef({ x: 0, width: 0 });
+  const resizeStart = useRef({ pointerX: 0, x: 0, width: 0, edge: 'right' as HorizontalResizeEdge });
 
   // Handle Dragging global floating notes
   const [draggingNoteId, setDraggingNoteId] = useState<string | null>(null);
@@ -3478,17 +3490,44 @@ export default function App() {
     }
   };
 
+  const beginFloatingImageWindowDrag = (clientX: number, clientY: number, img: FloatingImage) => {
+    const windowElements = Array.from(document.querySelectorAll<HTMLElement>('.floating-window[data-window-kind="image"]'));
+    const visibleRects = windowElements.map(element => {
+      const rect = element.getBoundingClientRect();
+      return {
+        id: element.dataset.id || '',
+        rect: {
+          x: rect.left,
+          y: rect.top - FLOATING_IMAGE_TOOLBAR_HEIGHT,
+          width: rect.width,
+          height: rect.height + FLOATING_IMAGE_TOOLBAR_HEIGHT
+        }
+      };
+    });
+    const movingRect = visibleRects.find(item => item.id === img.id)?.rect;
+
+    dragFloatingGeometry.current = {
+      width: movingRect?.width || img.width,
+      height: movingRect?.height || img.width + FLOATING_IMAGE_TOOLBAR_HEIGHT,
+      targets: visibleRects.filter(item => item.id && item.id !== img.id).map(item => item.rect),
+      bounds: displayLayout?.displays.map(display => display.workArea) || [{ x: 0, y: 0, width: window.innerWidth, height: window.innerHeight }]
+    };
+    dragFloatingOffset.current = {
+      x: clientX - img.x,
+      y: clientY - img.y
+    };
+    setImageSnapGuides({});
+    setTopWindowId(img.id);
+    setDraggingFloatingId(img.id);
+  };
+
   const handleFloatingMouseDown = (e: React.MouseEvent, id: string) => {
     // Only drag by the header/drag-handle
     if ((e.target as HTMLElement).closest('.floating-drag-handle')) {
       e.stopPropagation();
-      setDraggingFloatingId(id);
       const img = floatingImages.find(f => f.id === id);
       if (img) {
-        dragFloatingOffset.current = {
-          x: e.clientX - img.x,
-          y: e.clientY - img.y
-        };
+        beginFloatingImageWindowDrag(e.clientX, e.clientY, img);
       }
     }
   };
@@ -3502,12 +3541,7 @@ export default function App() {
 
     e.preventDefault();
     e.stopPropagation();
-    setTopWindowId(id);
-    setDraggingFloatingId(id);
-    dragFloatingOffset.current = {
-      x: e.clientX - img.x,
-      y: e.clientY - img.y
-    };
+    beginFloatingImageWindowDrag(e.clientX, e.clientY, img);
   };
 
   const handleNoteMouseDown = (e: React.MouseEvent, id: string) => {
@@ -3524,14 +3558,20 @@ export default function App() {
     }
   };
 
-  const handleFloatingResizeMouseDown = (e: React.MouseEvent, id: string) => {
+  const handleFloatingResizeMouseDown = (e: React.MouseEvent, id: string, edge: HorizontalResizeEdge) => {
+    if (e.button !== 0) return;
+    e.preventDefault();
     e.stopPropagation();
     setResizingFloatingId(id);
+    setTopWindowId(id);
+    setImageSnapGuides({});
     const img = floatingImages.find(f => f.id === id);
     if (img) {
       resizeStart.current = {
-        x: e.clientX,
-        width: img.width
+        pointerX: e.clientX,
+        x: img.x,
+        width: img.width,
+        edge
       };
     }
   };
@@ -3581,12 +3621,33 @@ export default function App() {
         }
 
         if (draggingFloatingId) {
+          const rawX = e.clientX - dragFloatingOffset.current.x;
+          const rawY = e.clientY - dragFloatingOffset.current.y;
+          const geometry = dragFloatingGeometry.current;
+          const movingRect = {
+            x: rawX,
+            y: rawY - FLOATING_IMAGE_TOOLBAR_HEIGHT,
+            width: geometry.width,
+            height: geometry.height
+          };
+          const snapped = e.altKey
+            ? { ...movingRect, guideX: undefined, guideY: undefined }
+            : snapWindowRect(
+                movingRect,
+                geometry.targets,
+                geometry.bounds,
+                FLOATING_WINDOW_SNAP_THRESHOLD,
+                FLOATING_WINDOW_SNAP_GAP
+              );
+          const snappedY = snapped.y + FLOATING_IMAGE_TOOLBAR_HEIGHT;
+          setImageSnapGuides(current => (
+            current.x === snapped.guideX && current.y === snapped.guideY
+              ? current
+              : { x: snapped.guideX, y: snapped.guideY }
+          ));
           setFloatingImages(prev => prev.map(img => {
             if (img.id === draggingFloatingId) {
-              let newX = e.clientX - dragFloatingOffset.current.x;
-              let newY = e.clientY - dragFloatingOffset.current.y;
-              
-              return { ...img, x: newX, y: newY };
+              return { ...img, x: snapped.x, y: snappedY };
             }
             return img;
           }));
@@ -3619,10 +3680,11 @@ export default function App() {
         if (resizingFloatingId) {
           setFloatingImages(prev => prev.map(img => {
             if (img.id === resizingFloatingId) {
-              const diffX = e.clientX - resizeStart.current.x;
+              const resized = resizeWindowHorizontally(resizeStart.current, e.clientX, 100);
               return {
                 ...img,
-                width: Math.max(100, resizeStart.current.width + diffX)
+                x: resized.x,
+                width: resized.width
               };
             }
             return img;
@@ -3673,6 +3735,7 @@ export default function App() {
       setIsDraggingPill(false);
       setDraggingFloatingId(null);
       setResizingFloatingId(null);
+      setImageSnapGuides({});
       setDraggingNoteId(null);
       setResizingNoteId(null);
       setDraggingSketchId(null);
@@ -3989,9 +4052,22 @@ export default function App() {
 
   return (
     <div className={`w-screen h-screen overflow-hidden pointer-events-none relative ${reduceLargeBoardEffects ? 'large-board-performance' : ''}`} style={{ WebkitAppRegion: 'no-drag' } as any}>
+      {draggingFloatingId && imageSnapGuides.x !== undefined && (
+        <div
+          className="absolute inset-y-0 z-[89990] w-px bg-sky-400/90 shadow-[0_0_8px_rgba(56,189,248,0.9)] pointer-events-none"
+          style={{ left: imageSnapGuides.x }}
+        />
+      )}
+      {draggingFloatingId && imageSnapGuides.y !== undefined && (
+        <div
+          className="absolute inset-x-0 z-[89990] h-px bg-sky-400/90 shadow-[0_0_8px_rgba(56,189,248,0.9)] pointer-events-none"
+          style={{ top: imageSnapGuides.y }}
+        />
+      )}
+
       {/* Global Drag Overlay to prevent mouse events being swallowed by canvas/iframes/pill while dragging */}
       {(isDraggingPill || draggingFloatingId || draggingNoteId || draggingSketchId || resizingFloatingId || resizingNoteId || resizingSketchId || isResizingPill) && (
-        <div className={`absolute inset-0 z-[100000] pointer-events-auto ${(resizingFloatingId || resizingNoteId || resizingSketchId || isResizingPill) ? 'cursor-nwse-resize' : 'cursor-move'}`} />
+        <div className={`absolute inset-0 z-[100000] pointer-events-auto ${resizingFloatingId ? 'cursor-ew-resize' : ((resizingNoteId || resizingSketchId || isResizingPill) ? 'cursor-nwse-resize' : 'cursor-move')}`} />
       )}
 
       {!isLoading && floatingImages.length === 0 && floatingNotes.length === 0 && floatingSketches.length === 0 && !showManager && !showSearchComponent && !showSettings && (
@@ -4056,7 +4132,7 @@ export default function App() {
           style={{
             left: position.x,
             top: position.y,
-            zIndex: 4000,
+            zIndex: 90000,
           }}
         >
           <div 
@@ -5242,6 +5318,7 @@ export default function App() {
             transition={(reduceLargeBoardEffects || draggingFloatingId === img.id || resizingFloatingId === img.id) ? { type: "tween", duration: 0 } : { type: "spring", damping: 25, stiffness: 300, mass: 0.5 }}
             className={`absolute bg-transparent flex flex-col group pointer-events-auto floating-window`}
             data-id={img.id}
+            data-window-kind="image"
             data-click-through={img.isLocked ? 'true' : 'false'}
             data-collapsed={img.isCollapsed ? 'true' : 'false'}
             onMouseDown={(e) => {
@@ -5264,13 +5341,14 @@ export default function App() {
           >
             {/* Drag Handle Overlay */}
             <div 
-               className={`absolute bottom-full left-0 w-full h-[34px] ${theme === 'light' ? 'bg-white/95 text-slate-700 shadow-lg' : 'bg-slate-900/90 text-slate-300'} backdrop-blur-sm ${img.isCollapsed ? 'rounded-lg' : 'rounded-t-lg'} transition-all flex items-center justify-between px-2 cursor-move border ${theme === 'light' ? 'border-black/10' : 'border-white/10'} pointer-events-auto gap-2 ${img.isCollapsed ? 'opacity-100' : (img.isLocked ? 'opacity-40 hover:opacity-100' : 'opacity-70 hover:opacity-100 group-hover:opacity-100')} floating-drag-handle`}
+               className={`absolute bottom-full left-0 w-full h-[34px] overflow-hidden min-w-0 ${theme === 'light' ? 'bg-white/95 text-slate-700 shadow-lg' : 'bg-slate-900/90 text-slate-300'} backdrop-blur-sm ${img.isCollapsed ? 'rounded-lg' : 'rounded-t-lg'} transition-all flex items-center justify-start px-1 cursor-move border ${theme === 'light' ? 'border-black/10' : 'border-white/10'} pointer-events-auto gap-1 ${img.isCollapsed ? 'opacity-100' : (img.isLocked ? 'opacity-40 hover:opacity-100' : 'opacity-70 hover:opacity-100 group-hover:opacity-100')} floating-drag-handle`}
                onMouseDown={(e) => {
                  if (!img.isLocked) handleFloatingMouseDown(e, img.id);
                }}
+               title={img.isLocked ? 'Unlock to move this image' : 'Drag to move. Hold Alt to temporarily disable snapping.'}
             >
-              <div className="flex items-center space-x-2 shrink-0">
-                <Move className={`w-3 h-3 ${img.isLocked ? 'text-slate-600' : 'text-slate-400'}`} />
+              <div className="flex items-center gap-1 shrink-0 min-w-0">
+                <Move className={`w-3 h-3 shrink-0 ${img.isLocked ? 'text-slate-600' : 'text-slate-400'}`} />
                 <input 
                    type="range" 
                    min="0.05" max="1" step="0.01" 
@@ -5278,11 +5356,20 @@ export default function App() {
                    onInput={(e) => updateFloatingOpacity(img.id, parseFloat((e.target as HTMLInputElement).value))}
                    onChange={(e) => updateFloatingOpacity(img.id, parseFloat(e.target.value))}
                    onMouseDown={(e) => e.stopPropagation()} 
-                   className="w-24 smooth-range text-xs"
+                   className="smooth-range text-xs shrink-0"
+                   style={{ width: Math.max(36, Math.min(96, img.width * 0.32)) }}
                 />
               </div>
               
-              <div className="flex flex-nowrap gap-1 items-center justify-end shrink-0" onMouseDown={(e) => e.stopPropagation()}>
+              <div
+                className="flex min-w-0 flex-1 flex-nowrap gap-1 items-center justify-start overflow-x-auto no-scrollbar overscroll-contain"
+                onMouseDown={(e) => e.stopPropagation()}
+                onWheel={(event) => {
+                  event.stopPropagation();
+                  event.currentTarget.scrollLeft += event.deltaY || event.deltaX;
+                }}
+                title="Scroll to reveal more image controls"
+              >
                 <button 
                   onClick={() => setFloatingImages(prev => prev.map(f => f.id === img.id ? {...f, zoom: Math.min((f.zoom || 1) + 0.25, 5)} : f))}
                   className="hover:bg-black/10 dark:hover:bg-white/10 p-1 rounded transition-colors text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white"
@@ -5580,14 +5667,24 @@ export default function App() {
                       })}
                     </div>
                   )}
-                  {/* Resize Handle */}
+                  {/* Two-sided resize handles */}
                   {!img.isLocked && (
-                    <div 
-                      className="absolute bottom-0 right-0 w-6 h-6 cursor-se-resize z-50 opacity-0 group-hover:opacity-100 transition-opacity flex items-end justify-end p-1.5"
-                      onMouseDown={(e) => handleFloatingResizeMouseDown(e, img.id)}
-                    >
-                      <div className="w-2.5 h-2.5 border-r-[3px] border-b-[3px] border-slate-400/80 hover:border-sky-400 rounded-br-[2px] transition-colors bg-black/20"></div>
-                    </div>
+                    <>
+                      <div
+                        className="absolute inset-y-0 left-0 w-2 cursor-ew-resize z-50 opacity-0 group-hover:opacity-100 transition-opacity no-window-drag"
+                        onMouseDown={(e) => handleFloatingResizeMouseDown(e, img.id, 'left')}
+                        title="Resize from left"
+                      >
+                        <div className="absolute bottom-1.5 left-1.5 w-2.5 h-2.5 border-l-[3px] border-b-[3px] border-slate-400/80 hover:border-sky-400 rounded-bl-[2px] transition-colors bg-black/20" />
+                      </div>
+                      <div
+                        className="absolute inset-y-0 right-0 w-2 cursor-ew-resize z-50 opacity-0 group-hover:opacity-100 transition-opacity no-window-drag"
+                        onMouseDown={(e) => handleFloatingResizeMouseDown(e, img.id, 'right')}
+                        title="Resize from right"
+                      >
+                        <div className="absolute bottom-1.5 right-1.5 w-2.5 h-2.5 border-r-[3px] border-b-[3px] border-slate-400/80 hover:border-sky-400 rounded-br-[2px] transition-colors bg-black/20" />
+                      </div>
+                    </>
                   )}
               </div>
             </motion.div>
