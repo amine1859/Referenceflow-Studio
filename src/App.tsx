@@ -6,7 +6,7 @@ import {
 import { motion, AnimatePresence } from 'motion/react';
 import Markdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { FloatingImage, FloatingNote, FloatingSketch, FloatingSketchLine, Project, getProjects, createProject, updateProject, deleteProject, getActiveProjectId, setActiveProjectId, fileToBase64 } from './lib/store';
+import { FloatingImage, FloatingNote, FloatingSketch, FloatingSketchLine, ImageAnnotationPoint, Project, getProjects, createProject, updateProject, deleteProject, getActiveProjectId, setActiveProjectId, fileToBase64 } from './lib/store';
 
 import { FloatingSketchWindow } from './components/FloatingSketchWindow';
 import { pdfjs } from 'react-pdf';
@@ -19,6 +19,27 @@ pdfjs.GlobalWorkerOptions.workerSrc = new URL(
 ).toString();
 
 const PATREON_URL = 'https://www.patreon.com/RefFlowStudio';
+
+const getNodeRequire = () => {
+  if (typeof window === 'undefined') return null;
+  return typeof (window as any).require === 'function' ? (window as any).require : null;
+};
+
+const normalizeHexColor = (value: string): string | null => {
+  const trimmed = String(value || '').trim();
+  const hexMatch = trimmed.match(/^#?([0-9a-f]{3}|[0-9a-f]{6})$/i);
+  if (hexMatch) {
+    const raw = hexMatch[1].length === 3
+      ? hexMatch[1].split('').map(character => character + character).join('')
+      : hexMatch[1];
+    return `#${raw.toUpperCase()}`;
+  }
+
+  const rgbMatch = trimmed.match(/^rgba?\(\s*(\d{1,3})\s*,\s*(\d{1,3})\s*,\s*(\d{1,3})/i);
+  if (!rgbMatch) return null;
+  const toHex = (channel: string) => Math.min(255, Number(channel)).toString(16).padStart(2, '0').toUpperCase();
+  return `#${toHex(rgbMatch[1])}${toHex(rgbMatch[2])}${toHex(rgbMatch[3])}`;
+};
 
 const dataUrlToUint8Array = (dataUrl: string): Uint8Array => {
   const base64 = dataUrl.split(',')[1] || '';
@@ -483,11 +504,12 @@ const matchShortcut = (combo: string, e: KeyboardEvent) => {
 };
 
 const ensureTempLocalFile = async (url: string, id: string): Promise<string> => {
-  const electron = (window as any).require ? (window as any).require('electron') : null;
-  if (!electron) return "";
-  const fs = electron.require('fs');
-  const path = electron.require('path');
-  const os = electron.require('os');
+  const nodeRequire = getNodeRequire();
+  if (!nodeRequire) return "";
+  const electron = nodeRequire('electron');
+  const fs = nodeRequire('fs');
+  const path = nodeRequire('path');
+  const os = nodeRequire('os');
   
   try {
     let ext = '.jpg';
@@ -620,7 +642,8 @@ const exportOriginalImage = async (url: string, id: string, formatType: 'png' | 
     
     const mimeType = formatType === 'png' ? 'image/png' : formatType === 'jpg' ? 'image/jpeg' : 'image/webp';
     const dataUrl = canvas.toDataURL(mimeType, formatType === 'png' ? undefined : 0.95);
-    const electron = (window as any).require ? (window as any).require('electron') : null;
+    const nodeRequire = getNodeRequire();
+    const electron = nodeRequire ? nodeRequire('electron') : null;
     
     if (electron) {
       const result = await electron.ipcRenderer.invoke('show-save-dialog', {
@@ -631,7 +654,7 @@ const exportOriginalImage = async (url: string, id: string, formatType: 'png' | 
         ]
       });
       if (!result.canceled && result.filePath) {
-        const fs = electron.require('fs');
+        const fs = nodeRequire('fs');
         const base64Data = dataUrl.split(',')[1];
         fs.writeFileSync(result.filePath, Buffer.from(base64Data, 'base64'));
         console.log(`[Export ${formatType}] Saved original natively to: ${result.filePath}`);
@@ -734,9 +757,14 @@ export default function App() {
   const [dragError, setDragError] = useState<string>('');
   const [defaultAutosaveRoot, setDefaultAutosaveRoot] = useState<string>("");
   const [copiedColor, setCopiedColor] = useState<string | null>(null);
+  const colorCopyTimerRef = useRef<number | null>(null);
   const [editingNotes, setEditingNotes] = useState<Record<string, boolean>>({});
   const [topWindowId, setTopWindowId] = useState<string | null>(null);
   const [displayLayout, setDisplayLayout] = useState<DisplayLayout | null>(null);
+  const [annotationModes, setAnnotationModes] = useState<Record<string, boolean>>({});
+  const [annotationColors, setAnnotationColors] = useState<Record<string, string>>({});
+  const imagePanSessionRef = useRef<{ id: string; pointerId: number; x: number; y: number } | null>(null);
+  const annotationSessionRef = useRef<{ id: string; pointerId: number } | null>(null);
 
   const [floatingSketches, setFloatingSketches] = useState<FloatingSketch[]>([]);
 
@@ -1057,7 +1085,7 @@ export default function App() {
             if (!isLoadMore) setSearchLog(prev => [...prev, `[Search] Skipped ${p}: Disabled.`]);
             continue;
         }
-        if (pConfig.badge === 'ðŸ”‘ API Key Required') {
+        if (pConfig.badge === 'API Key Required') {
             if (!isLoadMore) setSearchLog(prev => [...prev, `[Search] Skipped ${p}: Requires API Key.`]);
             continue;
         }
@@ -1828,8 +1856,9 @@ export default function App() {
   });
 
   const selectProjectOfId = async (id: string) => {
-    const p = projects.find(proj => proj.id === id);
+    let p = projects.find(proj => proj.id === id);
     if (!p) return;
+    p = await ensureProjectLocalDirectory(p);
     setActiveProjectIdState(p.id);
     await setActiveProjectId(p.id);
     setImages(p.images || []);
@@ -1864,7 +1893,65 @@ export default function App() {
     setFloatingSketches(prev => prev.map(s => ({...s, isCollapsed: !allCollapsed})));
   };
 
-  const getElectron = () => ((window as any).require ? (window as any).require('electron') : null);
+  const getElectron = () => {
+    const nodeRequire = getNodeRequire();
+    return nodeRequire ? nodeRequire('electron') : null;
+  };
+
+  const copyPaletteColor = async (rawColor: string) => {
+    const color = normalizeHexColor(rawColor);
+    if (!color) {
+      setCopiedColor(`error:${rawColor}`);
+      return;
+    }
+
+    let copied = false;
+    const electron = getElectron();
+    if (electron?.clipboard) {
+      try {
+        electron.clipboard.writeText(color);
+        copied = true;
+      } catch (error) {
+        console.error('Native palette copy failed:', error);
+      }
+    }
+
+    if (!copied && navigator.clipboard?.writeText) {
+      try {
+        await navigator.clipboard.writeText(color);
+        copied = true;
+      } catch (error) {
+        console.warn('Browser palette copy failed; trying the compatibility fallback:', error);
+      }
+    }
+
+    if (!copied) {
+      try {
+        const textarea = document.createElement('textarea');
+        textarea.value = color;
+        textarea.setAttribute('readonly', '');
+        textarea.style.position = 'fixed';
+        textarea.style.opacity = '0';
+        document.body.appendChild(textarea);
+        textarea.select();
+        copied = document.execCommand('copy');
+        textarea.remove();
+      } catch (error) {
+        console.error('Compatibility palette copy failed:', error);
+      }
+    }
+
+    setCopiedColor(copied ? color : `error:${color}`);
+    if (colorCopyTimerRef.current !== null) window.clearTimeout(colorCopyTimerRef.current);
+    colorCopyTimerRef.current = window.setTimeout(() => {
+      setCopiedColor(null);
+      colorCopyTimerRef.current = null;
+    }, 1800);
+  };
+
+  useEffect(() => () => {
+    if (colorCopyTimerRef.current !== null) window.clearTimeout(colorCopyTimerRef.current);
+  }, []);
 
   const openSupportPage = async () => {
     const electron = getElectron();
@@ -1887,6 +1974,9 @@ export default function App() {
       .toLowerCase()
       .slice(0, 80) || 'board';
 
+  const getProjectFolderName = (project: Pick<Project, 'id' | 'name'>) =>
+    `${sanitizeProjectFolderName(project.name)}-${project.id.slice(0, 8)}`;
+
   const getInstalledAutosaveRoot = async () => {
     const electron = getElectron();
     if (!electron?.ipcRenderer) return "";
@@ -1896,6 +1986,25 @@ export default function App() {
       console.warn("Could not read default data directory:", e);
       return "";
     }
+  };
+
+  const ensureProjectLocalDirectory = async (project: Project, preferredRoot?: string): Promise<Project> => {
+    if (project.directoryPath || !getNodeRequire()) return project;
+    const root = preferredRoot || defaultAutosaveRoot || await getInstalledAutosaveRoot();
+    const nodeRequire = getNodeRequire();
+    if (!root || !nodeRequire) return project;
+
+    const path = nodeRequire('path');
+    const directoryPath = path.join(root, getProjectFolderName(project));
+    const projectWithDirectory = { ...project, directoryPath };
+    await updateProject(project.id, { directoryPath });
+    const syncResult = await syncBoardToPath(projectWithDirectory, directoryPath);
+    if (syncResult.failed.length > 0) {
+      console.warn('The board folder was created with media warnings:', syncResult.failed);
+    }
+    setDefaultAutosaveRoot(root);
+    setProjects(await getProjects());
+    return projectWithDirectory;
   };
 
   useEffect(() => {
@@ -1967,9 +2076,9 @@ export default function App() {
         setActiveProjectIdState(defaultProj.id);
         await setActiveProjectId(defaultProj.id);
         if (installedRoot) {
-          const electron = getElectron();
-          const path = electron?.require ? electron.require('path') : null;
-          const dirPath = path ? path.join(installedRoot, sanitizeProjectFolderName(defaultProj.name)) : "";
+          const nodeRequire = getNodeRequire();
+          const path = nodeRequire ? nodeRequire('path') : null;
+          const dirPath = path ? path.join(installedRoot, getProjectFolderName(defaultProj)) : "";
           if (dirPath) {
             await updateProject(defaultProj.id, { directoryPath: dirPath });
             await syncBoardToPath({ ...defaultProj, directoryPath: dirPath }, dirPath);
@@ -1994,9 +2103,9 @@ export default function App() {
           if (activeProj.directoryPath) {
              setNeedsPermission(false);
           } else if (installedRoot) {
-             const electron = getElectron();
-             const path = electron?.require ? electron.require('path') : null;
-             const dirPath = path ? path.join(installedRoot, sanitizeProjectFolderName(activeProj.name)) : "";
+             const nodeRequire = getNodeRequire();
+             const path = nodeRequire ? nodeRequire('path') : null;
+             const dirPath = path ? path.join(installedRoot, getProjectFolderName(activeProj)) : "";
              if (dirPath) {
                await updateProject(activeProj.id, { directoryPath: dirPath });
                await syncBoardToPath({ ...activeProj, directoryPath: dirPath }, dirPath);
@@ -2089,43 +2198,70 @@ export default function App() {
       }
       await writeTextFile('notes.md', content);
       await writeTextFile('sketches.json', JSON.stringify(project.floatingSketches || [], null, 2));
+      await writeTextFile('annotations.json', JSON.stringify(
+        (project.floatingImages || []).map(image => ({ imageId: image.id, strokes: image.annotations || [] })),
+        null,
+        2
+      ));
     } catch (err: any) {
       console.error("Auto-sync failed", err);
     }
   };
 
-  const syncBoardToPath = async (project: Project, directoryPath: string) => {
-    const electron = (window as any).require ? (window as any).require('electron') : null;
-    if (!electron || !directoryPath) return;
+  const syncBoardToPath = async (project: Project, directoryPath: string): Promise<{ saved: number; failed: string[] }> => {
+    const nodeRequire = getNodeRequire();
+    if (!nodeRequire || !directoryPath) {
+      return { saved: 0, failed: ['Desktop filesystem access is unavailable.'] };
+    }
 
     try {
-      const fs = electron.require('fs');
-      const path = electron.require('path');
+      const electron = nodeRequire('electron');
+      const fs = nodeRequire('fs');
+      const path = nodeRequire('path');
+      const { fileURLToPath } = nodeRequire('url');
       fs.mkdirSync(directoryPath, { recursive: true });
+      const imagesDirectory = path.join(directoryPath, 'images');
+      fs.mkdirSync(imagesDirectory, { recursive: true });
 
       const sanitizeName = (value: string) => (value || 'untitled')
         .replace(/[^a-z0-9._-]+/gi, '_')
         .replace(/^_+|_+$/g, '')
         .slice(0, 80) || 'untitled';
 
-      const extensionForUrl = (url: string, fallback = 'bin') => {
-        const lower = (url || '').toLowerCase();
-        if (lower.startsWith('data:image/png') || lower.includes('.png')) return 'png';
-        if (lower.startsWith('data:image/webp') || lower.includes('.webp')) return 'webp';
-        if (lower.startsWith('data:image/gif') || lower.includes('.gif')) return 'gif';
-        if (lower.startsWith('data:application/pdf') || lower.includes('.pdf')) return 'pdf';
-        if (lower.startsWith('data:image/jpeg') || lower.startsWith('data:image/jpg') || lower.includes('.jpg') || lower.includes('.jpeg')) return 'jpg';
-        return fallback;
-      };
-
       const writeText = (fileName: string, content: string) => {
         fs.writeFileSync(path.join(directoryPath, fileName), content, 'utf8');
       };
 
-      const writeDataUrl = (dataUrl: string, fileName: string) => {
-        if (!dataUrl || !dataUrl.startsWith('data:')) return;
-        const base64Data = dataUrl.split(',')[1] || '';
-        fs.writeFileSync(path.join(directoryPath, fileName), Buffer.from(base64Data, 'base64'));
+      const readMedia = async (source: string) => {
+        if (!source) throw new Error('The image source is empty.');
+        if (source.startsWith('data:')) {
+          const comma = source.indexOf(',');
+          if (comma < 0) throw new Error('The image data URL is malformed.');
+          const metadata = source.slice(0, comma);
+          const payload = source.slice(comma + 1);
+          return Buffer.from(payload, /;base64/i.test(metadata) ? 'base64' : 'utf8');
+        }
+        if (source.startsWith('file://')) return fs.readFileSync(fileURLToPath(source));
+        if (fs.existsSync(source)) return fs.readFileSync(source);
+
+        const response = await fetch(source);
+        if (!response.ok) throw new Error(`Download failed with HTTP ${response.status}.`);
+        return Buffer.from(await response.arrayBuffer());
+      };
+
+      const saveMedia = async (source: string, fileStem: string, type: 'image' | 'pdf' = 'image') => {
+        const sourceBuffer = await readMedia(source);
+        if (type === 'pdf' || /^data:application\/pdf/i.test(source) || /\.pdf(?:$|[?#])/i.test(source)) {
+          fs.writeFileSync(path.join(imagesDirectory, `${fileStem}.pdf`), sourceBuffer);
+          return;
+        }
+
+        const decodedImage = electron.nativeImage.createFromBuffer(sourceBuffer);
+        if (decodedImage.isEmpty()) throw new Error('The image could not be decoded.');
+        const shouldUseJpeg = /^data:image\/jpe?g/i.test(source) || /\.jpe?g(?:$|[?#])/i.test(source);
+        const extension = shouldUseJpeg ? 'jpg' : 'png';
+        const encodedImage = shouldUseJpeg ? decodedImage.toJPEG(95) : decodedImage.toPNG();
+        fs.writeFileSync(path.join(imagesDirectory, `${fileStem}.${extension}`), encodedImage);
       };
 
       const manifestProject = {
@@ -2136,6 +2272,11 @@ export default function App() {
 
       writeText('board.json', JSON.stringify(manifestProject, null, 2));
       writeText('sketches.json', JSON.stringify(project.floatingSketches || [], null, 2));
+      writeText('annotations.json', JSON.stringify(
+        (project.floatingImages || []).map(image => ({ imageId: image.id, strokes: image.annotations || [] })),
+        null,
+        2
+      ));
 
       let notes = `# Notes for ${project.name}\n\n`;
       if (project.floatingNotes && project.floatingNotes.length > 0) {
@@ -2147,14 +2288,34 @@ export default function App() {
       }
       writeText('notes.md', notes);
 
-      (project.images || []).forEach((img, idx) => {
-        writeDataUrl(img, `background_${idx + 1}.${extensionForUrl(img, 'png')}`);
-      });
-      (project.floatingImages || []).forEach((img) => {
-        writeDataUrl(img.url, `floating_${sanitizeName(img.id)}.${extensionForUrl(img.url, img.type === 'pdf' ? 'pdf' : 'png')}`);
-      });
-    } catch (err) {
+      for (const fileName of fs.readdirSync(imagesDirectory)) {
+        if (/^(background_|floating_)/i.test(fileName)) {
+          fs.unlinkSync(path.join(imagesDirectory, fileName));
+        }
+      }
+
+      let saved = 0;
+      const failed: string[] = [];
+      for (let index = 0; index < (project.images || []).length; index++) {
+        try {
+          await saveMedia(project.images[index], `background_${index + 1}`);
+          saved++;
+        } catch (error: any) {
+          failed.push(`Background ${index + 1}: ${error?.message || String(error)}`);
+        }
+      }
+      for (const image of project.floatingImages || []) {
+        try {
+          await saveMedia(image.url, `floating_${sanitizeName(image.id)}`, image.type === 'pdf' ? 'pdf' : 'image');
+          saved++;
+        } catch (error: any) {
+          failed.push(`Image ${image.id}: ${error?.message || String(error)}`);
+        }
+      }
+      return { saved, failed };
+    } catch (err: any) {
       console.error("Native folder sync failed", err);
+      return { saved: 0, failed: [err?.message || String(err)] };
     }
   };
 
@@ -2176,7 +2337,10 @@ export default function App() {
       
       const activeProj = all.find(p => p.id === activeProjectId);
       if (activeProj?.directoryPath) {
-        await syncBoardToPath(activeProj, activeProj.directoryPath);
+        const syncResult = await syncBoardToPath(activeProj, activeProj.directoryPath);
+        if (syncResult.failed.length > 0) {
+          console.warn('Some board media could not be mirrored locally:', syncResult.failed);
+        }
       } else if (activeProj?.directoryHandle) {
         await syncBoardToHandle(activeProj, activeProj.directoryHandle);
       }
@@ -2191,7 +2355,9 @@ export default function App() {
     try {
       const electron = getElectron();
       if (electron?.ipcRenderer) {
-        const path = electron.require('path');
+        const nodeRequire = getNodeRequire();
+        if (!nodeRequire) throw new Error('Desktop filesystem access is unavailable.');
+        const path = nodeRequire('path');
         const result = await electron.ipcRenderer.invoke('show-open-dialog', {
           title: 'Choose ReferenceFlow autosave folder',
           defaultPath: defaultAutosaveRoot || undefined,
@@ -2202,22 +2368,28 @@ export default function App() {
         const selectedRoot = result.filePaths[0];
         setDefaultAutosaveRoot(selectedRoot);
         await electron.ipcRenderer.invoke('set-default-data-directory', selectedRoot);
-        const folderName = sanitizeProjectFolderName(project.name);
+        const folderName = getProjectFolderName(project);
         const dirPath = path.join(selectedRoot, folderName);
-        const updatedProject = {
+        const projectSnapshot = project.id === activeProjectId ? {
           ...project,
           images,
           floatingImages,
           floatingNotes,
-          floatingSketches,
+          floatingSketches
+        } : project;
+        const updatedProject = {
+          ...projectSnapshot,
           directoryPath: dirPath
         };
         await updateProject(project.id, { directoryPath: dirPath });
         const updatedProjects = await getProjects();
         setProjects(updatedProjects);
-        await syncBoardToPath(updatedProject, dirPath);
+        const syncResult = await syncBoardToPath(updatedProject, dirPath);
         if (project.id === activeProjectId) setNeedsPermission(false);
-        alert('Autosave folder enabled. ReferenceFlow will keep this board mirrored locally.');
+        if (syncResult.failed.length > 0) {
+          throw new Error(`The board files were created, but ${syncResult.failed.length} media file(s) could not be saved. ${syncResult.failed[0]}`);
+        }
+        alert(`Export complete. ${syncResult.saved} media file(s) were saved and this board will keep syncing locally.`);
         return;
       }
 
@@ -2227,7 +2399,7 @@ export default function App() {
       }
       
       const rootHandle = await (window as any).showDirectoryPicker();
-      const folderName = project.name.replace(/[^a-z0-9]/gi, '_').toLowerCase() || 'board';
+      const folderName = getProjectFolderName(project);
       const dirHandle = await rootHandle.getDirectoryHandle(folderName, { create: true });
       
       await updateProject(project.id, { directoryHandle: dirHandle });
@@ -2235,7 +2407,14 @@ export default function App() {
       setProjects(updatedProjects);
       
       // Re-find to get identical reference if needed
-      const updatedProject = updatedProjects.find(p => p.id === project.id) || project;
+      const storedProject = updatedProjects.find(p => p.id === project.id) || project;
+      const updatedProject = project.id === activeProjectId ? {
+        ...storedProject,
+        images,
+        floatingImages,
+        floatingNotes,
+        floatingSketches
+      } : storedProject;
       await syncBoardToHandle(updatedProject, dirHandle);
       
       if (project.id === activeProjectId) {
@@ -2272,6 +2451,10 @@ export default function App() {
     if (saved) return JSON.parse(saved);
     return { width: 180, height: 400 };
   });
+  const [retractedPillSize, setRetractedPillSize] = useState(() => {
+    const saved = Number(localStorage.getItem('ref-flow-retracted-pill-size'));
+    return Number.isFinite(saved) && saved > 0 ? Math.min(96, Math.max(40, saved)) : 48;
+  });
   const getPrimaryWorkspaceOrigin = useCallback(() => {
     const primary = displayLayout?.primary;
     if (!primary) return { x: position.x + pillDimensions.width + 20, y: position.y };
@@ -2286,8 +2469,8 @@ export default function App() {
     const displays = displayLayout.displays?.length
       ? displayLayout.displays
       : [{ bounds: displayLayout.primary, workArea: displayLayout.primary, isPrimary: true } as any];
-    const pillWidth = isRetracted ? 48 : pillDimensions.width;
-    const pillHeight = isRetracted ? 48 : pillDimensions.height;
+    const pillWidth = isRetracted ? retractedPillSize : pillDimensions.width;
+    const pillHeight = isRetracted ? retractedPillSize : pillDimensions.height;
     const center = { x: candidate.x + pillWidth / 2, y: candidate.y + pillHeight / 2 };
     const distanceToBounds = (bounds: { x: number; y: number; width: number; height: number }) => {
       const dx = Math.max(bounds.x - center.x, 0, center.x - (bounds.x + bounds.width));
@@ -2305,7 +2488,7 @@ export default function App() {
       x: Math.min(maxX, Math.max(bounds.x + margin, candidate.x)),
       y: Math.min(maxY, Math.max(bounds.y + margin, candidate.y))
     };
-  }, [displayLayout, isRetracted, pillDimensions]);
+  }, [displayLayout, isRetracted, pillDimensions, retractedPillSize]);
 
   useEffect(() => {
     if (!displayLayout) return;
@@ -2324,6 +2507,10 @@ export default function App() {
   }, [position]);
 
   useEffect(() => {
+    localStorage.setItem('ref-flow-retracted-pill-size', String(retractedPillSize));
+  }, [retractedPillSize]);
+
+  useEffect(() => {
     const electron = getElectron();
     if (!electron?.ipcRenderer) return;
     electron.ipcRenderer.invoke('get-launch-context').then((context: { shouldRevealPill?: boolean }) => {
@@ -2334,7 +2521,7 @@ export default function App() {
     }).catch((error: any) => console.warn('Could not read launch context:', error));
   }, []);
   const [isResizingPill, setIsResizingPill] = useState(false);
-  const resizePillStart = useRef({ x: 0, y: 0, width: 0, height: 0 });
+  const resizePillStart = useRef({ x: 0, y: 0, width: 0, height: 0, retractedSize: 48 });
 
   // Handle Dragging global floating images
   const [draggingFloatingId, setDraggingFloatingId] = useState<string | null>(null);
@@ -2770,6 +2957,8 @@ export default function App() {
   ]);
 
   const handlePillResizeMouseDown = (e: React.MouseEvent) => {
+    if (e.button !== 0) return;
+    e.preventDefault();
     e.stopPropagation();
     setIsResizingPill(true);
     resizePillStart.current = {
@@ -2777,6 +2966,7 @@ export default function App() {
       y: e.clientY,
       width: pillDimensions.width,
       height: pillDimensions.height,
+      retractedSize: retractedPillSize,
     };
   };
 
@@ -2904,11 +3094,16 @@ export default function App() {
         if (isResizingPill) {
           let diffX = e.clientX - resizePillStart.current.x;
           let diffY = e.clientY - resizePillStart.current.y;
-          
-          setPillDimensions({
-             width: Math.max(160, resizePillStart.current.width + diffX),
-             height: Math.max(200, resizePillStart.current.height + diffY)
-          });
+
+          if (isRetracted) {
+            const sizeDelta = (diffX + diffY) / 2;
+            setRetractedPillSize(Math.min(96, Math.max(40, resizePillStart.current.retractedSize + sizeDelta)));
+          } else {
+            setPillDimensions({
+               width: Math.max(160, resizePillStart.current.width + diffX),
+               height: Math.max(200, resizePillStart.current.height + diffY)
+            });
+          }
         }
 
         if (isDraggingPill) {
@@ -3025,7 +3220,7 @@ export default function App() {
       window.removeEventListener('mousemove', handleGlobalMouseMove);
       window.removeEventListener('mouseup', handleGlobalMouseUp);
     };
-  }, [isResizingPill, isDraggingPill, draggingFloatingId, resizingFloatingId, draggingNoteId, resizingNoteId, draggingSketchId, resizingSketchId, pillDimensions, clampPillToConnectedDisplay]);
+  }, [isResizingPill, isDraggingPill, draggingFloatingId, resizingFloatingId, draggingNoteId, resizingNoteId, draggingSketchId, resizingSketchId, pillDimensions, clampPillToConnectedDisplay, isRetracted]);
 
   // Handle Drag & Drop of Images
   const [isDragOver, setIsDragOver] = useState(false);
@@ -3118,6 +3313,139 @@ export default function App() {
 
   const closeFloatingImage = (idToClose: string) => {
     setFloatingImages(prev => prev.map(img => img.id === idToClose ? { ...img, isCollapsed: true } : img));
+  };
+
+  const clampNumber = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
+
+  const handleImageWheelZoom = (event: React.WheelEvent<HTMLDivElement>, id: string) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const viewport = event.currentTarget.getBoundingClientRect();
+    const cursorFromCenterX = event.clientX - viewport.left - (viewport.width / 2);
+    const cursorFromCenterY = event.clientY - viewport.top - (viewport.height / 2);
+    const limitedDelta = clampNumber(event.deltaY, -120, 120);
+
+    setFloatingImages(prev => prev.map(image => {
+      if (image.id !== id) return image;
+      const previousZoom = image.zoom || 1;
+      const nextZoom = clampNumber(previousZoom * Math.exp(-limitedDelta * 0.0025), 0.5, 5);
+      if (Math.abs(nextZoom - previousZoom) < 0.001) return image;
+      if (nextZoom <= 1) {
+        return { ...image, zoom: nextZoom, panX: 0, panY: 0 };
+      }
+
+      const ratio = nextZoom / previousZoom;
+      const currentPanX = image.panX || 0;
+      const currentPanY = image.panY || 0;
+      const anchoredPanX = currentPanX + (1 - ratio) * (cursorFromCenterX - currentPanX);
+      const anchoredPanY = currentPanY + (1 - ratio) * (cursorFromCenterY - currentPanY);
+      const maxPanX = viewport.width * (nextZoom - 1) / 2;
+      const maxPanY = viewport.height * (nextZoom - 1) / 2;
+      return {
+        ...image,
+        zoom: nextZoom,
+        panX: clampNumber(anchoredPanX, -maxPanX, maxPanX),
+        panY: clampNumber(anchoredPanY, -maxPanY, maxPanY)
+      };
+    }));
+  };
+
+  const handleImagePanPointerDown = (event: React.PointerEvent<HTMLDivElement>, image: FloatingImage) => {
+    if (event.button !== 1) return;
+    event.preventDefault();
+    event.stopPropagation();
+    if ((image.zoom || 1) <= 1) return;
+    event.currentTarget.setPointerCapture(event.pointerId);
+    imagePanSessionRef.current = { id: image.id, pointerId: event.pointerId, x: event.clientX, y: event.clientY };
+    setTopWindowId(image.id);
+  };
+
+  const handleImagePanPointerMove = (event: React.PointerEvent<HTMLDivElement>, id: string) => {
+    const session = imagePanSessionRef.current;
+    if (!session || session.id !== id || session.pointerId !== event.pointerId) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const deltaX = event.clientX - session.x;
+    const deltaY = event.clientY - session.y;
+    session.x = event.clientX;
+    session.y = event.clientY;
+    const viewport = event.currentTarget.getBoundingClientRect();
+
+    setFloatingImages(prev => prev.map(image => {
+      if (image.id !== id) return image;
+      const zoom = image.zoom || 1;
+      const maxPanX = Math.max(0, viewport.width * (zoom - 1) / 2);
+      const maxPanY = Math.max(0, viewport.height * (zoom - 1) / 2);
+      return {
+        ...image,
+        panX: clampNumber((image.panX || 0) + deltaX, -maxPanX, maxPanX),
+        panY: clampNumber((image.panY || 0) + deltaY, -maxPanY, maxPanY)
+      };
+    }));
+  };
+
+  const endImagePan = (event: React.PointerEvent<HTMLDivElement>, id: string) => {
+    const session = imagePanSessionRef.current;
+    if (!session || session.id !== id || session.pointerId !== event.pointerId) return;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+    imagePanSessionRef.current = null;
+  };
+
+  const getAnnotationPoint = (svg: SVGSVGElement, clientX: number, clientY: number): ImageAnnotationPoint | null => {
+    const matrix = svg.getScreenCTM();
+    if (!matrix) return null;
+    const point = svg.createSVGPoint();
+    point.x = clientX;
+    point.y = clientY;
+    const localPoint = point.matrixTransform(matrix.inverse());
+    return {
+      x: clampNumber(localPoint.x, 0, 1000),
+      y: clampNumber(localPoint.y, 0, 1000)
+    };
+  };
+
+  const startImageAnnotation = (event: React.PointerEvent<SVGSVGElement>, id: string) => {
+    if (event.button !== 0) return;
+    const point = getAnnotationPoint(event.currentTarget, event.clientX, event.clientY);
+    if (!point) return;
+    event.preventDefault();
+    event.stopPropagation();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    annotationSessionRef.current = { id, pointerId: event.pointerId };
+    const color = annotationColors[id] || '#ff3b30';
+    setFloatingImages(prev => prev.map(image => image.id === id ? {
+      ...image,
+      annotations: [...(image.annotations || []), { color, width: 8, points: [point] }]
+    } : image));
+  };
+
+  const continueImageAnnotation = (event: React.PointerEvent<SVGSVGElement>, id: string) => {
+    const session = annotationSessionRef.current;
+    if (!session || session.id !== id || session.pointerId !== event.pointerId) return;
+    const point = getAnnotationPoint(event.currentTarget, event.clientX, event.clientY);
+    if (!point) return;
+    event.preventDefault();
+    event.stopPropagation();
+    setFloatingImages(prev => prev.map(image => {
+      if (image.id !== id || !image.annotations?.length) return image;
+      const annotations = [...image.annotations];
+      const lastStroke = annotations[annotations.length - 1];
+      const previousPoint = lastStroke.points[lastStroke.points.length - 1];
+      if (previousPoint && Math.hypot(point.x - previousPoint.x, point.y - previousPoint.y) < 1) return image;
+      annotations[annotations.length - 1] = { ...lastStroke, points: [...lastStroke.points, point] };
+      return { ...image, annotations };
+    }));
+  };
+
+  const endImageAnnotation = (event: React.PointerEvent<SVGSVGElement>, id: string) => {
+    const session = annotationSessionRef.current;
+    if (!session || session.id !== id || session.pointerId !== event.pointerId) return;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+    annotationSessionRef.current = null;
   };
 
   const createSketch = () => {
@@ -3244,8 +3572,8 @@ export default function App() {
         <motion.div 
           initial={{ opacity: 0, scale: 0.92, y: 10 }}
           animate={{
-            width: isRetracted ? 48 : pillDimensions.width,
-            height: isRetracted ? 48 : pillDimensions.height,
+            width: isRetracted ? retractedPillSize : pillDimensions.width,
+            height: isRetracted ? retractedPillSize : pillDimensions.height,
             opacity: pillOpacity,
             scale: 1,
             y: 0,
@@ -3278,7 +3606,8 @@ export default function App() {
                   >
                     <button 
                       onClick={() => setIsRetracted(false)}
-                      className="w-10 h-10 flex items-center justify-center rounded-full text-sky-600 dark:text-sky-300 hover:text-slate-900 dark:hover:text-white hover:bg-black/10 dark:hover:bg-white/10 transition-colors pointer-events-auto"
+                      className="flex items-center justify-center rounded-full text-sky-600 dark:text-sky-300 hover:text-slate-900 dark:hover:text-white hover:bg-black/10 dark:hover:bg-white/10 transition-colors pointer-events-auto"
+                      style={{ width: Math.max(32, retractedPillSize - 8), height: Math.max(32, retractedPillSize - 8) }}
                       title="Expand Pill"
                     >
                       <ChevronRight className="w-5 h-5 pointer-events-none" />
@@ -3519,14 +3848,13 @@ export default function App() {
         </div>
         
         {/* Modern Edge-Based Pill Resize Handle */}
-        {!isRetracted && (
-          <div 
-            className="absolute bottom-0 right-0 w-6 h-6 cursor-nwse-resize z-[1000] flex items-end justify-end group/resize pointer-events-auto"
-            onMouseDown={handlePillResizeMouseDown}
-          >
-            <div className={`mr-1 mb-1 w-2.5 h-2.5 border-r-[2px] border-b-[2px] transition-all duration-150 rounded-br-[3px] ${isResizingPill ? 'opacity-100 border-sky-400 scale-110 bg-sky-400/20' : 'opacity-0 group-hover/resize:opacity-100 border-slate-400'}`}></div>
-          </div>
-        )}
+        <div
+          className="pill-resize-handle absolute bottom-0 right-0 w-6 h-6 cursor-nwse-resize z-[1000] flex items-end justify-end group/resize pointer-events-auto"
+          onMouseDown={handlePillResizeMouseDown}
+          title={isRetracted ? 'Resize compact pill' : 'Resize pill'}
+        >
+          <div className={`mr-1 mb-1 w-2.5 h-2.5 border-r-[2px] border-b-[2px] transition-all duration-150 rounded-br-[3px] ${isResizingPill ? 'opacity-100 border-sky-400 scale-110 bg-sky-400/20' : 'opacity-0 group-hover/resize:opacity-100 border-slate-400'}`}></div>
+        </div>
       </motion.div>
       )}
 
@@ -3545,7 +3873,7 @@ export default function App() {
                   className={`settings-panel light-contrast-panel absolute pointer-events-auto border p-5 rounded-[24px] shadow-2xl w-64 text-sm font-sans z-[99999] ${theme === 'light' ? 'bg-white border-black/10 text-slate-900' : 'bg-[#1e1e24] border-white/10 text-slate-200'}`}
             style={{
               top: position.y,
-              left: position.x + (isRetracted ? 48 : pillDimensions.width) + 16,
+              left: position.x + (isRetracted ? retractedPillSize : pillDimensions.width) + 16,
             }}
           >
           <div className={`flex items-center justify-between mb-4 pb-2 border-b ${theme === 'light' ? 'border-black/10' : 'border-white/10'}`}>
@@ -3813,7 +4141,7 @@ export default function App() {
             className={`absolute pointer-events-auto border p-5 rounded-[24px] shadow-2xl w-72 text-sm font-sans z-[100000] flex flex-col ${theme === 'light' ? 'bg-white border-black/10 text-slate-800' : 'bg-[#1e1e24] border-white/10 text-slate-200'}`}
             style={{
               top: position.y,
-              left: position.x + (isRetracted ? 48 : pillDimensions.width) + 16 + 280,
+              left: position.x + (isRetracted ? retractedPillSize : pillDimensions.width) + 16 + 280,
             }}
           >
             <div className={`flex items-center justify-between mb-4 pb-2 border-b ${theme === 'light' ? 'border-black/10' : 'border-white/10'}`}>
@@ -3843,7 +4171,7 @@ export default function App() {
                     }}
                     className="absolute right-2 top-2 text-slate-500 hover:text-slate-300"
                   >
-                    <div className="w-4 h-4 border border-current rounded flex items-center justify-center text-[8px]">ðŸ‘</div>
+                    <Eye className="w-4 h-4" />
                   </button>
                 </div>
               </div>
@@ -3945,7 +4273,7 @@ export default function App() {
             className={`absolute pointer-events-auto border p-5 rounded-[24px] shadow-2xl w-80 text-sm font-sans z-[100000] flex flex-col ${theme === 'light' ? 'bg-white border-black/10 text-slate-800' : 'bg-[#1e1e24] border-white/10 text-slate-200'}`}
             style={{
               top: position.y,
-              left: position.x + (isRetracted ? 48 : pillDimensions.width) + 16 + 280,
+              left: position.x + (isRetracted ? retractedPillSize : pillDimensions.width) + 16 + 280,
             }}
           >
             <div className={`flex items-center justify-between mb-4 pb-2 border-b ${theme === 'light' ? 'border-black/10' : 'border-white/10'}`}>
@@ -3960,7 +4288,7 @@ export default function App() {
                 <span className="text-[10px] uppercase text-slate-500 block mb-1">Active Providers</span>
                 <div className="space-y-1 text-slate-700 dark:text-slate-300 font-mono text-[10px]">
                     {providerOrder.filter(p => getProviderConfig(p).isEnabled).map(p => (
-                        <div key={p}>â€¢ {p} {getProviderConfig(p).badge.includes('ðŸ”‘') ? '(Missing Key)' : ''}</div>
+                        <div key={p}>- {p} {getProviderConfig(p).badge === 'API Key Required' ? '(Missing Key)' : ''}</div>
                     ))}
                 </div>
               </div>
@@ -4007,7 +4335,7 @@ export default function App() {
             className={`absolute pointer-events-auto border p-5 rounded-[24px] shadow-2xl w-[450px] text-sm font-sans z-[99999] overflow-hidden flex flex-col max-h-[85vh] ${theme === 'light' ? 'bg-white border-black/10 text-slate-800' : 'bg-[#1e1e24] border-white/10 text-slate-200'}`}
             style={{
               top: position.y,
-              left: position.x + (isRetracted ? 48 : pillDimensions.width) + 16,
+              left: position.x + (isRetracted ? retractedPillSize : pillDimensions.width) + 16,
             }}
             onClick={() => setSearchContextMenu(null)}
           >
@@ -4063,23 +4391,23 @@ export default function App() {
                         <span className="text-[9px] text-slate-500 uppercase tracking-widest font-bold mb-1 block">In-App Search (Native)</span>
                         <div className="flex flex-wrap gap-1.5 shrink-0">
                             {NATIVE_PROVIDERS.map(p => {
-                                let statusIcon = '';
+                                let statusLabel = '';
                                 if (p !== 'All Native') {
                                     const conf = getProviderConfig(p);
-                                    if (conf.badge.includes('ðŸ”‘')) statusIcon = 'ðŸ”‘';
-                                    else if (!conf.isEnabled) statusIcon = 'âŒ';
-                                    else if (conf.badge.includes('âš ')) statusIcon = 'âš ';
+                                    if (conf.badge === 'API Key Required') statusLabel = '[key]';
+                                    else if (!conf.isEnabled) statusLabel = '[off]';
+                                    else if (conf.badge === 'Connection Failed') statusLabel = '[!]';
                                 }
                                 
                                 return (
                                 <button
                                     key={p}
                                     onClick={() => setSearchProvider(p)}
-                                    className={`px-2 py-1 rounded-md text-[10px] font-medium transition-colors flex items-center justify-center gap-1 ${searchProvider === p ? 'bg-sky-500 text-white' : 'bg-black/5 dark:bg-white/5 text-slate-500 dark:text-slate-400 hover:bg-black/10 dark:hover:bg-white/10 hover:text-slate-900 dark:hover:text-white'} ${statusIcon === 'âŒ' ? 'opacity-50' : ''}`}
-                                    title={statusIcon === 'ðŸ”‘' ? 'API Key Required' : statusIcon === 'âŒ' ? 'Disabled in Settings' : statusIcon === 'âš ' ? 'Connection Failed' : 'Ready'}
-                                    disabled={statusIcon === 'âŒ'}
+                                    className={`px-2 py-1 rounded-md text-[10px] font-medium transition-colors flex items-center justify-center gap-1 ${searchProvider === p ? 'bg-sky-500 text-white' : 'bg-black/5 dark:bg-white/5 text-slate-500 dark:text-slate-400 hover:bg-black/10 dark:hover:bg-white/10 hover:text-slate-900 dark:hover:text-white'} ${statusLabel === '[off]' ? 'opacity-50' : ''}`}
+                                    title={statusLabel === '[key]' ? 'API Key Required' : statusLabel === '[off]' ? 'Disabled in Settings' : statusLabel === '[!]' ? 'Connection Failed' : 'Ready'}
+                                    disabled={statusLabel === '[off]'}
                                 >
-                                    {p} {statusIcon}
+                                    {p} {statusLabel}
                                 </button>
                                 );
                             })}
@@ -4310,9 +4638,10 @@ export default function App() {
                   <button 
                       className="context-menu-button w-full text-left px-4 py-2 hover:bg-sky-500 hover:text-white transition-colors text-xs flex items-center gap-2"
                       onClick={async () => {
-                          const electron = (window as any).require ? (window as any).require('electron') : null;
-                          if (electron) {
-                              const path = electron.require('path');
+                          const nodeRequire = getNodeRequire();
+                          const electron = nodeRequire ? nodeRequire('electron') : null;
+                          if (electron && nodeRequire) {
+                              const path = nodeRequire('path');
                               const originalExt = path.extname(floatingContextMenu.url.split('?')[0]) || '.jpg';
                               const filename = `reference_image_${floatingContextMenu.id}${originalExt}`;
                               
@@ -4325,7 +4654,7 @@ export default function App() {
                                   ]
                               });
                               if (!result.canceled && result.filePath) {
-                                  const fs = electron.require('fs');
+                                  const fs = nodeRequire('fs');
                                   const tempPath = contextMenuTempPath || await ensureTempLocalFile(floatingContextMenu.url, floatingContextMenu.id);
                                   if (tempPath && fs.existsSync(tempPath)) {
                                       fs.writeFileSync(result.filePath, fs.readFileSync(tempPath));
@@ -4451,19 +4780,65 @@ export default function App() {
                   <ZoomIn className="w-3 h-3 text-sky-400" />
                 </button>
                 <button 
-                  onClick={() => setFloatingImages(prev => prev.map(f => f.id === img.id ? {...f, zoom: Math.max((f.zoom || 1) - 0.25, 0.5)} : f))}
+                  onClick={() => setFloatingImages(prev => prev.map(f => {
+                    if (f.id !== img.id) return f;
+                    const zoom = Math.max((f.zoom || 1) - 0.25, 0.5);
+                    return { ...f, zoom, panX: zoom <= 1 ? 0 : f.panX, panY: zoom <= 1 ? 0 : f.panY };
+                  }))}
                   className="hover:bg-black/10 dark:hover:bg-white/10 p-1 rounded transition-colors text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white"
                   title="Zoom Out"
                 >
                   <ZoomOut className="w-3 h-3" />
                 </button>
                 <button 
-                  onClick={() => setFloatingImages(prev => prev.map(f => f.id === img.id ? {...f, zoom: 1} : f))}
+                  onClick={() => setFloatingImages(prev => prev.map(f => f.id === img.id ? {...f, zoom: 1, panX: 0, panY: 0} : f))}
                   className="hover:bg-black/10 dark:hover:bg-white/10 p-1 rounded transition-colors text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white text-[9px] font-bold"
                   title="Reset Zoom"
                 >
                   1:1
                 </button>
+                {img.type !== 'pdf' && (
+                  <button
+                    onClick={() => {
+                      const willDraw = !annotationModes[img.id];
+                      setAnnotationModes(prev => ({ ...prev, [img.id]: willDraw }));
+                      if (willDraw && img.isLocked) {
+                        setFloatingImages(prev => prev.map(f => f.id === img.id ? { ...f, isLocked: false } : f));
+                      }
+                    }}
+                    className={`p-1 rounded transition-colors ${annotationModes[img.id] ? 'bg-rose-500 text-white' : 'hover:bg-black/10 dark:hover:bg-white/10 text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'}`}
+                    title={annotationModes[img.id] ? 'Stop drawing' : 'Draw on image'}
+                  >
+                    <PenTool className="w-3 h-3" />
+                  </button>
+                )}
+                {annotationModes[img.id] && img.type !== 'pdf' && (
+                  <input
+                    type="color"
+                    value={annotationColors[img.id] || '#ff3b30'}
+                    onChange={(event) => setAnnotationColors(prev => ({ ...prev, [img.id]: event.target.value }))}
+                    className="w-5 h-5 rounded cursor-pointer border-0 bg-transparent p-0"
+                    title="Drawing color"
+                  />
+                )}
+                {(img.annotations?.length || 0) > 0 && img.type !== 'pdf' && (
+                  <>
+                    <button
+                      onClick={() => setFloatingImages(prev => prev.map(f => f.id === img.id ? { ...f, annotations: (f.annotations || []).slice(0, -1) } : f))}
+                      className="hover:bg-black/10 dark:hover:bg-white/10 p-1 rounded transition-colors text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white"
+                      title="Undo last drawing"
+                    >
+                      <Eraser className="w-3 h-3" />
+                    </button>
+                    <button
+                      onClick={() => setFloatingImages(prev => prev.map(f => f.id === img.id ? { ...f, annotations: [] } : f))}
+                      className="hover:bg-red-500/80 p-1 rounded transition-colors text-slate-500 dark:text-slate-400 hover:text-white"
+                      title="Clear all drawings"
+                    >
+                      <Trash2 className="w-3 h-3" />
+                    </button>
+                  </>
+                )}
                 <button 
                   onClick={() => extractPaletteForImage(img.id, img.url)}
                   className="hover:bg-black/10 dark:hover:bg-white/10 p-1 rounded transition-colors text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white"
@@ -4474,7 +4849,7 @@ export default function App() {
                 <button 
                   onClick={() => setFloatingImages(prev => prev.map(f => f.id === img.id ? {...f, rotation: (f.rotation + 90) % 360} : f))}
                   className="hover:bg-black/10 dark:hover:bg-white/10 p-1 rounded transition-colors text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white"
-                  title="Rotate 90Â°"
+                  title="Rotate 90 degrees"
                 >
                   <RotateCw className="w-3 h-3" />
                 </button>
@@ -4482,6 +4857,9 @@ export default function App() {
                   onClick={() => {
                     const nextLocked = !img.isLocked;
                     setFloatingImages(prev => prev.map(f => f.id === img.id ? {...f, isLocked: nextLocked} : f));
+                    if (nextLocked) {
+                      setAnnotationModes(prev => ({ ...prev, [img.id]: false }));
+                    }
                     logWindowLockState('image', img.id, nextLocked);
                   }}
                   className="hover:bg-black/10 dark:hover:bg-white/10 p-1 rounded transition-colors text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white"
@@ -4569,65 +4947,126 @@ export default function App() {
                       )}
                     </div>
                   ) : (
-                    <img 
-                      src={img.url} 
-                      alt="Floating Reference" 
-                      className="block pointer-events-auto select-none transition-transform duration-300 no-window-drag cursor-grab active:cursor-grabbing"
-                      style={{ width: img.width, transform: `rotate(${img.rotation}deg) scale(${img.zoom || 1})`, objectFit: 'contain' }}
-                      draggable={!img.isLocked}
-                      title={img.isLocked ? 'Unlock this reference to drag it out' : 'Drag into Photoshop or another desktop app'}
-                      onMouseDown={(event) => event.stopPropagation()}
-                      onMouseEnter={() => {
-                        if (dragFilePathsRef.current.has(img.id)) return;
-                        ensureTempLocalFile(img.url, img.id).then(filePath => {
-                          if (filePath) dragFilePathsRef.current.set(img.id, filePath);
-                        });
+                    <div
+                      className={`relative w-full overflow-hidden no-window-drag touch-none ${annotationModes[img.id] ? 'cursor-crosshair' : (imagePanSessionRef.current?.id === img.id ? 'cursor-grabbing' : ((img.zoom || 1) > 1 ? 'cursor-grab' : 'cursor-default'))}`}
+                      onWheel={(event) => handleImageWheelZoom(event, img.id)}
+                      onPointerDown={(event) => handleImagePanPointerDown(event, img)}
+                      onPointerMove={(event) => handleImagePanPointerMove(event, img.id)}
+                      onPointerUp={(event) => endImagePan(event, img.id)}
+                      onPointerCancel={(event) => endImagePan(event, img.id)}
+                      onAuxClick={(event) => {
+                        if (event.button === 1) event.preventDefault();
                       }}
-                      onDragStart={(event) => {
-                        event.stopPropagation();
-                        const electron = getElectron();
-                        if (electron?.ipcRenderer) {
-                          // Electron's native file drag replaces Chromium's HTML5
-                          // drag operation. Keeping both alive can leave Chromium
-                          // stuck in a drag session when a desktop app rejects or
-                          // cancels the drop, which makes the cursor and window
-                          // interactions appear permanently grabbed.
-                          event.preventDefault();
-                          electron.ipcRenderer.send('start-reference-drag', {
-                            id: img.id,
-                            source: img.url,
-                            cachedPath: dragFilePathsRef.current.get(img.id) || '',
-                            type: img.type || 'image'
-                          });
-                          return;
-                        }
+                      title={annotationModes[img.id]
+                        ? 'Draw to highlight. Use the toolbar to undo or clear.'
+                        : 'Scroll to zoom. Middle-click and drag to pan when zoomed.'}
+                    >
+                      <div
+                        className={`relative w-full ${imagePanSessionRef.current?.id === img.id ? '' : 'transition-transform duration-150'}`}
+                        style={{
+                          transform: `translate3d(${img.panX || 0}px, ${img.panY || 0}px, 0) rotate(${img.rotation}deg) scale(${img.zoom || 1})`,
+                          transformOrigin: 'center center'
+                        }}
+                      >
+                        <img
+                          src={img.url}
+                          alt="Floating Reference"
+                          className="block w-full pointer-events-auto select-none no-window-drag"
+                          style={{ objectFit: 'contain' }}
+                          draggable={!img.isLocked && !annotationModes[img.id]}
+                          title={img.isLocked ? 'Unlock this reference to drag it out' : 'Drag into Photoshop or another desktop app'}
+                          onMouseDown={(event) => event.stopPropagation()}
+                          onMouseEnter={() => {
+                            if (dragFilePathsRef.current.has(img.id)) return;
+                            ensureTempLocalFile(img.url, img.id).then(filePath => {
+                              if (filePath) dragFilePathsRef.current.set(img.id, filePath);
+                            });
+                          }}
+                          onDragStart={(event) => {
+                            event.stopPropagation();
+                            const electron = getElectron();
+                            if (electron?.ipcRenderer) {
+                              // Electron's native file drag replaces Chromium's HTML5
+                              // drag operation. Keeping both alive can leave Chromium
+                              // stuck in a drag session when a desktop app rejects or
+                              // cancels the drop, which makes the cursor and window
+                              // interactions appear permanently grabbed.
+                              event.preventDefault();
+                              electron.ipcRenderer.send('start-reference-drag', {
+                                id: img.id,
+                                source: img.url,
+                                cachedPath: dragFilePathsRef.current.get(img.id) || '',
+                                type: img.type || 'image'
+                              });
+                              return;
+                            }
 
-                        // Preserve ordinary browser drag behavior outside Electron.
-                        event.dataTransfer.effectAllowed = 'copy';
-                        event.dataTransfer.setData('text/uri-list', img.url);
-                      }}
-                    />
+                            // Preserve ordinary browser drag behavior outside Electron.
+                            event.dataTransfer.effectAllowed = 'copy';
+                            event.dataTransfer.setData('text/uri-list', img.url);
+                          }}
+                        />
+                        <svg
+                          viewBox="0 0 1000 1000"
+                          preserveAspectRatio="none"
+                          className={`absolute inset-0 w-full h-full ${annotationModes[img.id] ? 'pointer-events-auto' : 'pointer-events-none'}`}
+                          onPointerDown={(event) => startImageAnnotation(event, img.id)}
+                          onPointerMove={(event) => continueImageAnnotation(event, img.id)}
+                          onPointerUp={(event) => endImageAnnotation(event, img.id)}
+                          onPointerCancel={(event) => endImageAnnotation(event, img.id)}
+                        >
+                          {(img.annotations || []).map((stroke, strokeIndex) => stroke.points.length === 1 ? (
+                            <circle
+                              key={strokeIndex}
+                              cx={stroke.points[0].x}
+                              cy={stroke.points[0].y}
+                              r={stroke.width / 2}
+                              fill={stroke.color}
+                            />
+                          ) : (
+                            <polyline
+                              key={strokeIndex}
+                              points={stroke.points.map(point => `${point.x},${point.y}`).join(' ')}
+                              fill="none"
+                              stroke={stroke.color}
+                              strokeWidth={stroke.width}
+                              strokeLinecap="round"
+                              strokeLinejoin="round"
+                            />
+                          ))}
+                        </svg>
+                      </div>
+                      {annotationModes[img.id] && (
+                        <div className="absolute left-2 bottom-2 rounded-md bg-slate-950/75 px-2 py-1 text-[9px] font-medium text-white pointer-events-none">
+                          Drawing mode
+                        </div>
+                      )}
+                    </div>
                   )}
                   {img.palette && img.palette.length > 0 && (
                     <div className="flex h-6 w-full mt-auto" style={{ width: img.width }}>
-                      {img.palette.map((color, i) => (
-                        <div 
-                          key={i} 
-                          className="flex-1 h-full cursor-pointer hover:scale-110 origin-bottom transition-transform group/color relative"
-                          style={{ backgroundColor: color }}
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            navigator.clipboard.writeText(color);
-                            setCopiedColor(color);
-                            setTimeout(() => setCopiedColor(null), 1500);
-                          }}
-                          title={`Copy ${color}`}
-                        >
-                          <div className="absolute opacity-0 group-hover/color:opacity-100 bottom-full left-1/2 -translate-x-1/2 mb-2 bg-black/80 text-white text-[9px] px-1.5 py-0.5 rounded pointer-events-none whitespace-nowrap">
-                            {copiedColor === color ? 'Copied!' : color}
-                          </div>
-                        </div>
-                      ))}
+                      {img.palette.map((color, i) => {
+                        const normalizedColor = normalizeHexColor(color) || color;
+                        const copyFailed = copiedColor === `error:${normalizedColor}` || copiedColor === `error:${color}`;
+                        return (
+                          <button
+                            type="button"
+                            key={`${normalizedColor}-${i}`}
+                            className="flex-1 h-full cursor-pointer hover:scale-110 focus-visible:scale-110 focus-visible:outline focus-visible:outline-2 focus-visible:outline-white origin-bottom transition-transform group/color relative"
+                            style={{ backgroundColor: normalizedColor }}
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              void copyPaletteColor(normalizedColor);
+                            }}
+                            title={`Copy ${normalizedColor}`}
+                            aria-label={`Copy color ${normalizedColor}`}
+                          >
+                            <span className="absolute opacity-0 group-hover/color:opacity-100 group-focus-visible/color:opacity-100 bottom-full left-1/2 -translate-x-1/2 mb-2 bg-black/90 text-white text-[9px] px-1.5 py-0.5 rounded pointer-events-none whitespace-nowrap">
+                              {copiedColor === normalizedColor ? `Copied ${normalizedColor}` : copyFailed ? 'Copy failed' : normalizedColor}
+                            </span>
+                          </button>
+                        );
+                      })}
                     </div>
                   )}
                   {/* Resize Handle */}
@@ -4904,7 +5343,6 @@ export default function App() {
                     if (p.id !== activeProjectId) {
                        await selectProjectOfId(p.id);
                     }
-                    setShowManager(false);
                   }}
                 >
                    <div className="flex justify-between items-start mb-4">
@@ -4916,19 +5354,31 @@ export default function App() {
                            value={editingProjectName}
                            onChange={(e) => setEditingProjectName(e.target.value)}
                            onKeyDown={async (e) => {
+                             e.stopPropagation();
                              if (e.key === 'Enter') {
-                               await updateProject(p.id, { name: editingProjectName });
+                               const nextName = editingProjectName.trim() || 'Untitled Board';
+                               await updateProject(p.id, { name: nextName });
+                               if (p.directoryPath) {
+                                 await syncBoardToPath({ ...p, name: nextName }, p.directoryPath);
+                               }
                                setProjects(await getProjects());
+                               setEditingProjectId(null);
+                             } else if (e.key === 'Escape') {
                                setEditingProjectId(null);
                              }
                            }}
+                           onMouseDown={(e) => e.stopPropagation()}
                            onClick={(e) => e.stopPropagation()}
                            className="w-full bg-white dark:bg-slate-900 border border-sky-500 rounded px-2 py-1 text-slate-900 dark:text-white text-sm outline-none"
                          />
                          <button 
                            onClick={async (e) => {
                              e.stopPropagation();
-                             await updateProject(p.id, { name: editingProjectName });
+                             const nextName = editingProjectName.trim() || 'Untitled Board';
+                             await updateProject(p.id, { name: nextName });
+                             if (p.directoryPath) {
+                               await syncBoardToPath({ ...p, name: nextName }, p.directoryPath);
+                             }
                              setProjects(await getProjects());
                              setEditingProjectId(null);
                            }}
@@ -4970,7 +5420,7 @@ export default function App() {
                      </div>
                    </div>
                    <div className="text-sm text-slate-400 mb-2 font-medium">
-                     {p.floatingImages?.length || 0} Images Â· {p.floatingNotes?.length || 0} Notes Â· {p.floatingSketches?.length || 0} Sketches
+                     {p.floatingImages?.length || 0} Images / {p.floatingNotes?.length || 0} Notes / {p.floatingSketches?.length || 0} Sketches
                    </div>
                    <div className="text-xs text-slate-500">
                      Updated {new Date(p.updatedAt).toLocaleDateString()}
@@ -5010,10 +5460,12 @@ export default function App() {
                 onClick={async () => {
                   const p = await createProject(`Board ${projects.length + 1}`);
                   let createdProject = p;
-                  if (defaultAutosaveRoot) {
-                    const electron = getElectron();
-                    const path = electron?.require ? electron.require('path') : null;
-                    const dirPath = path ? path.join(defaultAutosaveRoot, sanitizeProjectFolderName(p.name)) : "";
+                  const autosaveRoot = defaultAutosaveRoot || await getInstalledAutosaveRoot();
+                  if (autosaveRoot) {
+                    setDefaultAutosaveRoot(autosaveRoot);
+                    const nodeRequire = getNodeRequire();
+                    const path = nodeRequire ? nodeRequire('path') : null;
+                    const dirPath = path ? path.join(autosaveRoot, getProjectFolderName(p)) : "";
                     if (dirPath) {
                       createdProject = { ...p, directoryPath: dirPath };
                       await updateProject(p.id, { directoryPath: dirPath });
@@ -5065,11 +5517,15 @@ export default function App() {
                               if (e.target.files) {
                                 const files = Array.from(e.target.files) as File[];
                                 try {
+                                  const projectWithDirectory = await ensureProjectLocalDirectory(p);
                                   const mediaFiles = files.filter(f => f.type.startsWith('image/') || f.type === 'application/pdf');
                                   const base64Images = await Promise.all(mediaFiles.map(fileToBase64));
                                   const newFloatingImages = createFloatingMediaItems(mediaFiles, base64Images, { x: 100 + Math.random() * 50, y: 100 + Math.random() * 50 });
-                                  const updatedFloatingImages = [...(p.floatingImages || []), ...newFloatingImages];
+                                  const updatedFloatingImages = [...(projectWithDirectory.floatingImages || []), ...newFloatingImages];
                                   await updateProject(p.id, { floatingImages: updatedFloatingImages });
+                                  if (projectWithDirectory.directoryPath) {
+                                    await syncBoardToPath({ ...projectWithDirectory, floatingImages: updatedFloatingImages }, projectWithDirectory.directoryPath);
+                                  }
                                   setProjects(await getProjects());
                                   if (p.id === activeProjectId) setFloatingImages(updatedFloatingImages);
                                 } catch (error) {

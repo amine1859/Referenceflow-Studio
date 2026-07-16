@@ -2,11 +2,17 @@
 
 RefFlow Studio is a Windows desktop reference-board app for artists, designers, and developers. It provides a floating always-on-top workspace for images, PDFs, notes, sketches, local boards, and visual search.
 
+## Video Demo
+
+![RefFlow Studio floating reference workflow running directly over creative apps](screenshots/ref-flow-showcase.gif)
+
+[Watch the full-resolution showcase with sound](https://github.com/amine1859/Referenceflow-Studio/releases/download/v1.0.2/refflow.showcase.mp4).
+
 ## Screenshots
 
 ### Work directly over Photoshop
 
-![RefFlow Studio references floating over a Photoshop project](screenshots/photoshop-workflow.png)
+![RefFlow Studio references floating over a Photoshop project](screenshots/ref-flow-studio-photoshop-showcase.jpg)
 
 ### Build a flexible floating reference board
 
@@ -82,6 +88,11 @@ The installer is written to `dist_desktop/`.
 - Build artifacts such as `dist/`, `dist_desktop/`, `.exe`, and `.blockmap` files are ignored by Git.
 - The installer uses `assets/referenceflow.ico` for installer, uninstaller, and app executable branding.
 - The app executable runs as the current user so normal desktop interactions are not blocked by Windows elevation rules.
+
+## Security and privacy
+
+- [Code signing policy](CODE_SIGNING.md) — free code signing provided by SignPath.io, certificate by SignPath Foundation.
+- [Privacy policy](PRIVACY.md) — explains local storage and the user-initiated connections made by search and support features.
 
 ## License
 
