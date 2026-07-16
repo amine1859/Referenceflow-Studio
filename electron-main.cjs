@@ -21,6 +21,109 @@ try {
 }
 
 const isBackgroundLaunch = process.argv.includes('--background');
+const START_ON_BOOT_ARGS = ['--background'];
+
+const normalizeLoginPath = (value) => {
+  try {
+    return path.resolve(String(value || '')).replace(/\\/g, '/').toLowerCase();
+  } catch {
+    return String(value || '').replace(/\\/g, '/').toLowerCase();
+  }
+};
+
+function getStartOnBootRegistration() {
+  if (!app.isPackaged) {
+    return {
+      success: false,
+      supported: false,
+      enabled: false,
+      requiresElevation: false,
+      message: 'Start on Boot is available in packaged Windows builds.'
+    };
+  }
+
+  try {
+    const registration = app.getLoginItemSettings({
+      path: process.execPath,
+      args: START_ON_BOOT_ARGS
+    });
+    const expectedPath = normalizeLoginPath(process.execPath);
+    const matchingLaunchItem = Array.isArray(registration.launchItems)
+      ? registration.launchItems.find(item => normalizeLoginPath(item.path) === expectedPath)
+      : null;
+    // Electron's exact `openAtLogin` match can briefly be false on Windows
+    // when its registry command-line arguments are normalized differently.
+    // These two signals report whether this executable is actually enabled in
+    // Windows Startup Apps, which is the behavior the user asked for.
+    const enabled = Boolean(
+      registration.openAtLogin
+      || registration.executableWillLaunchAtLogin
+      || matchingLaunchItem?.enabled
+    );
+    return {
+      success: true,
+      supported: true,
+      enabled,
+      requiresElevation: false,
+      executablePath: process.execPath,
+      message: enabled
+        ? 'RefFlowStudio will start when you sign in to Windows.'
+        : 'Start on Boot is off. It uses your Windows account and does not require elevation.'
+    };
+  } catch (error) {
+    return {
+      success: false,
+      supported: true,
+      enabled: Boolean(settings.startOnBoot),
+      requiresElevation: false,
+      message: `Could not read the Windows startup registration: ${error.message}`
+    };
+  }
+}
+
+async function updateStartOnBootRegistration(enabled) {
+  if (!app.isPackaged) return getStartOnBootRegistration();
+
+  try {
+    app.setLoginItemSettings({
+      openAtLogin: Boolean(enabled),
+      enabled: Boolean(enabled),
+      name: app.getName(),
+      path: process.execPath,
+      args: START_ON_BOOT_ARGS
+    });
+    let result = getStartOnBootRegistration();
+    // Windows can update StartupApproved shortly after the Run entry. Give it
+    // a short confirmation window instead of showing a false failure instantly.
+    for (const delay of [100, 250, 500]) {
+      if (result.success && result.enabled === Boolean(enabled)) break;
+      await new Promise(resolve => setTimeout(resolve, delay));
+      result = getStartOnBootRegistration();
+    }
+    const verified = result.success && result.enabled === Boolean(enabled);
+    settings.startOnBoot = result.enabled;
+    fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2), 'utf8');
+    return {
+      ...result,
+      success: verified,
+      message: verified
+        ? (result.enabled
+            ? 'Start on Boot enabled for your Windows account. No extra administrator prompt is needed.'
+            : 'Start on Boot disabled.')
+        : `Windows still reports Start on Boot as ${result.enabled ? 'enabled' : 'disabled'}. Try the switch again or check Settings > Apps > Startup.`
+    };
+  } catch (error) {
+    console.error('Failed to update login item settings:', error);
+    return {
+      success: false,
+      supported: true,
+      enabled: getStartOnBootRegistration().enabled,
+      requiresElevation: false,
+      message: `Could not update Start on Boot: ${error.message}`
+    };
+  }
+}
+
 const gotSingleInstanceLock = app.requestSingleInstanceLock();
 if (!gotSingleInstanceLock) {
   app.quit();
@@ -412,6 +515,18 @@ function recoverRenderer(reason) {
 // Helper to convert lowercase modifiers to Electron Accelerator format
 function toElectronAccelerator(shortcutString) {
   if (!shortcutString) return '';
+  const keyAliases = {
+    comma: ',',
+    space: 'Space',
+    escape: 'Escape',
+    esc: 'Escape',
+    arrowup: 'Up',
+    arrowdown: 'Down',
+    arrowleft: 'Left',
+    arrowright: 'Right',
+    pageup: 'PageUp',
+    pagedown: 'PageDown'
+  };
   return shortcutString
     .split('+')
     .map(part => {
@@ -420,6 +535,7 @@ function toElectronAccelerator(shortcutString) {
       if (p === 'alt') return 'Alt';
       if (p === 'shift') return 'Shift';
       if (p === 'meta') return 'Command';
+      if (keyAliases[p]) return keyAliases[p];
       return p.toUpperCase();
     })
     .join('+');
@@ -484,6 +600,8 @@ ipcMain.on('start-drag', (event, filePath, iconPath) => {
 });
 
 function getReferenceExtension(source, declaredType) {
+  if (declaredType === 'docx' || /^data:application\/vnd\.openxmlformats-officedocument\.wordprocessingml\.document/i.test(source || '')) return '.docx';
+  if (declaredType === 'xlsx' || /^data:application\/vnd\.openxmlformats-officedocument\.spreadsheetml\.sheet/i.test(source || '')) return '.xlsx';
   if (declaredType === 'pdf' || /^data:application\/pdf/i.test(source || '')) return '.pdf';
   const mimeMatch = String(source || '').match(/^data:image\/([a-z0-9.+-]+)[;,]/i);
   if (mimeMatch) {
@@ -494,7 +612,7 @@ function getReferenceExtension(source, declaredType) {
   try {
     const cleanSource = String(source || '').split(/[?#]/)[0];
     const ext = path.extname(cleanSource).toLowerCase();
-    if (/^\.(png|jpe?g|webp|gif|bmp|tiff?|pdf)$/.test(ext)) return ext === '.jpeg' ? '.jpg' : ext;
+    if (/^\.(png|jpe?g|webp|gif|bmp|tiff?|pdf|docx|xlsx)$/.test(ext)) return ext === '.jpeg' ? '.jpg' : ext;
   } catch {
     // Fall through to the safest image extension.
   }
@@ -665,18 +783,10 @@ ipcMain.on('set-always-on-top', (event, enabled) => {
   }
 });
 
-ipcMain.on('set-start-on-boot', (event, enabled) => {
-  settings.startOnBoot = !!enabled;
-  try {
-    app.setLoginItemSettings({
-      openAtLogin: settings.startOnBoot,
-      openAsHidden: false,
-      args: ['--background']
-    });
-    fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2), 'utf8');
-  } catch (e) {
-    console.error("Failed to update login item settings:", e);
-  }
+ipcMain.handle('get-start-on-boot-status', async () => getStartOnBootRegistration());
+
+ipcMain.handle('set-start-on-boot', async (_event, enabled) => {
+  return updateStartOnBootRegistration(Boolean(enabled));
 });
 
 ipcMain.on('set-launch-minimized', (event, enabled) => {
@@ -1097,6 +1207,15 @@ if (gotSingleInstanceLock) {
   });
 
   app.on('ready', () => {
+    if (settings.startOnBoot) {
+      void updateStartOnBootRegistration(true)
+        .then(startupResult => {
+          if (!startupResult.success) {
+            console.error(`Failed to restore Start on Boot: ${startupResult.message}`);
+          }
+        })
+        .catch(error => console.error('Failed to restore Start on Boot:', error));
+    }
     createWindow();
     createTray();
     configureAutoUpdates();

@@ -6,14 +6,16 @@ import {
 import { motion, AnimatePresence } from 'motion/react';
 import Markdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { FloatingImage, FloatingNote, FloatingSketch, FloatingSketchLine, ImageAnnotationPoint, Project, getProjects, createProject, updateProject, deleteProject, getActiveProjectId, setActiveProjectId, fileToBase64 } from './lib/store';
+import { FloatingImage, FloatingMediaType, FloatingNote, FloatingSketch, FloatingSketchLine, ImageAnnotationPoint, Project, getProjects, createProject, updateProject, deleteProject, getActiveProjectId, setActiveProjectId, fileToBase64 } from './lib/store';
 import { createLocalBoardManifest, createProjectMediaSnapshot, getBackgroundMediaFileName, getFloatingMediaFileName, getSavedMediaExtension, projectMediaSnapshotsEqual, sanitizeExportStem } from './lib/projectMedia';
 import type { ProjectMediaSnapshot } from './lib/projectMedia';
-import { resizeWindowHorizontally, snapWindowRect } from './lib/windowGeometry';
-import type { HorizontalResizeEdge, WindowRect } from './lib/windowGeometry';
+import { resizeWindowFromEdge, resizeWindowWithAspectRatio, snapWindowRect } from './lib/windowGeometry';
+import type { EdgeResizeStart, WindowRect, WindowResizeEdge } from './lib/windowGeometry';
 import { getAnnotationPageKey, getSmoothStrokePath, getVisibleAnnotations, replaceVisibleAnnotations } from './lib/annotations';
 
 import { FloatingSketchWindow } from './components/FloatingSketchWindow';
+import { OfficeDocumentWindow } from './components/OfficeDocumentWindow';
+import { getWindowResizeCursorClass, InvisibleResizeFrame } from './components/InvisibleResizeFrame';
 import { pdfjs } from 'react-pdf';
 
 // PDF.js requires an explicit worker URL in packaged Electron builds. Keeping
@@ -24,6 +26,21 @@ pdfjs.GlobalWorkerOptions.workerSrc = new URL(
 ).toString();
 
 const PATREON_URL = 'https://www.patreon.com/RefFlowStudio';
+const DOCX_MIME_TYPE = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+const XLSX_MIME_TYPE = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+const SUPPORTED_MEDIA_ACCEPT = `image/*,application/pdf,${DOCX_MIME_TYPE},${XLSX_MIME_TYPE},.docx,.xlsx`;
+
+const getImportedMediaType = (file: Pick<File, 'name' | 'type'>): FloatingMediaType | null => {
+  const lowerName = String(file.name || '').toLowerCase();
+  const mimeType = String(file.type || '').toLowerCase();
+  if (mimeType.startsWith('image/')) return 'image';
+  if (mimeType === 'application/pdf' || lowerName.endsWith('.pdf')) return 'pdf';
+  if (mimeType === DOCX_MIME_TYPE || lowerName.endsWith('.docx')) return 'docx';
+  if (mimeType === XLSX_MIME_TYPE || lowerName.endsWith('.xlsx')) return 'xlsx';
+  return null;
+};
+
+const isOfficeDocument = (type?: FloatingMediaType) => type === 'docx' || type === 'xlsx';
 
 type AppUpdatePhase = 'idle' | 'development' | 'checking' | 'available' | 'downloading' | 'up-to-date' | 'ready' | 'installing' | 'error';
 
@@ -81,8 +98,27 @@ const MAX_REFERENCE_PREVIEW_DIMENSION = 2048;
 const MAX_CONCURRENT_REFERENCE_PREVIEWS = 2;
 const MIN_BOUNDED_PREVIEW_SOURCE_LENGTH = 1_500_000;
 const FLOATING_IMAGE_TOOLBAR_HEIGHT = 34;
+const FLOATING_NOTE_TOOLBAR_HEIGHT = 32;
+const FLOATING_SKETCH_TOOLBAR_HEIGHT = 32;
 const FLOATING_WINDOW_SNAP_THRESHOLD = 12;
 const FLOATING_WINDOW_SNAP_GAP = 8;
+const FLOATING_NOTE_MIN_WIDTH = 220;
+const FLOATING_NOTE_MIN_HEIGHT = 100;
+const FLOATING_MEDIA_MIN_WIDTH = 120;
+const FLOATING_MEDIA_MIN_HEIGHT = 80;
+const FLOATING_MEDIA_FALLBACK_HEIGHT = 240;
+const OFFICE_DOCUMENT_DEFAULT_HEIGHT = 520;
+const OFFICE_DOCUMENT_MIN_WIDTH = 360;
+const OFFICE_DOCUMENT_MIN_HEIGHT = 280;
+
+type FloatingWindowKind = 'image' | 'note' | 'sketch';
+
+const getFloatingWindowToolbarHeight = (kind: FloatingWindowKind) => {
+  if (kind === 'image') return FLOATING_IMAGE_TOOLBAR_HEIGHT;
+  if (kind === 'note') return FLOATING_NOTE_TOOLBAR_HEIGHT;
+  return FLOATING_SKETCH_TOOLBAR_HEIGHT;
+};
+
 let activeReferencePreviewJobs = 0;
 const pendingReferencePreviewJobs: Array<() => void> = [];
 
@@ -239,7 +275,7 @@ function ReferenceImagePreview({
       role="img"
       aria-label="Floating Reference"
       className={className}
-      style={{ ...style, width: '100%', height: 'auto' }}
+      style={{ ...style, width: '100%', height: style?.height ?? 'auto' }}
       draggable={draggable}
       title={title}
       onMouseDown={event => onMouseDown?.(event)}
@@ -269,6 +305,7 @@ function PdfCanvas({
   children?: React.ReactNode;
 }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const textLayerRef = useRef<HTMLDivElement>(null);
   const [isLoadingPdf, setIsLoadingPdf] = useState(true);
   const [pdfDocument, setPdfDocument] = useState<any>(null);
 
@@ -313,6 +350,7 @@ function PdfCanvas({
 
     let cancelled = false;
     let renderTask: any = null;
+    let textLayerTask: any = null;
     setIsLoadingPdf(true);
 
     pdfDocument.getPage(pageNumber)
@@ -330,10 +368,24 @@ function PdfCanvas({
         canvas.style.width = `${viewport.width}px`;
         canvas.style.height = `${viewport.height}px`;
 
+        const textLayerElement = textLayerRef.current;
+        if (textLayerElement) {
+          textLayerElement.replaceChildren();
+          textLayerElement.style.setProperty('--total-scale-factor', String(fitScale * scale));
+          const TextLayer = (pdfjs as any).TextLayer;
+          if (TextLayer) {
+            textLayerTask = new TextLayer({
+              textContentSource: page.streamTextContent({ includeMarkedContent: true, disableNormalization: true }),
+              container: textLayerElement,
+              viewport
+            });
+          }
+        }
+
         context.setTransform(deviceScale, 0, 0, deviceScale, 0, 0);
         context.clearRect(0, 0, viewport.width, viewport.height);
         renderTask = page.render({ canvas, canvasContext: context, viewport });
-        await renderTask.promise;
+        await Promise.all([renderTask.promise, textLayerTask?.render?.()]);
         if (!cancelled) {
           setIsLoadingPdf(false);
           onRenderSuccess?.();
@@ -355,6 +407,11 @@ function PdfCanvas({
           // Ignore render cancellation during fast page/zoom changes.
         }
       }
+      try {
+        textLayerTask?.cancel?.();
+      } catch {
+        // Ignore text-layer cancellation during fast page/zoom changes.
+      }
     };
   }, [pdfDocument, pageNumber, width, scale]);
 
@@ -366,6 +423,7 @@ function PdfCanvas({
         </div>
       )}
       <canvas ref={canvasRef} className="block max-w-none" />
+      <div ref={textLayerRef} className="pdf-text-layer textLayer no-window-drag" aria-label="Selectable PDF text" />
       {children}
     </div>
   );
@@ -698,28 +756,62 @@ const fetchImageAsBase64 = async (url: string): Promise<string> => {
 
 
 
-const matchShortcut = (combo: string, e: KeyboardEvent) => {
-  if (!combo) return false;
-  const parts = combo.toLowerCase().split('+');
-  const requiresCtrl = parts.includes('ctrl');
-  const requiresShift = parts.includes('shift');
-  const requiresAlt = parts.includes('alt');
-  const key = parts[parts.length - 1];
+type ShortcutParts = { ctrl: boolean; alt: boolean; shift: boolean; meta: boolean; key: string };
 
-  const isCtrlMatched = requiresCtrl === (e.ctrlKey || e.metaKey);
-  const isShiftMatched = requiresShift === e.shiftKey;
-  const isAltMatched = requiresAlt === e.altKey;
+const parseShortcut = (combo: string): ShortcutParts => {
+  const parts = String(combo || '').toLowerCase().split('+').map(part => part.trim()).filter(Boolean);
+  const modifiers = new Set(['ctrl', 'alt', 'shift', 'meta']);
+  return {
+    ctrl: parts.includes('ctrl'),
+    alt: parts.includes('alt'),
+    shift: parts.includes('shift'),
+    meta: parts.includes('meta'),
+    key: [...parts].reverse().find(part => !modifiers.has(part)) || ''
+  };
+};
+
+const buildShortcut = ({ ctrl, alt, shift, meta, key }: ShortcutParts) => {
+  const normalizedKey = key.trim().toLowerCase();
+  if (!normalizedKey) return '';
+  return [ctrl && 'ctrl', alt && 'alt', shift && 'shift', meta && 'meta', normalizedKey].filter(Boolean).join('+');
+};
+
+const normalizeShortcutKey = (event: React.KeyboardEvent<HTMLInputElement>) => {
+  const rawKey = event.key.toLowerCase();
+  if (['control', 'alt', 'shift', 'meta'].includes(rawKey)) return '';
+  if (rawKey === ' ') return 'space';
+  if (rawKey === ',') return 'comma';
+  return rawKey;
+};
+
+const shortcutKeyLabel = (key: string) => {
+  if (!key) return '';
+  if (key === 'comma') return ',';
+  if (key === 'space') return 'Space';
+  return key.length === 1 ? key.toUpperCase() : key.replace(/^arrow/, '').replace(/^./, value => value.toUpperCase());
+};
+
+const matchShortcut = (combo: string, e: KeyboardEvent) => {
+  const shortcut = parseShortcut(combo);
+  if (!shortcut.key) return false;
+
+  const isCtrlMatched = shortcut.ctrl === e.ctrlKey;
+  const isShiftMatched = shortcut.shift === e.shiftKey;
+  const isAltMatched = shortcut.alt === e.altKey;
+  const isMetaMatched = shortcut.meta === e.metaKey;
   
   let isKeyMatched = false;
-  if (key === 'escape' || key === 'esc') {
+  if (shortcut.key === 'escape' || shortcut.key === 'esc') {
     isKeyMatched = e.key.toLowerCase() === 'escape';
-  } else if (key === 'comma') {
+  } else if (shortcut.key === 'comma') {
     isKeyMatched = e.key === ',';
+  } else if (shortcut.key === 'space') {
+    isKeyMatched = e.key === ' ';
   } else {
-    isKeyMatched = e.key.toLowerCase() === key || (e.code.toLowerCase().replace('key', '') === key);
+    isKeyMatched = e.key.toLowerCase() === shortcut.key || (e.code.toLowerCase().replace('key', '') === shortcut.key);
   }
 
-  return isCtrlMatched && isShiftMatched && isAltMatched && isKeyMatched;
+  return isCtrlMatched && isShiftMatched && isAltMatched && isMetaMatched && isKeyMatched;
 };
 
 const ensureTempLocalFile = async (url: string, id: string): Promise<string> => {
@@ -736,6 +828,8 @@ const ensureTempLocalFile = async (url: string, id: string): Promise<string> => 
     else if (url.toLowerCase().includes('.webp') || url.startsWith('data:image/webp')) ext = '.webp';
     else if (url.toLowerCase().includes('.gif') || url.startsWith('data:image/gif')) ext = '.gif';
     else if (url.toLowerCase().includes('.pdf') || url.startsWith('data:application/pdf')) ext = '.pdf';
+    else if (url.toLowerCase().includes('.docx') || url.startsWith(`data:${DOCX_MIME_TYPE}`)) ext = '.docx';
+    else if (url.toLowerCase().includes('.xlsx') || url.startsWith(`data:${XLSX_MIME_TYPE}`)) ext = '.xlsx';
     else if (url.startsWith('data:image/jpeg') || url.startsWith('data:image/jpg')) ext = '.jpg';
     
     let dataRoot = '';
@@ -930,6 +1024,7 @@ export default function App() {
   const [floatingImages, setFloatingImages] = useState<FloatingImage[]>([]);
   const [floatingNotes, setFloatingNotes] = useState<FloatingNote[]>([]);
   const [showSettings, setShowSettings] = useState(false);
+  const [showProviderSettings, setShowProviderSettings] = useState(false);
   const [showSearchComponent, setShowSearchComponent] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [searchProvider, setSearchProvider] = useState("All Native");
@@ -949,7 +1044,7 @@ export default function App() {
   const [searchLog, setSearchLog] = useState<string[]>([]);
   const [searchPage, setSearchPage] = useState(1);
   const [searchContextMenu, setSearchContextMenu] = useState<{x: number, y: number, result: any} | null>(null);
-  const [floatingContextMenu, setFloatingContextMenu] = useState<{x: number, y: number, id: string, url: string, type?: 'image' | 'pdf'} | null>(null);
+  const [floatingContextMenu, setFloatingContextMenu] = useState<{x: number, y: number, id: string, url: string, type?: FloatingMediaType, fileName?: string} | null>(null);
   const [contextMenuTempPath, setContextMenuTempPath] = useState<string>('');
   const dragFilePathsRef = useRef<Map<string, string>>(new Map());
   const NATIVE_PROVIDERS = ['All Native', 'Wikimedia Commons', 'Openverse', 'Pixabay', 'Pexels', 'Unsplash', 'SerpAPI'];
@@ -1077,19 +1172,23 @@ export default function App() {
     collapsed = false
   ): FloatingImage[] => {
     return urls.map((url, i) => {
-      const isPdf = files[i]?.type === 'application/pdf';
+      const mediaType = getImportedMediaType(files[i]) || 'image';
+      const isPdf = mediaType === 'pdf';
+      const isOffice = isOfficeDocument(mediaType);
       return {
         id: Math.random().toString(36).substr(2, 9),
         url,
         x: origin.x + (i * 20),
         y: origin.y + (i * 20),
-        width: isPdf ? 420 : 400,
+        width: isOffice ? 680 : isPdf ? 420 : 400,
+        height: isOffice ? OFFICE_DOCUMENT_DEFAULT_HEIGHT : undefined,
         opacity: 1,
         isLocked: false,
         rotation: 0,
         palette: [],
         zoom: 1,
-        type: isPdf ? 'pdf' : 'image',
+        type: mediaType,
+        fileName: files[i]?.name,
         documentPage: isPdf ? 1 : undefined,
         isCollapsed: collapsed
       };
@@ -1101,7 +1200,7 @@ export default function App() {
     origin: { x: number; y: number } = { x: position.x + pillDimensions.width + 20, y: position.y },
     collapsed = false
   ): Promise<FloatingImage[]> => {
-    const mediaFiles = files.filter(f => f.type.startsWith('image/') || f.type === 'application/pdf');
+    const mediaFiles = files.filter(file => getImportedMediaType(file) !== null);
     if (mediaFiles.length === 0) return [];
 
     const newMedia = await Promise.all(mediaFiles.map(fileToBase64));
@@ -2003,6 +2102,10 @@ export default function App() {
     const saved = localStorage.getItem('ref-flow-start-on-boot');
     return saved ? saved === 'true' : false;
   });
+  const [startOnBootStatus, setStartOnBootStatus] = useState<{
+    phase: 'checking' | 'ready' | 'saving' | 'error' | 'unavailable';
+    message: string;
+  }>({ phase: 'checking', message: 'Checking Windows startup registration...' });
   const [launchMinimized, setLaunchMinimized] = useState<boolean>(() => {
     const saved = localStorage.getItem('ref-flow-launch-minimized');
     return saved ? saved === 'true' : false;
@@ -2047,6 +2150,72 @@ export default function App() {
     resCount: 0,
     errors: []
   });
+
+  useEffect(() => {
+    if (!showSettings) setShowProviderSettings(false);
+    if (!showSettings || !showProviderSettings) {
+      setConfigModalProvider(null);
+      setShowDiagnosticsModal(false);
+    }
+  }, [showProviderSettings, showSettings]);
+
+  useEffect(() => {
+    let mounted = true;
+    const electron = (window as any).require ? (window as any).require('electron') : null;
+    if (!electron?.ipcRenderer) {
+      setStartOnBootStatus({
+        phase: 'unavailable',
+        message: 'Startup registration is available in the packaged Windows app.'
+      });
+      return () => { mounted = false; };
+    }
+
+    electron.ipcRenderer.invoke('get-start-on-boot-status')
+      .then((result: { success?: boolean; supported?: boolean; enabled?: boolean; message?: string }) => {
+        if (!mounted) return;
+        if (result.success) {
+          setStartOnBoot(Boolean(result.enabled));
+          localStorage.setItem('ref-flow-start-on-boot', String(Boolean(result.enabled)));
+        }
+        setStartOnBootStatus({
+          phase: result.supported === false ? 'unavailable' : result.success ? 'ready' : 'error',
+          message: result.message || 'Windows startup status is unavailable.'
+        });
+      })
+      .catch((error: Error) => {
+        if (!mounted) return;
+        setStartOnBootStatus({ phase: 'error', message: `Startup check failed: ${error.message}` });
+      });
+
+    return () => { mounted = false; };
+  }, []);
+
+  const changeStartOnBoot = async (enabled: boolean) => {
+    const electron = (window as any).require ? (window as any).require('electron') : null;
+    if (!electron?.ipcRenderer) {
+      setStartOnBootStatus({
+        phase: 'unavailable',
+        message: 'Install the Windows test build to change Start on Boot.'
+      });
+      return;
+    }
+
+    setStartOnBootStatus({ phase: 'saving', message: enabled ? 'Enabling Start on Boot...' : 'Disabling Start on Boot...' });
+    try {
+      const result = await electron.ipcRenderer.invoke('set-start-on-boot', enabled);
+      setStartOnBoot(Boolean(result.enabled));
+      localStorage.setItem('ref-flow-start-on-boot', String(Boolean(result.enabled)));
+      setStartOnBootStatus({
+        phase: result.success ? 'ready' : 'error',
+        message: result.message || 'Windows did not confirm the startup change.'
+      });
+    } catch (error) {
+      setStartOnBootStatus({
+        phase: 'error',
+        message: `Could not change Start on Boot: ${error instanceof Error ? error.message : String(error)}`
+      });
+    }
+  };
 
   const updateApiKeys = (newKeys: Record<string, string>) => {
     setApiKeys(newKeys);
@@ -2104,14 +2273,18 @@ export default function App() {
     const saved = localStorage.getItem('ref-flow-shortcuts');
     if (saved) {
       const parsed = JSON.parse(saved);
-      // Ensure all old single-character keys or missing keys get properly migrated to the control+alt configuration
+      // Preserve intentionally disabled bindings while migrating legacy single-key values.
       const migrated: any = {};
       Object.keys(defaultKeys).forEach((k) => {
         const val = parsed[k];
-        if (val && val.startsWith('ctrl+alt+')) {
-          migrated[k] = val;
-        } else if (val) {
-          migrated[k] = `ctrl+alt+${val}`;
+        if (Object.prototype.hasOwnProperty.call(parsed, k) && typeof val === 'string') {
+          if (!val.trim()) {
+            migrated[k] = '';
+          } else if (val.includes('+')) {
+            migrated[k] = buildShortcut(parseShortcut(val));
+          } else {
+            migrated[k] = `ctrl+alt+${val.toLowerCase()}`;
+          }
         } else {
           migrated[k] = (defaultKeys as any)[k];
         }
@@ -2120,6 +2293,14 @@ export default function App() {
     }
     return defaultKeys;
   });
+
+  const setShortcutBinding = useCallback((actionKey: string, shortcut: string) => {
+    setShortcuts(current => {
+      const next = { ...current, [actionKey]: shortcut };
+      localStorage.setItem('ref-flow-shortcuts', JSON.stringify(next));
+      return next;
+    });
+  }, []);
 
   const selectProjectOfId = async (id: string) => {
     let p = projects.find(proj => proj.id === id);
@@ -2521,6 +2702,8 @@ export default function App() {
         if (lower.startsWith('data:image/png') || lower.includes('.png')) return 'png';
         if (lower.startsWith('data:image/webp') || lower.includes('.webp')) return 'webp';
         if (lower.startsWith('data:image/gif') || lower.includes('.gif')) return 'gif';
+        if (lower.startsWith(`data:${DOCX_MIME_TYPE}`) || lower.includes('.docx')) return 'docx';
+        if (lower.startsWith(`data:${XLSX_MIME_TYPE}`) || lower.includes('.xlsx')) return 'xlsx';
         if (lower.startsWith('data:application/pdf') || lower.includes('.pdf')) return 'pdf';
         if (lower.startsWith('data:image/jpeg') || lower.startsWith('data:image/jpg') || lower.includes('.jpg') || lower.includes('.jpeg')) return 'jpg';
         return fallback;
@@ -2553,7 +2736,7 @@ export default function App() {
         images: (project.images || []).map((source, index) => `background_${index + 1}.${extensionForUrl(source, 'png')}`),
         floatingImages: (project.floatingImages || []).map(image => ({
           ...image,
-          url: `floating_${sanitizeExportStem(image.id)}.${extensionForUrl(image.url, image.type === 'pdf' ? 'pdf' : 'png')}`
+          url: `floating_${sanitizeExportStem(image.id)}.${extensionForUrl(image.url, image.type || 'png')}`
         })),
         exportedAt: new Date().toISOString()
       };
@@ -2569,7 +2752,7 @@ export default function App() {
 
       if (syncMedia && project.floatingImages && project.floatingImages.length > 0) {
         for (const img of project.floatingImages) {
-          await saveBase64(img.url, `floating_${sanitizeExportStem(img.id)}.${extensionForUrl(img.url, img.type === 'pdf' ? 'pdf' : 'png')}`);
+          await saveBase64(img.url, `floating_${sanitizeExportStem(img.id)}.${extensionForUrl(img.url, img.type || 'png')}`);
         }
       }
 
@@ -2638,11 +2821,11 @@ export default function App() {
         return Buffer.from(await response.arrayBuffer());
       };
 
-      const saveMedia = async (source: string, fileStem: string, type: 'image' | 'pdf' = 'image') => {
+      const saveMedia = async (source: string, fileStem: string, type: FloatingMediaType = 'image') => {
         const sourceBuffer = await readMedia(source);
         const extension = getSavedMediaExtension(source, type);
-        if (extension === 'pdf') {
-          fs.writeFileSync(path.join(imagesDirectory, `${fileStem}.pdf`), sourceBuffer);
+        if (extension === 'pdf' || extension === 'docx' || extension === 'xlsx') {
+          fs.writeFileSync(path.join(imagesDirectory, `${fileStem}.${extension}`), sourceBuffer);
           return;
         }
 
@@ -2701,7 +2884,7 @@ export default function App() {
           fileStem: string,
           fileName: string,
           label: string,
-          type: 'image' | 'pdf' = 'image',
+          type: FloatingMediaType = 'image',
           sourceUnchanged = false
         ) => {
           expectedFileNames.add(fileName);
@@ -2740,12 +2923,12 @@ export default function App() {
         }
         for (const image of project.floatingImages || []) {
           const previousImage = previousFloatingSources.get(image.id);
-          const mediaType = image.type === 'pdf' ? 'pdf' : 'image';
+          const mediaType = image.type || 'image';
           await saveIndexedMedia(
             image.url,
             `floating_${sanitizeExportStem(image.id)}`,
             getFloatingMediaFileName(image),
-            `Image ${image.id}`,
+            `${mediaType === 'image' ? 'Image' : mediaType.toUpperCase()} ${image.id}`,
             mediaType,
             previousImage?.source === image.url && previousImage.type === mediaType
           );
@@ -3034,10 +3217,11 @@ export default function App() {
   const dragFloatingGeometry = useRef<{
     width: number;
     height: number;
+    toolbarHeight: number;
     targets: WindowRect[];
     bounds: WindowRect[];
-  }>({ width: 0, height: 0, targets: [], bounds: [] });
-  const [imageSnapGuides, setImageSnapGuides] = useState<{ x?: number; y?: number }>({});
+  }>({ width: 0, height: 0, toolbarHeight: 0, targets: [], bounds: [] });
+  const [windowSnapGuides, setWindowSnapGuides] = useState<{ x?: number; y?: number }>({});
   const opacityFrameRef = useRef<number | null>(null);
   const pendingOpacityRef = useRef<{ id: string; opacity: number } | null>(null);
 
@@ -3053,6 +3237,10 @@ export default function App() {
     });
   }, []);
 
+  const updateFloatingMedia = useCallback((id: string, patch: Partial<FloatingImage>) => {
+    setFloatingImages(current => current.map(image => image.id === id ? { ...image, ...patch } : image));
+  }, []);
+
   useEffect(() => {
     return () => {
       if (opacityFrameRef.current !== null) {
@@ -3063,7 +3251,15 @@ export default function App() {
 
   // Handle Resizing global floating images
   const [resizingFloatingId, setResizingFloatingId] = useState<string | null>(null);
-  const resizeStart = useRef({ pointerX: 0, x: 0, width: 0, edge: 'right' as HorizontalResizeEdge });
+  const resizeStart = useRef<EdgeResizeStart>({
+    pointerX: 0,
+    pointerY: 0,
+    x: 0,
+    y: 0,
+    width: 0,
+    height: 0,
+    edge: 'right'
+  });
 
   // Handle Dragging global floating notes
   const [draggingNoteId, setDraggingNoteId] = useState<string | null>(null);
@@ -3071,7 +3267,16 @@ export default function App() {
 
   // Handle Resizing global floating notes
   const [resizingNoteId, setResizingNoteId] = useState<string | null>(null);
-  const resizeNoteStart = useRef({ x: 0, y: 0, width: 0, height: 0 });
+  const resizeNoteStart = useRef<EdgeResizeStart & { lockAspectRatio: boolean }>({
+    pointerX: 0,
+    pointerY: 0,
+    x: 0,
+    y: 0,
+    width: 0,
+    height: 0,
+    edge: 'bottom-right',
+    lockAspectRatio: false
+  });
 
   // Handle Dragging global floating sketches
   const [draggingSketchId, setDraggingSketchId] = useState<string | null>(null);
@@ -3079,10 +3284,61 @@ export default function App() {
 
   // Handle Resizing global floating sketches
   const [resizingSketchId, setResizingSketchId] = useState<string | null>(null);
-  const resizeSketchStart = useRef({ x: 0, y: 0, width: 0, height: 0 });
+  const resizeSketchStart = useRef<EdgeResizeStart>({
+    pointerX: 0,
+    pointerY: 0,
+    x: 0,
+    y: 0,
+    width: 0,
+    height: 0,
+    edge: 'bottom-right'
+  });
 
   // Ticking ref for requestAnimationFrame throttling of mousemove events
   const ticking = useRef(false);
+  const activeWindowDragElementRef = useRef<HTMLElement | null>(null);
+  const pendingWindowMoveRef = useRef<{
+    kind: FloatingWindowKind;
+    id: string;
+    x: number;
+    y: number;
+  } | null>(null);
+
+  const findFloatingWindowElement = useCallback((kind: FloatingWindowKind, id: string) => {
+    return Array.from(document.querySelectorAll<HTMLElement>(`.floating-window[data-window-kind="${kind}"]`))
+      .find(element => element.dataset.id === id) || null;
+  }, []);
+
+  const beginImperativeWindowMove = useCallback((kind: FloatingWindowKind, id: string, x: number, y: number) => {
+    activeWindowDragElementRef.current = findFloatingWindowElement(kind, id);
+    pendingWindowMoveRef.current = { kind, id, x, y };
+  }, [findFloatingWindowElement]);
+
+  const previewImperativeWindowMove = useCallback((x: number, y: number) => {
+    const pending = pendingWindowMoveRef.current;
+    if (!pending) return;
+    pending.x = x;
+    pending.y = y;
+    const element = activeWindowDragElementRef.current;
+    if (element) {
+      element.style.left = `${x}px`;
+      element.style.top = `${y}px`;
+    }
+  }, []);
+
+  const commitImperativeWindowMove = useCallback(() => {
+    const pending = pendingWindowMoveRef.current;
+    pendingWindowMoveRef.current = null;
+    activeWindowDragElementRef.current = null;
+    if (!pending) return;
+    if (pending.kind === 'image') {
+      setFloatingImages(current => current.map(image => image.id === pending.id ? { ...image, x: pending.x, y: pending.y } : image));
+    } else if (pending.kind === 'note') {
+      setFloatingNotes(current => current.map(note => note.id === pending.id ? { ...note, x: pending.x, y: pending.y } : note));
+    } else {
+      setFloatingSketches(current => current.map(sketch => sketch.id === pending.id ? { ...sketch, x: pending.x, y: pending.y } : sketch));
+    }
+  }, []);
 
   const executeShortcutAction = useCallback((actionKey: string) => {
     switch (actionKey) {
@@ -3167,10 +3423,6 @@ export default function App() {
 
   useEffect(() => {
     localStorage.setItem('ref-flow-start-on-boot', startOnBoot.toString());
-    const electron = (window as any).require ? (window as any).require('electron') : null;
-    if (electron && electron.ipcRenderer) {
-      electron.ipcRenderer.send('set-start-on-boot', startOnBoot);
-    }
   }, [startOnBoot]);
 
   useEffect(() => {
@@ -3424,9 +3676,17 @@ export default function App() {
     const publishInteractiveRegions = () => {
       window.cancelAnimationFrame(animationFrame);
       animationFrame = window.requestAnimationFrame(() => {
+        if (isDragActive) {
+          const payloadFingerprint = 'drag-active';
+          if (payloadFingerprint !== lastInteractiveRegionsPayloadRef.current) {
+            lastInteractiveRegionsPayloadRef.current = payloadFingerprint;
+            ipcRenderer.send('update-interactive-regions', { regions: [], forceInteractive: true });
+          }
+          return;
+        }
         const elements = Array.from(document.querySelectorAll<HTMLElement>('.pointer-events-auto, [data-native-interactive="true"]'));
         const regions: Array<{ x: number; y: number; width: number; height: number }> = [];
-        const dragHandleSelector = '.floating-drag-handle, .floating-note-drag-handle, .floating-sketch-drag-handle';
+        const dragHandleSelector = '.floating-drag-handle, .floating-office-drag-handle, .floating-note-drag-handle, .floating-sketch-drag-handle';
         for (const element of elements) {
           const floatingWindow = element.closest<HTMLElement>('.floating-window');
           if (floatingWindow?.dataset.collapsed === 'true') continue;
@@ -3462,10 +3722,10 @@ export default function App() {
           });
         }
 
-        const payloadFingerprint = `${isDragActive ? 1 : 0}:${regions.map(region => `${region.x},${region.y},${region.width},${region.height}`).join('|')}`;
+        const payloadFingerprint = `0:${regions.map(region => `${region.x},${region.y},${region.width},${region.height}`).join('|')}`;
         if (payloadFingerprint === lastInteractiveRegionsPayloadRef.current) return;
         lastInteractiveRegionsPayloadRef.current = payloadFingerprint;
-        ipcRenderer.send('update-interactive-regions', { regions, forceInteractive: isDragActive });
+        ipcRenderer.send('update-interactive-regions', { regions, forceInteractive: false });
       });
     };
 
@@ -3527,74 +3787,119 @@ export default function App() {
     }
   };
 
-  const handleSketchMouseDown = (e: React.MouseEvent, id: string) => {
-    if ((e.target as HTMLElement).closest('.floating-sketch-drag-handle')) {
-      e.stopPropagation();
-      setDraggingSketchId(id);
-      const sketch = floatingSketches.find(s => s.id === id);
-      if (sketch) {
-        dragSketchOffset.current = {
-          x: e.clientX - sketch.x,
-          y: e.clientY - sketch.y
-        };
-      }
-    }
-  };
+  const prepareFloatingWindowSnap = (
+    kind: FloatingWindowKind,
+    id: string,
+    fallbackWidth: number,
+    fallbackBodyHeight: number
+  ) => {
+    const visibleRects: Array<{ kind: FloatingWindowKind; id: string; rect: WindowRect }> = [];
+    const windowElements = Array.from(document.querySelectorAll<HTMLElement>('.floating-window[data-window-kind]'));
 
-  const handleSketchResizeMouseDown = (e: React.MouseEvent, id: string) => {
-    e.stopPropagation();
-    setResizingSketchId(id);
-    const sketch = floatingSketches.find(s => s.id === id);
-    if (sketch) {
-      resizeSketchStart.current = {
-        x: e.clientX,
-        y: e.clientY,
-        width: sketch.width,
-        height: sketch.height
-      };
-    }
-  };
+    windowElements.forEach(element => {
+      const windowKind = element.dataset.windowKind;
+      if (windowKind !== 'image' && windowKind !== 'note' && windowKind !== 'sketch') return;
 
-  const beginFloatingImageWindowDrag = (clientX: number, clientY: number, img: FloatingImage) => {
-    const windowElements = Array.from(document.querySelectorAll<HTMLElement>('.floating-window[data-window-kind="image"]'));
-    const visibleRects = windowElements.map(element => {
       const rect = element.getBoundingClientRect();
-      return {
+      const toolbarHeight = getFloatingWindowToolbarHeight(windowKind);
+      visibleRects.push({
+        kind: windowKind,
         id: element.dataset.id || '',
         rect: {
           x: rect.left,
-          y: rect.top - FLOATING_IMAGE_TOOLBAR_HEIGHT,
+          y: rect.top - toolbarHeight,
           width: rect.width,
-          height: rect.height + FLOATING_IMAGE_TOOLBAR_HEIGHT
+          height: rect.height + toolbarHeight
         }
-      };
+      });
     });
-    const movingRect = visibleRects.find(item => item.id === img.id)?.rect;
+
+    const toolbarHeight = getFloatingWindowToolbarHeight(kind);
+    const movingRect = visibleRects.find(item => item.kind === kind && item.id === id)?.rect;
+    const viewportBounds = [{ x: 0, y: 0, width: window.innerWidth, height: window.innerHeight }];
 
     dragFloatingGeometry.current = {
-      width: movingRect?.width || img.width,
-      height: movingRect?.height || img.width + FLOATING_IMAGE_TOOLBAR_HEIGHT,
-      targets: visibleRects.filter(item => item.id && item.id !== img.id).map(item => item.rect),
-      bounds: displayLayout?.displays.map(display => display.workArea) || [{ x: 0, y: 0, width: window.innerWidth, height: window.innerHeight }]
+      width: movingRect?.width || fallbackWidth,
+      height: movingRect?.height || fallbackBodyHeight + toolbarHeight,
+      toolbarHeight,
+      targets: visibleRects
+        .filter(item => item.id && (item.kind !== kind || item.id !== id))
+        .map(item => item.rect),
+      bounds: displayLayout?.displays?.length
+        ? displayLayout.displays.map(display => display.workArea)
+        : viewportBounds
     };
+    setWindowSnapGuides({});
+  };
+
+  const handleSketchMouseDown = (e: React.MouseEvent, id: string) => {
+    if (e.button !== 0) return;
+    const target = e.target as Element;
+    if (!target.closest('.floating-sketch-drag-handle')) return;
+    if (target.closest('button, input, textarea, select, a, [role="button"], [contenteditable="true"]')) return;
+    const sketch = floatingSketches.find(s => s.id === id);
+    if (!sketch || sketch.isLocked) return;
+
+    e.preventDefault();
+    e.stopPropagation();
+    prepareFloatingWindowSnap('sketch', sketch.id, sketch.width, sketch.height);
+    setTopWindowId(id);
+    setDraggingSketchId(id);
+    dragSketchOffset.current = {
+      x: e.clientX - sketch.x,
+      y: e.clientY - sketch.y
+    };
+    beginImperativeWindowMove('sketch', sketch.id, sketch.x, sketch.y);
+  };
+
+  const handleSketchResizeMouseDown = (e: React.MouseEvent, id: string, edge: WindowResizeEdge) => {
+    if (e.button !== 0) return;
+    const sketch = floatingSketches.find(s => s.id === id);
+    if (!sketch || sketch.isLocked) return;
+
+    e.preventDefault();
+    e.stopPropagation();
+    setResizingSketchId(id);
+    setTopWindowId(id);
+    resizeSketchStart.current = {
+      pointerX: e.clientX,
+      pointerY: e.clientY,
+      x: sketch.x,
+      y: sketch.y,
+      width: sketch.width,
+      height: sketch.height,
+      edge
+    };
+  };
+
+  const beginFloatingImageWindowDrag = (clientX: number, clientY: number, img: FloatingImage) => {
+    prepareFloatingWindowSnap(
+      'image',
+      img.id,
+      img.width,
+      img.height || (isOfficeDocument(img.type) ? OFFICE_DOCUMENT_DEFAULT_HEIGHT : FLOATING_MEDIA_FALLBACK_HEIGHT)
+    );
     dragFloatingOffset.current = {
       x: clientX - img.x,
       y: clientY - img.y
     };
-    setImageSnapGuides({});
+    beginImperativeWindowMove('image', img.id, img.x, img.y);
     setTopWindowId(img.id);
     setDraggingFloatingId(img.id);
   };
 
   const handleFloatingMouseDown = (e: React.MouseEvent, id: string) => {
-    // Only drag by the header/drag-handle
-    if ((e.target as HTMLElement).closest('.floating-drag-handle')) {
-      e.stopPropagation();
-      const img = floatingImages.find(f => f.id === id);
-      if (img) {
-        beginFloatingImageWindowDrag(e.clientX, e.clientY, img);
-      }
-    }
+    if (e.button !== 0) return;
+    const target = e.target as Element;
+    if (!target.closest('.floating-drag-handle, .floating-office-drag-handle')) return;
+    if (target.closest('button, input, textarea, select, a, [role="button"], [contenteditable="true"], [data-window-drag-block="true"]')) return;
+
+    const img = floatingImages.find(f => f.id === id);
+    if (!img || img.isLocked) return;
+
+    e.preventDefault();
+    e.stopPropagation();
+    beginFloatingImageWindowDrag(e.clientX, e.clientY, img);
   };
 
   const startFloatingImageDrag = (e: React.MouseEvent, id: string) => {
@@ -3602,7 +3907,7 @@ export default function App() {
     const target = e.target as HTMLElement;
     if (target.closest('button, input, textarea, .no-window-drag')) return;
     const img = floatingImages.find(f => f.id === id);
-    if (!img || img.isLocked || img.type === 'pdf') return;
+    if (!img || img.isLocked || (img.type || 'image') !== 'image') return;
 
     e.preventDefault();
     e.stopPropagation();
@@ -3610,53 +3915,99 @@ export default function App() {
   };
 
   const handleNoteMouseDown = (e: React.MouseEvent, id: string) => {
-    if ((e.target as HTMLElement).closest('.floating-note-drag-handle')) {
-      e.stopPropagation();
-      setDraggingNoteId(id);
-      const note = floatingNotes.find(n => n.id === id);
-      if (note) {
-        dragNoteOffset.current = {
-          x: e.clientX - note.x,
-          y: e.clientY - note.y
-        };
-      }
-    }
+    if (e.button !== 0) return;
+    const target = e.target as Element;
+    if (!target.closest('.floating-note-drag-handle')) return;
+    if (target.closest('button, input, textarea, select, a, [role="button"], [contenteditable="true"]')) return;
+    const note = floatingNotes.find(n => n.id === id);
+    if (!note || note.isLocked) return;
+
+    e.preventDefault();
+    e.stopPropagation();
+    prepareFloatingWindowSnap('note', note.id, note.width, note.height);
+    setTopWindowId(id);
+    setDraggingNoteId(id);
+    dragNoteOffset.current = {
+      x: e.clientX - note.x,
+      y: e.clientY - note.y
+    };
+    beginImperativeWindowMove('note', note.id, note.x, note.y);
   };
 
-  const handleFloatingResizeMouseDown = (e: React.MouseEvent, id: string, edge: HorizontalResizeEdge) => {
+  const handleFloatingResizeMouseDown = (e: React.MouseEvent, id: string, edge: WindowResizeEdge) => {
     if (e.button !== 0) return;
+    const img = floatingImages.find(f => f.id === id);
+    if (!img || img.isLocked) return;
+
     e.preventDefault();
     e.stopPropagation();
     setResizingFloatingId(id);
     setTopWindowId(id);
-    setImageSnapGuides({});
-    const img = floatingImages.find(f => f.id === id);
-    if (img) {
-      resizeStart.current = {
-        pointerX: e.clientX,
-        x: img.x,
-        width: img.width,
-        edge
-      };
-    }
+    setWindowSnapGuides({});
+    const windowRect = findFloatingWindowElement('image', id)?.getBoundingClientRect();
+    resizeStart.current = {
+      pointerX: e.clientX,
+      pointerY: e.clientY,
+      x: img.x,
+      y: img.y,
+      width: img.width,
+      height: img.height || windowRect?.height || (isOfficeDocument(img.type) ? OFFICE_DOCUMENT_DEFAULT_HEIGHT : FLOATING_MEDIA_FALLBACK_HEIGHT),
+      edge
+    };
   };
 
-  const handleNoteResizeMouseDown = (e: React.MouseEvent, id: string) => {
+  const handleNoteResizeMouseDown = (e: React.MouseEvent, id: string, edge: WindowResizeEdge) => {
+    if (e.button !== 0) return;
+    const note = floatingNotes.find(n => n.id === id);
+    if (!note || note.isLocked) return;
+
+    e.preventDefault();
     e.stopPropagation();
     setResizingNoteId(id);
-    const note = floatingNotes.find(n => n.id === id);
-    if (note) {
-      resizeNoteStart.current = {
-        x: e.clientX,
-        y: e.clientY,
-        width: note.width,
-        height: note.height
-      };
-    }
+    setTopWindowId(id);
+    resizeNoteStart.current = {
+      pointerX: e.clientX,
+      pointerY: e.clientY,
+      x: note.x,
+      y: note.y,
+      width: note.width,
+      height: note.height,
+      edge,
+      lockAspectRatio: Boolean(note.lockAspectRatio)
+    };
   };
 
   useEffect(() => {
+    const finishGlobalInteraction = () => {
+      // Save pill dimensions if they were changed.
+      if (isResizingPill) {
+        localStorage.setItem('ref-flow-pill-dim-vert', JSON.stringify(pillDimensions));
+      }
+      if (isDraggingPill || isResizingPill) {
+        setPosition(current => clampPillToConnectedDisplay(current));
+      }
+
+      commitImperativeWindowMove();
+      setIsResizingPill(false);
+      setIsDraggingPill(false);
+      setDraggingFloatingId(null);
+      setResizingFloatingId(null);
+      setWindowSnapGuides({});
+      setDraggingNoteId(null);
+      setResizingNoteId(null);
+      setDraggingSketchId(null);
+      setResizingSketchId(null);
+      ticking.current = false;
+    };
+
     const handleGlobalMouseMove = (e: MouseEvent) => {
+      // A mouse-up can be delivered to another app or display surface. The
+      // buttons bitmask lets the next move recover instead of leaving a drag
+      // permanently latched.
+      if (e.buttons === 0) {
+        finishGlobalInteraction();
+        return;
+      }
       if (ticking.current) return;
       ticking.current = true;
 
@@ -3685,13 +4036,11 @@ export default function App() {
           setPosition({ x: newX, y: newY });
         }
 
-        if (draggingFloatingId) {
-          const rawX = e.clientX - dragFloatingOffset.current.x;
-          const rawY = e.clientY - dragFloatingOffset.current.y;
+        const previewSnappedWindowMove = (rawX: number, rawY: number) => {
           const geometry = dragFloatingGeometry.current;
           const movingRect = {
             x: rawX,
-            y: rawY - FLOATING_IMAGE_TOOLBAR_HEIGHT,
+            y: rawY - geometry.toolbarHeight,
             width: geometry.width,
             height: geometry.height
           };
@@ -3704,52 +4053,41 @@ export default function App() {
                 FLOATING_WINDOW_SNAP_THRESHOLD,
                 FLOATING_WINDOW_SNAP_GAP
               );
-          const snappedY = snapped.y + FLOATING_IMAGE_TOOLBAR_HEIGHT;
-          setImageSnapGuides(current => (
+          const snappedY = snapped.y + geometry.toolbarHeight;
+          setWindowSnapGuides(current => (
             current.x === snapped.guideX && current.y === snapped.guideY
               ? current
               : { x: snapped.guideX, y: snapped.guideY }
           ));
-          setFloatingImages(prev => prev.map(img => {
-            if (img.id === draggingFloatingId) {
-              return { ...img, x: snapped.x, y: snappedY };
-            }
-            return img;
-          }));
+          previewImperativeWindowMove(snapped.x, snappedY);
+        };
+
+        if (draggingFloatingId) {
+          const rawX = e.clientX - dragFloatingOffset.current.x;
+          const rawY = e.clientY - dragFloatingOffset.current.y;
+          previewSnappedWindowMove(rawX, rawY);
         }
 
         if (draggingNoteId) {
-          setFloatingNotes(prev => prev.map(note => {
-            if (note.id === draggingNoteId) {
-              let newX = e.clientX - dragNoteOffset.current.x;
-              let newY = e.clientY - dragNoteOffset.current.y;
-              
-              return { ...note, x: newX, y: newY };
-            }
-            return note;
-          }));
+          const rawX = e.clientX - dragNoteOffset.current.x;
+          const rawY = e.clientY - dragNoteOffset.current.y;
+          previewSnappedWindowMove(rawX, rawY);
         }
 
         if (draggingSketchId) {
-          setFloatingSketches(prev => prev.map(sketch => {
-            if (sketch.id === draggingSketchId) {
-              let newX = e.clientX - dragSketchOffset.current.x;
-              let newY = e.clientY - dragSketchOffset.current.y;
-              
-              return { ...sketch, x: newX, y: newY };
-            }
-            return sketch;
-          }));
+          const rawX = e.clientX - dragSketchOffset.current.x;
+          const rawY = e.clientY - dragSketchOffset.current.y;
+          previewSnappedWindowMove(rawX, rawY);
         }
 
         if (resizingFloatingId) {
           setFloatingImages(prev => prev.map(img => {
             if (img.id === resizingFloatingId) {
-              const resized = resizeWindowHorizontally(resizeStart.current, e.clientX, 100);
+              const minimumWidth = isOfficeDocument(img.type) ? OFFICE_DOCUMENT_MIN_WIDTH : FLOATING_MEDIA_MIN_WIDTH;
+              const minimumHeight = isOfficeDocument(img.type) ? OFFICE_DOCUMENT_MIN_HEIGHT : FLOATING_MEDIA_MIN_HEIGHT;
               return {
                 ...img,
-                x: resized.x,
-                width: resized.width
+                ...resizeWindowFromEdge(resizeStart.current, e.clientX, e.clientY, minimumWidth, minimumHeight)
               };
             }
             return img;
@@ -3759,12 +4097,14 @@ export default function App() {
         if (resizingNoteId) {
           setFloatingNotes(prev => prev.map(note => {
             if (note.id === resizingNoteId) {
-              const diffX = e.clientX - resizeNoteStart.current.x;
-              const diffY = e.clientY - resizeNoteStart.current.y;
+              // Shift temporarily switches the saved resize mode, so both
+              // free and proportional sizing are always available.
+              const keepAspectRatio = resizeNoteStart.current.lockAspectRatio !== e.shiftKey;
               return {
                 ...note,
-                width: Math.max(320, resizeNoteStart.current.width + diffX),
-                height: Math.max(100, resizeNoteStart.current.height + diffY)
+                ...(keepAspectRatio
+                  ? resizeWindowWithAspectRatio(resizeNoteStart.current, e.clientX, e.clientY, FLOATING_NOTE_MIN_WIDTH, FLOATING_NOTE_MIN_HEIGHT)
+                  : resizeWindowFromEdge(resizeNoteStart.current, e.clientX, e.clientY, FLOATING_NOTE_MIN_WIDTH, FLOATING_NOTE_MIN_HEIGHT))
               };
             }
             return note;
@@ -3774,12 +4114,9 @@ export default function App() {
         if (resizingSketchId) {
           setFloatingSketches(prev => prev.map(sketch => {
             if (sketch.id === resizingSketchId) {
-              const diffX = e.clientX - resizeSketchStart.current.x;
-              const diffY = e.clientY - resizeSketchStart.current.y;
               return {
                 ...sketch,
-                width: Math.max(200, resizeSketchStart.current.width + diffX),
-                height: Math.max(200, resizeSketchStart.current.height + diffY)
+                ...resizeWindowFromEdge(resizeSketchStart.current, e.clientX, e.clientY, 200, 200)
               };
             }
             return sketch;
@@ -3787,35 +4124,28 @@ export default function App() {
         }
       });
     };
-    const handleGlobalMouseUp = () => {
-      // Save pill dimensions if they were changed
-      if (isResizingPill) {
-        localStorage.setItem('ref-flow-pill-dim-vert', JSON.stringify(pillDimensions));
-      }
-      if (isDraggingPill || isResizingPill) {
-        setPosition(current => clampPillToConnectedDisplay(current));
-      }
-
-      setIsResizingPill(false);
-      setIsDraggingPill(false);
-      setDraggingFloatingId(null);
-      setResizingFloatingId(null);
-      setImageSnapGuides({});
-      setDraggingNoteId(null);
-      setResizingNoteId(null);
-      setDraggingSketchId(null);
-      setResizingSketchId(null);
+    const handleWindowMouseLeave = (event: MouseEvent) => {
+      if (event.buttons === 0) finishGlobalInteraction();
+    };
+    const handleVisibilityChange = () => {
+      if (document.hidden) finishGlobalInteraction();
     };
 
     if (isResizingPill || isDraggingPill || draggingFloatingId || resizingFloatingId || draggingNoteId || resizingNoteId || draggingSketchId || resizingSketchId) {
       window.addEventListener('mousemove', handleGlobalMouseMove);
-      window.addEventListener('mouseup', handleGlobalMouseUp);
+      window.addEventListener('mouseup', finishGlobalInteraction);
+      window.addEventListener('blur', finishGlobalInteraction);
+      window.addEventListener('mouseleave', handleWindowMouseLeave);
+      document.addEventListener('visibilitychange', handleVisibilityChange);
     }
     return () => {
       window.removeEventListener('mousemove', handleGlobalMouseMove);
-      window.removeEventListener('mouseup', handleGlobalMouseUp);
+      window.removeEventListener('mouseup', finishGlobalInteraction);
+      window.removeEventListener('blur', finishGlobalInteraction);
+      window.removeEventListener('mouseleave', handleWindowMouseLeave);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
     };
-  }, [isResizingPill, isDraggingPill, draggingFloatingId, resizingFloatingId, draggingNoteId, resizingNoteId, draggingSketchId, resizingSketchId, pillDimensions, clampPillToConnectedDisplay, isRetracted]);
+  }, [isResizingPill, isDraggingPill, draggingFloatingId, resizingFloatingId, draggingNoteId, resizingNoteId, draggingSketchId, resizingSketchId, pillDimensions, clampPillToConnectedDisplay, isRetracted, commitImperativeWindowMove, previewImperativeWindowMove]);
 
   // Handle Drag & Drop of Images
   const [isDragOver, setIsDragOver] = useState(false);
@@ -3868,7 +4198,7 @@ export default function App() {
   const triggerNativeFilePicker = () => {
     const input = document.createElement('input');
     input.type = 'file';
-    input.accept = 'image/*,application/pdf';
+    input.accept = SUPPORTED_MEDIA_ACCEPT;
     input.multiple = true;
     input.onchange = async (e: any) => {
       if (e.target.files) {
@@ -4219,22 +4549,34 @@ export default function App() {
 
   return (
     <div className={`w-screen h-screen overflow-hidden pointer-events-none relative ${reduceLargeBoardEffects ? 'large-board-performance' : ''}`} style={{ WebkitAppRegion: 'no-drag' } as any}>
-      {draggingFloatingId && imageSnapGuides.x !== undefined && (
+      {(draggingFloatingId || draggingNoteId || draggingSketchId) && windowSnapGuides.x !== undefined && (
         <div
+          data-window-snap-guide="x"
           className="absolute inset-y-0 z-[89990] w-px bg-sky-400/90 shadow-[0_0_8px_rgba(56,189,248,0.9)] pointer-events-none"
-          style={{ left: imageSnapGuides.x }}
+          style={{ left: windowSnapGuides.x }}
         />
       )}
-      {draggingFloatingId && imageSnapGuides.y !== undefined && (
+      {(draggingFloatingId || draggingNoteId || draggingSketchId) && windowSnapGuides.y !== undefined && (
         <div
+          data-window-snap-guide="y"
           className="absolute inset-x-0 z-[89990] h-px bg-sky-400/90 shadow-[0_0_8px_rgba(56,189,248,0.9)] pointer-events-none"
-          style={{ top: imageSnapGuides.y }}
+          style={{ top: windowSnapGuides.y }}
         />
       )}
 
       {/* Global Drag Overlay to prevent mouse events being swallowed by canvas/iframes/pill while dragging */}
       {(isDraggingPill || draggingFloatingId || draggingNoteId || draggingSketchId || resizingFloatingId || resizingNoteId || resizingSketchId || isResizingPill) && (
-        <div className={`absolute inset-0 z-[100000] pointer-events-auto ${resizingFloatingId ? 'cursor-ew-resize' : ((resizingNoteId || resizingSketchId || isResizingPill) ? 'cursor-nwse-resize' : 'cursor-move')}`} />
+        <div className={`absolute inset-0 z-[100000] pointer-events-auto ${
+          resizingFloatingId
+            ? getWindowResizeCursorClass(resizeStart.current.edge)
+            : resizingNoteId
+              ? getWindowResizeCursorClass(resizeNoteStart.current.edge)
+              : resizingSketchId
+                ? getWindowResizeCursorClass(resizeSketchStart.current.edge)
+                : isResizingPill
+                  ? 'cursor-nwse-resize'
+                  : 'cursor-move'
+        }`} />
       )}
 
       {!isLoading && floatingImages.length === 0 && floatingNotes.length === 0 && floatingSketches.length === 0 && !showManager && !showSearchComponent && !showSettings && (
@@ -4257,7 +4599,7 @@ export default function App() {
               <div className="min-w-0">
                 <h2 className="text-lg font-semibold tracking-tight">Start a reference board</h2>
                 <p className="mt-1 text-sm text-slate-500 dark:text-slate-400 leading-6">
-                  Drop images or PDFs anywhere, paste a URL from search, or create notes and sketches beside your references.
+                  Drop images, PDFs, Word documents, or Excel workbooks anywhere, paste a URL from search, or create notes and sketches beside your references.
                 </p>
               </div>
             </div>
@@ -4391,16 +4733,16 @@ export default function App() {
                            key={img.id} 
                            className={`relative group rounded-xl overflow-hidden border-2 transition-all cursor-pointer shrink-0 w-20 h-20 bg-black/20 flex items-center justify-center ${img.isCollapsed ? 'border-dashed border-slate-500/50 opacity-60' : 'border-transparent hover:border-sky-400'}`}
                          >
-                           {img.type === 'pdf' ? (
-                             <div 
+                           {img.type === 'pdf' || isOfficeDocument(img.type) ? (
+                              <div
                                className="text-[10px] text-slate-400 font-mono text-center w-full h-full flex flex-col items-center justify-center" 
                                onClick={() => {
                                  setFloatingImages(prev => prev.map(f => f.id === img.id ? {...f, isCollapsed: false} : f));
                                  setTopWindowId(img.id);
                                }}
                              >
-                               <FileText className="w-5 h-5 mb-1 text-sky-400" />
-                               <span className="text-[9px] truncate max-w-[70px]">PDF</span>
+                                <FileText className={`w-5 h-5 mb-1 ${img.type === 'xlsx' ? 'text-emerald-400' : 'text-sky-400'}`} />
+                                <span className="text-[9px] truncate max-w-[70px]">{(img.type || 'file').toUpperCase()}</span>
                              </div>
                            ) : (
                               <img
@@ -4505,7 +4847,7 @@ export default function App() {
 
                 {/* Bottom Controls */}
                 <div className="mt-2 shrink-0 border-t border-white/5 pt-2 w-full flex flex-wrap justify-center gap-2 drag-handle cursor-move">
-                  <button 
+                  <button
                     onClick={openProjectManager}
                     className="w-10 h-10 rounded-xl bg-sky-500/10 border border-sky-500/30 flex items-center justify-center hover:bg-sky-500/20 transition-colors text-sky-400 group"
                     title="Full Screen Manager"
@@ -4538,7 +4880,11 @@ export default function App() {
                     <Plus className="w-5 h-5 group-hover:scale-110 transition-transform" />
                   </button>
                   <button 
-                    onClick={() => { setShowSearchComponent(!showSearchComponent); setShowSettings(false); }}
+                    onClick={() => {
+                      setShowSearchComponent(!showSearchComponent);
+                      setShowSettings(false);
+                      setShowProviderSettings(false);
+                    }}
                     className={`w-10 h-10 rounded-xl flex items-center justify-center transition-colors border ${
                       showSearchComponent
                         ? 'bg-sky-500 text-white border-sky-500'
@@ -4552,7 +4898,12 @@ export default function App() {
                   </button>
                   
                   <button 
-                    onClick={() => { setShowSettings(!showSettings); setShowSearchComponent(false); }}
+                    onClick={() => {
+                      const nextShowSettings = !showSettings;
+                      setShowSettings(nextShowSettings);
+                      setShowProviderSettings(false);
+                      setShowSearchComponent(false);
+                    }}
                     className={`relative w-10 h-10 rounded-full flex items-center justify-center transition-colors ${
                       showSettings
                         ? (theme === 'dark' ? 'bg-white/20 text-white' : 'bg-slate-200 text-slate-900')
@@ -4583,6 +4934,7 @@ export default function App() {
         </div>
       </motion.div>
       )}
+      </AnimatePresence>
 
       {/* 
         ============================================================
@@ -4590,13 +4942,13 @@ export default function App() {
         ============================================================
       */}
       <AnimatePresence>
-        {showSettings && (
+        {showSettings && !showProviderSettings && (
           <motion.div 
             initial={{ opacity: 0, x: -10, scale: 0.95 }}
             animate={{ opacity: 1, x: 0, scale: 1 }}
             exit={{ opacity: 0, x: -10, scale: 0.95 }}
             transition={{ duration: 0.2 }}
-                  className={`settings-panel light-contrast-panel absolute pointer-events-auto border p-5 rounded-[24px] shadow-2xl w-64 text-sm font-sans z-[99999] ${theme === 'light' ? 'bg-white border-black/10 text-slate-900' : 'bg-[#1e1e24] border-white/10 text-slate-200'}`}
+                  className={`settings-panel light-contrast-panel absolute pointer-events-auto border p-5 rounded-[24px] shadow-2xl w-80 max-w-[calc(100vw-1rem)] text-sm font-sans z-[99999] ${theme === 'light' ? 'bg-white border-black/10 text-slate-900' : 'bg-[#1e1e24] border-white/10 text-slate-200'}`}
             style={{
               top: position.y,
               left: position.x + (isRetracted ? retractedPillSize : pillDimensions.width) + 16,
@@ -4604,7 +4956,7 @@ export default function App() {
           >
           <div className={`flex items-center justify-between mb-4 pb-2 border-b ${theme === 'light' ? 'border-black/10' : 'border-white/10'}`}>
             <h3 className="font-bold uppercase tracking-widest text-[11px] text-slate-600 dark:text-slate-400 drag-handle cursor-move flex-1" onMouseDown={handlePillMouseDown}>Settings App</h3>
-            <button onClick={() => setShowSettings(false)} className="text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white p-1 hover:bg-black/10 dark:hover:bg-white/10 rounded">
+            <button onClick={() => { setShowSettings(false); setShowProviderSettings(false); }} className="text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white p-1 hover:bg-black/10 dark:hover:bg-white/10 rounded">
               <X className="w-4 h-4" />
             </button>
           </div>
@@ -4649,12 +5001,16 @@ export default function App() {
                 type="checkbox" 
                 className="w-4 h-4 rounded border-slate-600 bg-slate-900 accent-sky-500"
                 checked={startOnBoot}
-                onChange={(e) => {
-                  setStartOnBoot(e.target.checked);
-                }}
+                disabled={startOnBootStatus.phase === 'checking' || startOnBootStatus.phase === 'saving' || startOnBootStatus.phase === 'unavailable'}
+                onChange={(e) => { void changeStartOnBoot(e.target.checked); }}
+                aria-label="Start on Boot"
               />
               <span className="text-xs text-slate-700 dark:text-slate-300 group-hover:text-slate-950 dark:group-hover:text-white transition-colors">Start on Boot</span>
             </label>
+
+            <p className={`-mt-2 pl-7 text-[9px] leading-4 ${startOnBootStatus.phase === 'error' ? 'text-red-500' : startOnBootStatus.phase === 'saving' ? 'text-sky-500' : 'text-slate-500 dark:text-slate-400'}`} data-start-on-boot-status>
+              {startOnBootStatus.message}
+            </p>
 
             <label className="flex items-center space-x-3 cursor-pointer group">
               <input
@@ -4739,85 +5095,21 @@ export default function App() {
             </div>
 
             <div className={`pt-3 border-t space-y-3 ${theme === 'light' ? 'border-black/10' : 'border-white/5'}`}>
-              <div className="flex justify-between items-center">
-                <span className="text-[10px] text-slate-500 uppercase tracking-wider block font-bold">Search Providers</span>
-                <button 
-                  onClick={() => setShowDiagnosticsModal(true)}
-                  className="text-[9px] text-sky-400 hover:text-sky-300 font-mono transition-colors border border-sky-400/30 bg-sky-400/10 px-1.5 py-0.5 rounded"
-                >
-                  Diagnostics
-                </button>
-              </div>
-              <div className="space-y-2">
-                {providerOrder.map((provider, index) => {
-                  const conf = getProviderConfig(provider);
-                  return (
-                  <div key={provider} className="flex flex-col gap-1.5 bg-slate-100 dark:bg-black/10 border border-slate-300 dark:border-white/5 p-2 rounded-lg">
-                    <div className="flex items-center justify-between">
-                      <div className="flex items-center gap-2">
-                        {/* Drag Handle / Reorder */}
-                        <div className="flex flex-col items-center justify-center shrink-0 w-4">
-                           <button 
-                               className={`text-[8px] ${index === 0 ? 'text-transparent pointer-events-none' : 'text-slate-600 dark:text-slate-400 hover:text-sky-500'}`}
-                               onClick={() => {
-                                   const newOrd = [...providerOrder];
-                                   [newOrd[index - 1], newOrd[index]] = [newOrd[index], newOrd[index - 1]];
-                                   updateProviderOrder(newOrd);
-                               }}
-                           >
-                               ▲
-                           </button>
-                           <button 
-                               className={`text-[8px] ${index === providerOrder.length - 1 ? 'text-transparent pointer-events-none' : 'text-slate-600 dark:text-slate-400 hover:text-sky-500'}`}
-                               onClick={() => {
-                                   const newOrd = [...providerOrder];
-                                   [newOrd[index + 1], newOrd[index]] = [newOrd[index], newOrd[index + 1]];
-                                   updateProviderOrder(newOrd);
-                               }}
-                           >
-                               ▼
-                           </button>
-                        </div>
-                        <span className="text-[11px] font-semibold text-slate-950 dark:text-slate-100">
-                          {provider === 'BingVisualSearch' ? 'Bing Visual Search' : provider === 'YandexImages' ? 'Yandex Images' : provider}
-                        </span>
-                      </div>
-                      <div className="flex items-center gap-2">
-                         <button 
-                            onClick={() => {
-                                updateProviderStatus({ ...providerStatus, [provider]: { ...providerStatus[provider], enabled: !conf.isEnabled } });
-                            }}
-                            className={`w-8 h-4 rounded-full flex items-center p-0.5 transition-colors ${conf.isEnabled ? 'bg-sky-500' : 'bg-slate-700'}`}
-                         >
-                            <div className={`w-3 h-3 bg-white rounded-full shadow-sm transition-transform ${conf.isEnabled ? 'translate-x-4' : 'translate-x-0'}`} />
-                         </button>
-                      </div>
-                    </div>
-                    <div className="flex items-center justify-between pl-6">
-                      <span className={`text-[9px] font-mono ${
-                        conf.badge === 'Ready'
-                          ? 'text-green-700 dark:text-green-400'
-                          : conf.badge === 'API Key Required'
-                            ? 'text-amber-700 dark:text-amber-400'
-                            : conf.badge === 'Disabled'
-                              ? 'text-slate-700 dark:text-slate-400'
-                              : 'text-red-700 dark:text-red-400'
-                      }`}>
-                        {conf.badge}
-                      </span>
-                      {provider !== 'Wikimedia Commons' && (
-                        <button 
-                            onClick={() => { setConfigModalProvider(provider); setConfigTestStatus('idle'); }}
-                            className="text-[9px] text-slate-800 dark:text-slate-300 hover:text-slate-950 dark:hover:text-white px-2 py-0.5 bg-white dark:bg-white/5 hover:bg-slate-200 dark:hover:bg-white/10 border border-slate-300 dark:border-white/10 rounded transition-colors"
-                        >
-                            Configure
-                        </button>
-                      )}
-                    </div>
-                  </div>
-                  );
-                })}
-              </div>
+              <button
+                type="button"
+                onClick={() => setShowProviderSettings(true)}
+                className={`w-full flex items-center gap-3 rounded-xl border p-3 text-left transition-colors ${theme === 'light' ? 'border-black/10 bg-black/[0.03] hover:bg-black/[0.07]' : 'border-white/10 bg-white/[0.04] hover:bg-white/[0.08]'}`}
+                title="Manage Search Providers and API keys"
+              >
+                <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-sky-500/15 text-sky-500">
+                  <Search className="h-4 w-4" />
+                </div>
+                <div className="min-w-0 flex-1">
+                  <span className="block text-[11px] font-semibold text-slate-900 dark:text-slate-100">Search Providers</span>
+                  <span className="block text-[9px] leading-4 text-slate-500 dark:text-slate-400">API keys, order, connection tests, and diagnostics</span>
+                </div>
+                <ChevronRight className="h-4 w-4 shrink-0 text-slate-400" />
+              </button>
             </div>
 
             <div className="pt-3 border-t border-white/5 space-y-2">
@@ -4839,6 +5131,7 @@ export default function App() {
 
             <div className="pt-3 border-t border-white/5 space-y-2">
               <span className="text-[10px] text-slate-500 uppercase tracking-wider block">Shortcuts</span>
+              <p className="text-[9px] leading-4 text-slate-500">Focus a binding and press the full combination you want, such as Shift + M. Unassign disables it.</p>
               {[
                 { key: 'minimize', label: 'Minimize/Expand pill' },
                 { key: 'newNote', label: 'New Note' },
@@ -4848,27 +5141,54 @@ export default function App() {
                 { key: 'closeApp', label: 'Close Application' },
                 { key: 'flipBoards', label: 'Flip Boards' },
                 { key: 'toggleWindows', label: 'Show/Hide Windows' },
-              ].map(({ key, label }) => (
-                <div key={key} className="flex items-center justify-between py-0.5">
-                  <span className="text-[11px] text-slate-400">{label}</span>
-                  <div className="flex items-center space-x-1 shrink-0">
-                    <span className="text-[10px] text-slate-500 font-mono">ctrl+alt+</span>
-                    <input
-                      type="text"
-                      maxLength={1}
-                      value={((shortcuts as any)[key] || '').replace('ctrl+alt+', '')}
-                      onChange={(e) => {
-                        const char = e.target.value.toLowerCase().trim();
-                        if (!char) return;
-                        const newShortcuts = { ...shortcuts, [key]: `ctrl+alt+${char}` };
-                        setShortcuts(newShortcuts);
-                        localStorage.setItem('ref-flow-shortcuts', JSON.stringify(newShortcuts));
-                      }}
-                      className="w-5 h-6 bg-black/20 border border-white/10 rounded text-center text-xs text-sky-400 font-bold outline-none focus:border-sky-500 font-mono"
-                    />
+              ].map(({ key, label }) => {
+                const combo = (shortcuts as Record<string, string>)[key] || '';
+                const parsed = parseShortcut(combo);
+                const displayValue = combo
+                  ? [parsed.ctrl && 'Ctrl', parsed.alt && 'Alt', parsed.shift && 'Shift', parsed.meta && 'Win', shortcutKeyLabel(parsed.key)].filter(Boolean).join(' + ')
+                  : 'Unassigned';
+                return (
+                  <div key={key} className="grid grid-cols-[minmax(0,1fr)_9.5rem] items-center gap-3 py-1" data-shortcut-row>
+                    <span className="min-w-0 break-words text-[10px] leading-4 text-slate-400" data-shortcut-label>{label}</span>
+                    <div className="grid min-w-0 grid-cols-[minmax(0,1fr)_auto] items-center gap-1" data-shortcut-controls>
+                      <input
+                        type="text"
+                        readOnly
+                        value={displayValue}
+                        onKeyDown={(event) => {
+                          event.preventDefault();
+                          event.stopPropagation();
+                          if (event.key === 'Backspace' || event.key === 'Delete') {
+                            setShortcutBinding(key, '');
+                            return;
+                          }
+                          const capturedKey = normalizeShortcutKey(event);
+                          if (!capturedKey || (!event.ctrlKey && !event.altKey && !event.shiftKey && !event.metaKey)) return;
+                          setShortcutBinding(key, buildShortcut({
+                            ctrl: event.ctrlKey,
+                            alt: event.altKey,
+                            shift: event.shiftKey,
+                            meta: event.metaKey,
+                            key: capturedKey
+                          }));
+                        }}
+                        className={`h-7 w-full min-w-0 cursor-pointer rounded border px-1.5 text-center font-mono text-[9px] font-bold outline-none focus:border-sky-500 ${combo ? 'border-white/10 bg-black/20 text-sky-400' : 'border-dashed border-white/10 bg-black/10 text-slate-500'}`}
+                        title="Click, then press the complete shortcut combination"
+                        aria-label={`${label} shortcut`}
+                      />
+                      <button
+                        type="button"
+                        onClick={() => setShortcutBinding(key, '')}
+                        disabled={!combo}
+                        className="rounded px-1 py-1 text-[9px] text-slate-500 hover:bg-rose-500/20 hover:text-rose-400 disabled:opacity-30"
+                        title={`Unassign ${label}`}
+                      >
+                        Clear
+                      </button>
+                    </div>
                   </div>
-                </div>
-              ))}
+                );
+              })}
             </div>
 
             <div className={`pt-3 border-t ${theme === 'light' ? 'border-black/10' : 'border-white/5'}`}>
@@ -4896,7 +5216,137 @@ export default function App() {
       </AnimatePresence>
 
       <AnimatePresence>
-        {configModalProvider && (
+        {showSettings && showProviderSettings && (
+          <motion.div
+            initial={{ opacity: 0, x: 10, scale: 0.96 }}
+            animate={{ opacity: 1, x: 0, scale: 1 }}
+            exit={{ opacity: 0, x: 10, scale: 0.96 }}
+            transition={{ duration: 0.18 }}
+            className={`settings-panel provider-settings-panel light-contrast-panel absolute pointer-events-auto border p-5 rounded-[24px] shadow-2xl w-72 text-sm font-sans z-[99999] ${theme === 'light' ? 'bg-white border-black/10 text-slate-900' : 'bg-[#1e1e24] border-white/10 text-slate-200'}`}
+            style={{
+              top: position.y,
+              left: position.x + (isRetracted ? retractedPillSize : pillDimensions.width) + 16,
+            }}
+            data-settings-section="providers"
+          >
+            <div className={`flex items-center gap-2 mb-4 pb-2 border-b ${theme === 'light' ? 'border-black/10' : 'border-white/10'}`}>
+              <button
+                type="button"
+                onClick={() => setShowProviderSettings(false)}
+                className="shrink-0 text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white p-1 hover:bg-black/10 dark:hover:bg-white/10 rounded"
+                title="Back to Settings"
+              >
+                <ChevronLeft className="w-4 h-4" />
+              </button>
+              <h3 className="min-w-0 flex-1 font-bold uppercase tracking-widest text-[11px] text-slate-600 dark:text-slate-400 drag-handle cursor-move" onMouseDown={handlePillMouseDown}>Search Providers</h3>
+              <button
+                type="button"
+                onClick={() => setShowDiagnosticsModal(true)}
+                className="text-[9px] text-sky-500 hover:text-sky-400 font-mono transition-colors border border-sky-400/30 bg-sky-400/10 px-1.5 py-0.5 rounded"
+                title="Open Search Diagnostics"
+              >
+                Diagnostics
+              </button>
+              <button
+                type="button"
+                onClick={() => { setShowSettings(false); setShowProviderSettings(false); }}
+                className="shrink-0 text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white p-1 hover:bg-black/10 dark:hover:bg-white/10 rounded"
+                title="Close Search Providers"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <p className="mb-3 text-[10px] leading-4 text-slate-500 dark:text-slate-400">
+              Enable providers, change fallback order, and configure API access without crowding the main settings menu.
+            </p>
+
+            <div className="space-y-2 max-h-[75vh] overflow-y-auto no-scrollbar pr-0.5">
+              {providerOrder.map((provider, index) => {
+                const conf = getProviderConfig(provider);
+                const providerLabel = provider === 'BingVisualSearch'
+                  ? 'Bing Visual Search'
+                  : provider === 'YandexImages'
+                    ? 'Yandex Images'
+                    : provider;
+                return (
+                  <div key={provider} className="flex flex-col gap-1.5 bg-slate-100 dark:bg-black/10 border border-slate-300 dark:border-white/5 p-2 rounded-lg" data-provider={provider}>
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="flex min-w-0 items-center gap-2">
+                        <div className="flex flex-col items-center justify-center shrink-0 w-4">
+                          <button
+                            type="button"
+                            aria-label={`Move ${providerLabel} up`}
+                            className={`text-[8px] ${index === 0 ? 'text-transparent pointer-events-none' : 'text-slate-600 dark:text-slate-400 hover:text-sky-500'}`}
+                            onClick={() => {
+                              const newOrder = [...providerOrder];
+                              [newOrder[index - 1], newOrder[index]] = [newOrder[index], newOrder[index - 1]];
+                              updateProviderOrder(newOrder);
+                            }}
+                          >
+                            ▲
+                          </button>
+                          <button
+                            type="button"
+                            aria-label={`Move ${providerLabel} down`}
+                            className={`text-[8px] ${index === providerOrder.length - 1 ? 'text-transparent pointer-events-none' : 'text-slate-600 dark:text-slate-400 hover:text-sky-500'}`}
+                            onClick={() => {
+                              const newOrder = [...providerOrder];
+                              [newOrder[index + 1], newOrder[index]] = [newOrder[index], newOrder[index + 1]];
+                              updateProviderOrder(newOrder);
+                            }}
+                          >
+                            ▼
+                          </button>
+                        </div>
+                        <span className="truncate text-[11px] font-semibold text-slate-950 dark:text-slate-100">{providerLabel}</span>
+                      </div>
+                      <button
+                        type="button"
+                        role="switch"
+                        aria-checked={conf.isEnabled}
+                        aria-label={`${conf.isEnabled ? 'Disable' : 'Enable'} ${providerLabel}`}
+                        onClick={() => {
+                          updateProviderStatus({ ...providerStatus, [provider]: { ...providerStatus[provider], enabled: !conf.isEnabled } });
+                        }}
+                        className={`w-8 h-4 shrink-0 rounded-full flex items-center p-0.5 transition-colors ${conf.isEnabled ? 'bg-sky-500' : 'bg-slate-700'}`}
+                      >
+                        <div className={`w-3 h-3 bg-white rounded-full shadow-sm transition-transform ${conf.isEnabled ? 'translate-x-4' : 'translate-x-0'}`} />
+                      </button>
+                    </div>
+                    <div className="flex items-center justify-between gap-2 pl-6">
+                      <span className={`text-[9px] font-mono ${
+                        conf.badge === 'Ready'
+                          ? 'text-green-700 dark:text-green-400'
+                          : conf.badge === 'API Key Required'
+                            ? 'text-amber-700 dark:text-amber-400'
+                            : conf.badge === 'Disabled'
+                              ? 'text-slate-700 dark:text-slate-400'
+                              : 'text-red-700 dark:text-red-400'
+                      }`}>
+                        {conf.badge}
+                      </span>
+                      {provider !== 'Wikimedia Commons' && (
+                        <button
+                          type="button"
+                          onClick={() => { setConfigModalProvider(provider); setConfigTestStatus('idle'); }}
+                          className="text-[9px] text-slate-800 dark:text-slate-300 hover:text-slate-950 dark:hover:text-white px-2 py-0.5 bg-white dark:bg-white/5 hover:bg-slate-200 dark:hover:bg-white/10 border border-slate-300 dark:border-white/10 rounded transition-colors"
+                          title={`Configure ${providerLabel} API access`}
+                        >
+                          Configure
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      <AnimatePresence>
+        {configModalProvider && showSettings && showProviderSettings && (
           <motion.div 
             initial={{ opacity: 0, scale: 0.95 }}
             animate={{ opacity: 1, scale: 1 }}
@@ -5028,7 +5478,7 @@ export default function App() {
       </AnimatePresence>
 
       <AnimatePresence>
-        {showDiagnosticsModal && (
+        {showDiagnosticsModal && showSettings && showProviderSettings && (
           <motion.div 
             initial={{ opacity: 0, scale: 0.95 }}
             animate={{ opacity: 1, scale: 1 }}
@@ -5404,17 +5854,20 @@ export default function App() {
                           const nodeRequire = getNodeRequire();
                           const electron = nodeRequire ? nodeRequire('electron') : null;
                           if (electron && nodeRequire) {
-                              const path = nodeRequire('path');
-                              const originalExt = path.extname(floatingContextMenu.url.split('?')[0]) || '.jpg';
-                              const filename = `reference_image_${floatingContextMenu.id}${originalExt}`;
+                              const extension = getSavedMediaExtension(floatingContextMenu.url, floatingContextMenu.type || 'image');
+                              const filename = floatingContextMenu.fileName || `reference_${floatingContextMenu.id}.${extension}`;
+                              const filterName = extension === 'docx'
+                                ? 'Word Document'
+                                : extension === 'xlsx'
+                                  ? 'Excel Workbook'
+                                  : extension === 'pdf'
+                                    ? 'PDF Document'
+                                    : 'Image';
                               
                               const result = await electron.ipcRenderer.invoke('show-save-dialog', {
-                                  title: 'Save Reference Image',
+                                  title: isOfficeDocument(floatingContextMenu.type) ? 'Save Original Document' : 'Save Reference',
                                   defaultPath: filename,
-                                  filters: [
-                                      { name: 'Images', extensions: ['jpg', 'jpeg', 'png', 'webp', 'gif'] },
-                                      { name: 'All Files', extensions: ['*'] }
-                                  ]
+                                  filters: [{ name: filterName, extensions: [extension] }, { name: 'All Files', extensions: ['*'] }]
                               });
                               if (!result.canceled && result.filePath) {
                                   const fs = nodeRequire('fs');
@@ -5434,10 +5887,10 @@ export default function App() {
                           setFloatingContextMenu(null);
                       }}
                   >
-                      Save As...
+                      {isOfficeDocument(floatingContextMenu.type) ? 'Save Original As…' : 'Save As…'}
                   </button>
 
-                  {floatingContextMenu.type !== 'pdf' && (
+                  {(floatingContextMenu.type || 'image') === 'image' && (
                     <>
                       <button 
                           className="context-menu-button w-full text-left px-4 py-2 hover:bg-sky-500 hover:text-white transition-colors text-xs flex items-center gap-2"
@@ -5507,7 +5960,7 @@ export default function App() {
                setTopWindowId(img.id);
                setContextMenuTempPath('');
                applyCentralizedIgnoreMouseEvents(false);
-               setFloatingContextMenu({ x: e.clientX, y: e.clientY, id: img.id, url: img.url, type: img.type || 'image' });
+               setFloatingContextMenu({ x: e.clientX, y: e.clientY, id: img.id, url: img.url, type: img.type || 'image', fileName: img.fileName });
             }}
             style={{
               left: img.x,
@@ -5521,7 +5974,7 @@ export default function App() {
                onMouseDown={(e) => {
                  if (!img.isLocked) handleFloatingMouseDown(e, img.id);
                }}
-               title={img.isLocked ? 'Unlock to move this image' : 'Drag to move. Hold Alt to temporarily disable snapping.'}
+               title={img.isLocked ? 'Unlock to move this window' : 'Drag an empty toolbar area to move. Hold Alt to temporarily disable snapping.'}
             >
               <div className="flex items-center gap-1 shrink-0 min-w-0">
                 <Move className={`w-3 h-3 shrink-0 ${img.isLocked ? 'text-slate-600' : 'text-slate-400'}`} />
@@ -5539,13 +5992,15 @@ export default function App() {
               
               <div
                 className="flex min-w-0 flex-1 flex-nowrap gap-1 items-center justify-start overflow-x-auto no-scrollbar overscroll-contain"
-                onMouseDown={(e) => e.stopPropagation()}
                 onWheel={(event) => {
                   event.stopPropagation();
                   event.currentTarget.scrollLeft += event.deltaY || event.deltaX;
                 }}
                 title="Scroll to reveal more image controls"
+                data-media-toolbar-controls
               >
+                {!isOfficeDocument(img.type) && (
+                  <>
                 <button 
                   onClick={() => setFloatingImages(prev => prev.map(f => f.id === img.id ? {...f, zoom: Math.min((f.zoom || 1) + 0.25, 5)} : f))}
                   className="hover:bg-black/10 dark:hover:bg-white/10 p-1 rounded transition-colors text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white"
@@ -5566,10 +6021,11 @@ export default function App() {
                 </button>
                 <button 
                   onClick={() => setFloatingImages(prev => prev.map(f => f.id === img.id ? {...f, zoom: 1, panX: 0, panY: 0} : f))}
-                  className="hover:bg-black/10 dark:hover:bg-white/10 p-1 rounded transition-colors text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white text-[9px] font-bold"
-                  title="Reset Zoom"
+                  className="hover:bg-black/10 dark:hover:bg-white/10 px-1.5 py-1 rounded transition-colors text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white text-[9px] font-bold"
+                  title="Reset zoom and position"
+                  data-control="reset-view"
                 >
-                  1:1
+                  Reset
                 </button>
                 <button
                   onClick={() => {
@@ -5626,13 +6082,18 @@ export default function App() {
                 >
                   <Palette className="w-3 h-3 text-fuchsia-400" />
                 </button>
-                <button 
-                  onClick={() => setFloatingImages(prev => prev.map(f => f.id === img.id ? {...f, rotation: (f.rotation + 90) % 360} : f))}
-                  className="hover:bg-black/10 dark:hover:bg-white/10 p-1 rounded transition-colors text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white"
-                  title="Rotate 90 degrees"
-                >
-                  <RotateCw className="w-3 h-3" />
-                </button>
+                {img.type === 'image' && (
+                  <button
+                    onClick={() => setFloatingImages(prev => prev.map(f => f.id === img.id ? {...f, rotation: (f.rotation + 90) % 360} : f))}
+                    className="hover:bg-black/10 dark:hover:bg-white/10 p-1 rounded transition-colors text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white"
+                    title="Rotate image 90 degrees"
+                    data-control="rotate"
+                  >
+                    <RotateCw className="w-3 h-3" />
+                  </button>
+                )}
+                  </>
+                )}
                 <button 
                   onClick={() => {
                     const nextLocked = !img.isLocked;
@@ -5661,12 +6122,19 @@ export default function App() {
                 >
                   <X className="w-3 h-3" />
                 </button>
+                <div
+                  className="min-w-4 flex-1 self-stretch cursor-move"
+                  data-media-drag-space
+                  aria-hidden="true"
+                />
               </div>
             </div>
             
             <motion.div 
               animate={{
-                height: img.isCollapsed ? 0 : 'auto',
+                height: img.isCollapsed
+                  ? 0
+                  : img.height || (isOfficeDocument(img.type) ? OFFICE_DOCUMENT_DEFAULT_HEIGHT : 'auto'),
                 borderWidth: img.isCollapsed ? 0 : 1
               }}
               transition={(reduceLargeBoardEffects || resizingFloatingId === img.id) ? { duration: 0 } : { duration: 0.2, ease: "easeInOut" }}
@@ -5693,14 +6161,14 @@ export default function App() {
                   )}
 
                   {img.type === 'pdf' ? (
-                    <div className="relative flex flex-col items-center justify-center bg-slate-800/50 w-full">
+                    <div className={`relative flex w-full flex-col items-center justify-center bg-slate-800/50 ${img.height ? 'h-full min-h-0' : ''}`}>
                       <div
                         ref={(element) => {
                           if (element) pdfViewportRefs.current.set(img.id, element);
                           else pdfViewportRefs.current.delete(img.id);
                         }}
                         data-pdf-viewport={img.id}
-                        className={`overflow-auto no-scrollbar w-full max-h-[75vh] min-h-32 no-window-drag touch-none ${annotationModes[img.id] ? 'cursor-crosshair' : ((img.zoom || 1) > 1 ? 'cursor-grab' : 'cursor-default')}`}
+                        className={`overflow-auto no-scrollbar w-full no-window-drag touch-none ${img.height ? 'h-full min-h-0 max-h-none' : 'max-h-[75vh] min-h-32'} ${annotationModes[img.id] ? 'cursor-crosshair' : ((img.zoom || 1) > 1 ? 'cursor-grab' : 'cursor-default')}`}
                         onWheel={(event) => handlePdfWheelZoom(event, img)}
                         onPointerDown={(event) => handlePdfPanPointerDown(event, img)}
                         onPointerMove={(event) => handlePdfPanPointerMove(event, img.id)}
@@ -5787,9 +6255,16 @@ export default function App() {
                         </div>
                       )}
                     </div>
+                  ) : isOfficeDocument(img.type) ? (
+                    <OfficeDocumentWindow
+                      media={img}
+                      theme={theme}
+                      onUpdate={updateFloatingMedia}
+                      onMoveMouseDown={handleFloatingMouseDown}
+                    />
                   ) : (
                     <div
-                      className={`relative w-full overflow-hidden no-window-drag touch-none ${annotationModes[img.id] ? 'cursor-crosshair' : (imagePanSessionRef.current?.id === img.id ? 'cursor-grabbing' : ((img.zoom || 1) > 1 ? 'cursor-grab' : 'cursor-default'))}`}
+                      className={`relative w-full overflow-hidden no-window-drag touch-none ${img.height ? 'flex min-h-0 flex-1 items-center justify-center' : ''} ${annotationModes[img.id] ? 'cursor-crosshair' : (imagePanSessionRef.current?.id === img.id ? 'cursor-grabbing' : ((img.zoom || 1) > 1 ? 'cursor-grab' : 'cursor-default'))}`}
                       onWheel={(event) => handleImageWheelZoom(event, img.id)}
                       onPointerDown={(event) => handleImagePanPointerDown(event, img)}
                       onPointerMove={(event) => handleImagePanPointerMove(event, img.id)}
@@ -5803,7 +6278,7 @@ export default function App() {
                         : 'Scroll to zoom. Middle-click and drag to pan when zoomed.'}
                     >
                       <div
-                        className={`relative w-full ${imagePanSessionRef.current?.id === img.id ? '' : 'transition-transform duration-150'}`}
+                        className={`relative w-full ${img.height ? 'flex h-full items-center justify-center' : ''} ${imagePanSessionRef.current?.id === img.id ? '' : 'transition-transform duration-150'}`}
                         style={{
                           transform: `translate3d(${img.panX || 0}px, ${img.panY || 0}px, 0) rotate(${img.rotation}deg) scale(${img.zoom || 1})`,
                           transformOrigin: 'center center'
@@ -5812,8 +6287,8 @@ export default function App() {
                         <ReferenceImagePreview
                           src={img.url}
                           targetWidth={getReferencePreviewWidth(img.width, img.zoom || 1)}
-                          className="block w-full pointer-events-auto select-none no-window-drag"
-                          style={{ objectFit: 'contain' }}
+                          className={`block w-full pointer-events-auto select-none no-window-drag ${img.height ? 'h-full max-h-full object-contain' : ''}`}
+                          style={{ objectFit: 'contain', height: img.height ? '100%' : undefined }}
                           draggable={!img.isLocked && !annotationModes[img.id]}
                           title={img.isLocked ? 'Unlock this reference to drag it out' : 'Drag into Photoshop or another desktop app'}
                           onMouseDown={(event) => event.stopPropagation()}
@@ -5885,7 +6360,7 @@ export default function App() {
                     </div>
                   )}
                   {img.palette && img.palette.length > 0 && (
-                    <div className="flex h-6 w-full mt-auto" style={{ width: img.width }}>
+                    <div className="mt-auto flex h-6 w-full shrink-0" style={{ width: img.width }}>
                       {img.palette.map((color, i) => {
                         const normalizedColor = normalizeHexColor(color) || color;
                         const copyFailed = copiedColor === `error:${normalizedColor}` || copiedColor === `error:${color}`;
@@ -5910,27 +6385,15 @@ export default function App() {
                       })}
                     </div>
                   )}
-                  {/* Two-sided resize handles */}
-                  {!img.isLocked && (
-                    <>
-                      <div
-                        className="absolute inset-y-0 left-0 w-2 cursor-ew-resize z-50 opacity-0 group-hover:opacity-100 transition-opacity no-window-drag"
-                        onMouseDown={(e) => handleFloatingResizeMouseDown(e, img.id, 'left')}
-                        title="Resize from left"
-                      >
-                        <div className="absolute bottom-1.5 left-1.5 w-2.5 h-2.5 border-l-[3px] border-b-[3px] border-slate-400/80 hover:border-sky-400 rounded-bl-[2px] transition-colors bg-black/20" />
-                      </div>
-                      <div
-                        className="absolute inset-y-0 right-0 w-2 cursor-ew-resize z-50 opacity-0 group-hover:opacity-100 transition-opacity no-window-drag"
-                        onMouseDown={(e) => handleFloatingResizeMouseDown(e, img.id, 'right')}
-                        title="Resize from right"
-                      >
-                        <div className="absolute bottom-1.5 right-1.5 w-2.5 h-2.5 border-r-[3px] border-b-[3px] border-slate-400/80 hover:border-sky-400 rounded-br-[2px] transition-colors bg-black/20" />
-                      </div>
-                    </>
-                  )}
               </div>
             </motion.div>
+            {!img.isLocked && (
+              <InvisibleResizeFrame
+                kind="media"
+                toolbarHeight={FLOATING_IMAGE_TOOLBAR_HEIGHT}
+                onResizeMouseDown={(event, edge) => handleFloatingResizeMouseDown(event, img.id, edge)}
+              />
+            )}
           </motion.div>
         ))}
       </AnimatePresence>
@@ -5943,6 +6406,10 @@ export default function App() {
       <AnimatePresence>
         {floatingNotes.map(note => {
           const isEditing = editingNotes[note.id];
+          const noteControlsVisible = note.isCollapsed
+            || topWindowId === note.id
+            || isEditing
+            || resizingNoteId === note.id;
           return (
           <motion.div 
             key={note.id}
@@ -5954,8 +6421,9 @@ export default function App() {
             }}
             exit={{ opacity: 0, scale: 0.95, y: 10 }}
             transition={(reduceLargeBoardEffects || draggingNoteId === note.id || resizingNoteId === note.id) ? { type: "tween", duration: 0 } : { type: "spring", damping: 25, stiffness: 300, mass: 0.5 }}
-            className={`absolute bg-transparent flex flex-col group drop-shadow-2xl pointer-events-auto floating-window`}
-            data-id={note.id}
+             className={`absolute bg-transparent flex flex-col group drop-shadow-2xl pointer-events-auto floating-window`}
+             data-id={note.id}
+             data-window-kind="note"
             data-click-through={note.isLocked ? 'true' : 'false'}
             data-collapsed={note.isCollapsed ? 'true' : 'false'}
             onMouseDown={() => setTopWindowId(note.id)}
@@ -5968,65 +6436,91 @@ export default function App() {
           >
             {/* Note Drag Handle Overlay */}
             <div 
-               className={`absolute bottom-full left-0 w-full h-[32px] ${theme === 'light' ? 'bg-white/80' : 'bg-slate-900/80'} backdrop-blur-sm ${note.isCollapsed ? 'rounded-lg' : 'rounded-t-lg'} transition-all flex items-center justify-between px-2 ${!note.isLocked ? 'cursor-move' : 'cursor-default'} ${theme === 'light' ? 'border-black/10' : 'border-white/10'} ${note.isCollapsed ? 'opacity-100' : (note.isLocked ? 'opacity-20 hover:opacity-100' : 'opacity-0 group-hover:opacity-100')} floating-note-drag-handle z-10 gap-2 pointer-events-auto`}
+               className={`note-toolbar absolute bottom-full left-0 w-full h-[32px] ${theme === 'light' ? 'bg-white/90' : 'bg-slate-900/90'} backdrop-blur-sm ${note.isCollapsed ? 'rounded-lg' : 'rounded-t-lg'} transition-opacity flex items-center px-1.5 ${!note.isLocked ? 'cursor-move' : 'cursor-default'} ${theme === 'light' ? 'border-black/10' : 'border-white/10'} ${noteControlsVisible ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'} floating-note-drag-handle z-10 gap-1 pointer-events-auto`}
                onMouseDown={(e) => {
+                 setTopWindowId(note.id);
                  if (!note.isLocked) handleNoteMouseDown(e, note.id);
                }}
             >
-              <div className="flex items-center gap-2 shrink-0">
+              <div className="flex w-5 shrink-0 items-center justify-center">
                 <Move className={`w-3 h-3 shrink-0 ${note.isLocked ? 'text-slate-600' : 'text-slate-400'}`} />
               </div>
-              <div className="flex flex-nowrap gap-1 items-center justify-end shrink-0" onMouseDown={(e) => e.stopPropagation()}>
-                {!note.isLocked && (
-                  <div className="flex items-center space-x-1 border-r border-slate-700 pr-1 mr-1">
+              <div className="h-full w-8 shrink-0 cursor-move" data-note-drag-space aria-hidden="true" />
+              <div
+                className="note-toolbar-controls flex min-w-0 flex-1 flex-nowrap items-center gap-1 overflow-x-auto overscroll-contain no-scrollbar"
+                onWheel={(event) => {
+                  event.stopPropagation();
+                  event.currentTarget.scrollLeft += event.deltaY || event.deltaX;
+                }}
+                title="Scroll to reveal more note controls"
+              >
+                  <div className={`flex shrink-0 items-center space-x-1 border-r border-slate-700 pr-1 mr-1 ${note.isLocked ? 'opacity-40' : ''}`}>
                     {['#fef08a', '#bfdbfe', '#fbcfe8', '#bbf7d0', '#e2e8f0'].map(c => (
                       <button
                         key={c}
+                        disabled={note.isLocked}
                         onClick={() => setFloatingNotes(prev => prev.map(n => n.id === note.id ? {...n, color: c} : n))}
-                        className={`w-3 h-3 rounded-full border border-black/20 hover:scale-125 transition-transform ${note.color === c ? 'ring-1 ring-white/50' : ''}`}
+                        className={`w-3 h-3 shrink-0 rounded-full border border-black/20 enabled:hover:scale-125 transition-transform disabled:cursor-not-allowed ${note.color === c ? 'ring-1 ring-white/50' : ''}`}
                         style={{ backgroundColor: c }}
-                        title="Change Color"
+                        title={note.isLocked ? 'Unlock note to change color' : 'Change Color'}
                       />
                     ))}
                   </div>
-                )}
                 
-                {!note.isLocked && isEditing && (
-                  <div className="flex items-center space-x-1 border-r border-slate-700 pr-1 mr-1">
+                  <div className={`flex shrink-0 items-center space-x-1 border-r border-slate-700 pr-1 mr-1 ${(!isEditing || note.isLocked) ? 'opacity-40' : ''}`}>
                     <button 
+                      disabled={!isEditing || note.isLocked}
                       onClick={() => updateNoteText(note.id, note.text + '**bold**')}
-                      className="hover:bg-black/10 dark:hover:bg-white/10 p-1 rounded transition-colors text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white"
-                      title="Bold"
+                      className="enabled:hover:bg-black/10 dark:enabled:hover:bg-white/10 p-1 rounded transition-colors text-slate-500 dark:text-slate-400 enabled:hover:text-slate-900 dark:enabled:hover:text-white disabled:cursor-not-allowed"
+                      title={note.isLocked ? 'Unlock note to format text' : isEditing ? 'Bold' : 'Edit the note to use formatting'}
+                      data-note-format="bold"
                     >
                       <Bold className="w-3 h-3" />
                     </button>
                     <button 
+                      disabled={!isEditing || note.isLocked}
                       onClick={() => updateNoteText(note.id, note.text + '*italic*')}
-                      className="hover:bg-black/10 dark:hover:bg-white/10 p-1 rounded transition-colors text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white"
-                      title="Italic"
+                      className="enabled:hover:bg-black/10 dark:enabled:hover:bg-white/10 p-1 rounded transition-colors text-slate-500 dark:text-slate-400 enabled:hover:text-slate-900 dark:enabled:hover:text-white disabled:cursor-not-allowed"
+                      title={note.isLocked ? 'Unlock note to format text' : isEditing ? 'Italic' : 'Edit the note to use formatting'}
+                      data-note-format="italic"
                     >
                       <Italic className="w-3 h-3" />
                     </button>
                     <button 
+                      disabled={!isEditing || note.isLocked}
                       onClick={() => updateNoteText(note.id, note.text + '\n- list item')}
-                      className="hover:bg-black/10 dark:hover:bg-white/10 p-1 rounded transition-colors text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white"
-                      title="List"
+                      className="enabled:hover:bg-black/10 dark:enabled:hover:bg-white/10 p-1 rounded transition-colors text-slate-500 dark:text-slate-400 enabled:hover:text-slate-900 dark:enabled:hover:text-white disabled:cursor-not-allowed"
+                      title={note.isLocked ? 'Unlock note to format text' : isEditing ? 'List' : 'Edit the note to use formatting'}
+                      data-note-format="list"
                     >
                       <List className="w-3 h-3" />
                     </button>
                   </div>
-                )}
                 
                 <button 
+                  disabled={note.isLocked}
                   onClick={() => setEditingNotes(prev => ({...prev, [note.id]: !isEditing}))}
-                  className="hover:bg-black/10 dark:hover:bg-white/10 p-1 rounded transition-colors text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white"
-                  title={isEditing ? "Preview Markdown" : "Edit Markdown"}
+                  className="shrink-0 enabled:hover:bg-black/10 dark:enabled:hover:bg-white/10 p-1 rounded transition-colors text-slate-500 dark:text-slate-400 enabled:hover:text-slate-900 dark:enabled:hover:text-white disabled:cursor-not-allowed disabled:opacity-40"
+                  title={note.isLocked ? 'Unlock note to edit' : isEditing ? "Preview Markdown" : "Edit Markdown"}
                 >
                   {isEditing ? <Eye className="w-3 h-3" /> : <Edit3 className="w-3 h-3" />}
                 </button>
+                <button
+                  aria-pressed={Boolean(note.lockAspectRatio)}
+                  onClick={() => setFloatingNotes(prev => prev.map(n => n.id === note.id
+                    ? { ...n, lockAspectRatio: !n.lockAspectRatio }
+                    : n))}
+                  className={`shrink-0 rounded px-1.5 py-1 text-[9px] font-semibold transition-colors ${note.lockAspectRatio ? 'bg-sky-500 text-white' : 'text-slate-500 dark:text-slate-400 hover:bg-black/10 dark:hover:bg-white/10 hover:text-slate-900 dark:hover:text-white'}`}
+                  title={note.lockAspectRatio
+                    ? 'Resize mode: proportional. Click for free resize; hold Shift to temporarily switch.'
+                    : 'Resize mode: free. Click for proportional resize; hold Shift to temporarily switch.'}
+                  data-note-resize-mode
+                >
+                  {note.lockAspectRatio ? 'Ratio' : 'Free'}
+                </button>
                 <button 
                   onClick={() => setFloatingNotes(prev => prev.map(n => n.id === note.id ? {...n, isCollapsed: !n.isCollapsed} : n))}
-                  className="hover:bg-black/10 dark:hover:bg-white/10 p-1 rounded transition-colors text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white"
+                  className="shrink-0 hover:bg-black/10 dark:hover:bg-white/10 p-1 rounded transition-colors text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white"
                   title={note.isCollapsed ? "Expand Note" : "Collapse Note"}
                 >
                   {note.isCollapsed ? <ChevronDown className="w-3 h-3 text-sky-400" /> : <ChevronUp className="w-3 h-3" />}
@@ -6037,14 +6531,14 @@ export default function App() {
                     setFloatingNotes(prev => prev.map(n => n.id === note.id ? {...n, isLocked: nextLocked} : n));
                     logWindowLockState('note', note.id, nextLocked);
                   }}
-                  className="hover:bg-black/10 dark:hover:bg-white/10 p-1 rounded transition-colors text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white"
+                  className="shrink-0 hover:bg-black/10 dark:hover:bg-white/10 p-1 rounded transition-colors text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white"
                   title={note.isLocked ? "Unpin Note" : "Pin to Background"}
                 >
                   {note.isLocked ? <Pin className="w-3 h-3 text-sky-400" /> : <PinOff className="w-3 h-3" />}
                 </button>
                 <button 
                   onClick={() => closeNote(note.id)}
-                  className="hover:bg-red-500/80 p-1 rounded transition-colors text-slate-500 dark:text-slate-400 hover:text-white"
+                  className="shrink-0 hover:bg-red-500/80 p-1 rounded transition-colors text-slate-500 dark:text-slate-400 hover:text-white"
                   title="Close Note"
                 >
                   <X className="w-3 h-3" />
@@ -6083,16 +6577,14 @@ export default function App() {
                   )}
                 </div>
               
-              {/* Note Resize Handle */}
-              {!note.isLocked && (
-                <div 
-                  className="absolute bottom-0 right-0 w-6 h-6 cursor-se-resize z-50 flex items-end justify-end p-1.5 opacity-0 group-hover:opacity-100 transition-opacity"
-                  onMouseDown={(e) => handleNoteResizeMouseDown(e, note.id)}
-                >
-                  <div className="w-2.5 h-2.5 border-r-[2px] border-b-[2px] border-black/20 rounded-br-[1px]"></div>
-                </div>
-              )}
             </motion.div>
+            {!note.isLocked && (
+              <InvisibleResizeFrame
+                kind="note"
+                toolbarHeight={FLOATING_NOTE_TOOLBAR_HEIGHT}
+                onResizeMouseDown={(event, edge) => handleNoteResizeMouseDown(event, note.id, edge)}
+              />
+            )}
           </motion.div>
         )})}
       </AnimatePresence>
@@ -6358,10 +6850,10 @@ export default function App() {
                      </div>
                      <div className="flex space-x-3">
                        <label className="flex items-center space-x-2 bg-sky-500/20 hover:bg-sky-500/30 text-sky-400 px-3 py-1.5 rounded cursor-pointer transition-colors">
-                         <Plus className="w-4 h-4"/><span className="text-sm font-medium pr-1">Add Image</span>
+                          <Plus className="w-4 h-4"/><span className="text-sm font-medium pr-1">Add Media</span>
                          <input 
                             type="file" 
-                            accept="image/*,application/pdf" 
+                            accept={SUPPORTED_MEDIA_ACCEPT}
                             multiple 
                             className="hidden" 
                             onChange={async (e) => {
@@ -6369,7 +6861,7 @@ export default function App() {
                                 const files = Array.from(e.target.files) as File[];
                                 try {
                                   const projectWithDirectory = await ensureProjectLocalDirectory(p);
-                                  const mediaFiles = files.filter(f => f.type.startsWith('image/') || f.type === 'application/pdf');
+                                  const mediaFiles = files.filter(file => getImportedMediaType(file) !== null);
                                   const base64Images = await Promise.all(mediaFiles.map(fileToBase64));
                                   const newFloatingImages = createFloatingMediaItems(mediaFiles, base64Images, { x: 100 + Math.random() * 50, y: 100 + Math.random() * 50 });
                                   const updatedFloatingImages = [...(projectWithDirectory.floatingImages || []), ...newFloatingImages];
@@ -6472,7 +6964,6 @@ export default function App() {
           )}
         </motion.div>
       )}
-      </AnimatePresence>
       </AnimatePresence>
     </div>
   );

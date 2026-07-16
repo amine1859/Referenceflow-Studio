@@ -1,8 +1,8 @@
-import type { FloatingImage, Project } from './store';
+import type { FloatingImage, FloatingMediaType, Project } from './store';
 
 export type ProjectMediaSnapshot = {
   backgroundSources: string[];
-  floatingSources: Array<{ id: string; source: string; type: 'image' | 'pdf' }>;
+  floatingSources: Array<{ id: string; source: string; type: FloatingMediaType }>;
 };
 
 export const sanitizeExportStem = (value: string) => (value || 'untitled')
@@ -10,7 +10,9 @@ export const sanitizeExportStem = (value: string) => (value || 'untitled')
   .replace(/^_+|_+$/g, '')
   .slice(0, 80) || 'untitled';
 
-export const getSavedMediaExtension = (source: string, type: 'image' | 'pdf' = 'image') => {
+export const getSavedMediaExtension = (source: string, type: FloatingMediaType = 'image') => {
+  if (type === 'docx' || /^data:application\/vnd\.openxmlformats-officedocument\.wordprocessingml\.document/i.test(source) || /\.docx(?:$|[?#])/i.test(source)) return 'docx';
+  if (type === 'xlsx' || /^data:application\/vnd\.openxmlformats-officedocument\.spreadsheetml\.sheet/i.test(source) || /\.xlsx(?:$|[?#])/i.test(source)) return 'xlsx';
   if (type === 'pdf' || /^data:application\/pdf/i.test(source) || /\.pdf(?:$|[?#])/i.test(source)) return 'pdf';
   return /^data:image\/jpe?g/i.test(source) || /\.jpe?g(?:$|[?#])/i.test(source) ? 'jpg' : 'png';
 };
@@ -19,14 +21,14 @@ export const getBackgroundMediaFileName = (source: string, index: number) =>
   `background_${index + 1}.${getSavedMediaExtension(source)}`;
 
 export const getFloatingMediaFileName = (image: FloatingImage) =>
-  `floating_${sanitizeExportStem(image.id)}.${getSavedMediaExtension(image.url, image.type === 'pdf' ? 'pdf' : 'image')}`;
+  `floating_${sanitizeExportStem(image.id)}.${getSavedMediaExtension(image.url, image.type || 'image')}`;
 
 export const createProjectMediaSnapshot = (project: Pick<Project, 'images' | 'floatingImages'>): ProjectMediaSnapshot => ({
   backgroundSources: [...(project.images || [])],
   floatingSources: (project.floatingImages || []).map(image => ({
     id: image.id,
     source: image.url,
-    type: image.type === 'pdf' ? 'pdf' : 'image'
+    type: image.type || 'image'
   }))
 });
 

@@ -1,7 +1,8 @@
 {
   "name": "ref-flow-studio",
+  "productName": "RefFlowStudio",
   "private": false,
-  "version": "1.0.4",
+  "version": "1.0.5",
   "description": "A Windows desktop reference-board app for artists, designers, and developers.",
   "author": "RefFlow Studio contributors",
   "license": "MIT",
@@ -13,13 +14,19 @@
     "preview": "vite preview",
     "clean": "node -e \"const fs=require('fs'); for (const path of ['dist','server.js','dist_desktop']) fs.rmSync(path,{recursive:true,force:true});\"",
     "lint": "tsc --noEmit",
+    "test:office-ui": "node tools/verify-office-ui.cjs",
     "electron:dev": "cross-env NODE_ENV=development electron electron-main.cjs",
     "electron:start": "vite build && cross-env NODE_ENV=production electron electron-main.cjs",
     "electron:dist": "vite build && electron-builder --win --x64 --publish never",
+    "electron:dist:unsigned": "vite build && electron-builder --win --x64 --publish never --config tools/electron-builder.unsigned.cjs",
+    "electron:test-dist": "vite build && electron-builder --win --x64 --publish never --config tools/electron-builder.test.cjs",
     "update:metadata": "node tools/generate-update-metadata.cjs"
   },
   "dependencies": {
-    "electron-updater": "^6.8.5"
+    "docx": "^9.7.1",
+    "electron-updater": "^6.8.5",
+    "exceljs": "^4.4.0",
+    "mammoth": "^1.12.0"
   },
   "devDependencies": {
     "@google/genai": "^2.4.0",
@@ -93,6 +100,11 @@
       "installerIcon": "assets/referenceflow.ico",
       "uninstallerIcon": "assets/referenceflow.ico",
       "include": "installer.nsh"
+    }
+  },
+  "overrides": {
+    "exceljs": {
+      "uuid": "^11.1.1"
     }
   }
 }

@@ -25,4 +25,8 @@ FunctionEnd
 !macro customUnInstall
   Delete "$INSTDIR\referenceflow-data-dir.txt"
   DeleteRegKey HKCU "Software\ReferenceFlow"
+  DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "${PRODUCT_NAME}"
+  DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "RefFlowStudio"
+  DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "ReferenceFlow"
+  DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "ref-flow-studio"
 !macroend

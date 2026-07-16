@@ -13,12 +13,19 @@ export interface WindowSnapResult {
 }
 
 export type HorizontalResizeEdge = 'left' | 'right';
+export type WindowResizeEdge = HorizontalResizeEdge | 'top' | 'bottom' | 'top-left' | 'top-right' | 'bottom-left' | 'bottom-right';
 
 export interface HorizontalResizeStart {
   pointerX: number;
   x: number;
   width: number;
   edge: HorizontalResizeEdge;
+}
+
+export interface EdgeResizeStart extends WindowRect {
+  pointerX: number;
+  pointerY: number;
+  edge: WindowResizeEdge;
 }
 
 type AxisCandidate = {
@@ -112,4 +119,84 @@ export const resizeWindowHorizontally = (
     x: start.edge === 'left' ? start.x + start.width - width : start.x,
     width
   };
+};
+
+export const resizeWindowFromEdge = (
+  start: EdgeResizeStart,
+  pointerX: number,
+  pointerY: number,
+  minWidth: number,
+  minHeight: number
+): WindowRect => {
+  const deltaX = pointerX - start.pointerX;
+  const deltaY = pointerY - start.pointerY;
+  const fromLeft = start.edge.endsWith('left');
+  const fromRight = start.edge.endsWith('right');
+  const fromTop = start.edge.startsWith('top');
+  const fromBottom = start.edge.startsWith('bottom');
+
+  let x = start.x;
+  let y = start.y;
+  let width = start.width;
+  let height = start.height;
+
+  if (fromLeft) {
+    width = Math.max(minWidth, start.width - deltaX);
+    x = start.x + start.width - width;
+  } else if (fromRight) {
+    width = Math.max(minWidth, start.width + deltaX);
+  }
+
+  if (fromTop) {
+    height = Math.max(minHeight, start.height - deltaY);
+    y = start.y + start.height - height;
+  } else if (fromBottom) {
+    height = Math.max(minHeight, start.height + deltaY);
+  }
+
+  return { x, y, width, height };
+};
+
+export const resizeWindowWithAspectRatio = (
+  start: EdgeResizeStart,
+  pointerX: number,
+  pointerY: number,
+  minWidth: number,
+  minHeight: number
+): WindowRect => {
+  const freeResize = resizeWindowFromEdge(start, pointerX, pointerY, minWidth, minHeight);
+  const fromLeft = start.edge.endsWith('left');
+  const fromRight = start.edge.endsWith('right');
+  const fromTop = start.edge.startsWith('top');
+  const fromBottom = start.edge.startsWith('bottom');
+  const changesWidth = fromLeft || fromRight;
+  const changesHeight = fromTop || fromBottom;
+  const minimumScale = Math.max(minWidth / start.width, minHeight / start.height);
+
+  let requestedScale = 1;
+  if (changesWidth && changesHeight) {
+    requestedScale = (
+      (start.width * freeResize.width) + (start.height * freeResize.height)
+    ) / ((start.width * start.width) + (start.height * start.height));
+  } else if (changesWidth) {
+    requestedScale = freeResize.width / start.width;
+  } else if (changesHeight) {
+    requestedScale = freeResize.height / start.height;
+  }
+
+  const scale = Math.max(minimumScale, requestedScale);
+  const width = Math.round(start.width * scale);
+  const height = Math.round(start.height * scale);
+  const x = fromLeft
+    ? start.x + start.width - width
+    : changesWidth
+      ? start.x
+      : start.x + (start.width - width) / 2;
+  const y = fromTop
+    ? start.y + start.height - height
+    : changesHeight
+      ? start.y
+      : start.y + (start.height - height) / 2;
+
+  return { x, y, width, height };
 };

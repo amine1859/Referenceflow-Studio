@@ -2,13 +2,17 @@ import React, { useState, useRef, useEffect } from 'react';
 import { motion } from 'motion/react';
 import { Move, Lock, Unlock, X, PenTool, Brush, Eraser, ChevronDown, ChevronUp } from 'lucide-react';
 import { FloatingSketch, FloatingSketchLine } from '../lib/store';
+import type { WindowResizeEdge } from '../lib/windowGeometry';
+import { InvisibleResizeFrame } from './InvisibleResizeFrame';
+
+const SKETCH_TOOLBAR_HEIGHT = 32;
 
 interface Props {
   sketch: FloatingSketch;
   updateSketch: (id: string, updates: Partial<FloatingSketch>) => void;
   closeSketch: (id: string) => void;
   onMouseDown: (e: React.MouseEvent, id: string) => void;
-  onResizeMouseDown: (e: React.MouseEvent, id: string) => void;
+  onResizeMouseDown: (e: React.MouseEvent, id: string, edge: WindowResizeEdge) => void;
   isActive?: boolean;
   onInteraction?: () => void;
   logWindowLockState?: (windowType: 'image' | 'note' | 'sketch', windowId: string, isLocked: boolean) => void;
@@ -205,6 +209,7 @@ export function FloatingSketchWindow({
       transition={(isDragging || isResizing) ? { type: "tween", duration: 0 } : { type: "spring", damping: 25, stiffness: 300, mass: 0.5 }}
       className={`absolute bg-transparent flex flex-col group drop-shadow-2xl pointer-events-auto floating-window`}
       data-id={sketch.id}
+      data-window-kind="sketch"
       data-click-through={sketch.isLocked ? 'true' : 'false'}
       data-collapsed={sketch.isCollapsed ? 'true' : 'false'}
       onMouseDown={onInteraction}
@@ -224,6 +229,7 @@ export function FloatingSketchWindow({
         <div className="flex items-center gap-2 shrink-0">
           <Move className={`w-3 h-3 shrink-0 ${sketch.isLocked ? 'text-slate-600' : 'text-slate-400'}`} />
         </div>
+        <div className="h-full min-w-6 flex-1 cursor-move" data-sketch-drag-space aria-hidden="true" />
         
         <div className="flex flex-nowrap gap-1 items-center justify-end shrink-0" onMouseDown={(e) => e.stopPropagation()}>
           {!sketch.isLocked && !sketch.isCollapsed && (
@@ -331,15 +337,14 @@ export function FloatingSketchWindow({
             />
           </div>
         
-        {!sketch.isLocked && (
-          <div 
-            className="absolute bottom-0 right-0 w-6 h-6 cursor-se-resize z-50 flex items-end justify-end p-1.5 opacity-0 group-hover:opacity-100 transition-opacity"
-            onMouseDown={(e) => onResizeMouseDown(e, sketch.id)}
-          >
-            <div className="w-2.5 h-2.5 border-r-[2px] border-b-[2px] border-black/20 rounded-br-[1px]"></div>
-          </div>
-        )}
       </motion.div>
+      {!sketch.isLocked && (
+        <InvisibleResizeFrame
+          kind="sketch"
+          toolbarHeight={SKETCH_TOOLBAR_HEIGHT}
+          onResizeMouseDown={(event, edge) => onResizeMouseDown(event, sketch.id, edge)}
+        />
+      )}
     </motion.div>
   );
 }

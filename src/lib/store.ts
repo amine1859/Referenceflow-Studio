@@ -12,12 +12,22 @@ export interface ImageAnnotationStroke {
   points: ImageAnnotationPoint[];
 }
 
+export type FloatingMediaType = 'image' | 'pdf' | 'docx' | 'xlsx';
+
+export interface OfficeDocumentEdits {
+  docxText?: string;
+  xlsxActiveSheet?: string;
+  xlsxCells?: Record<string, Record<string, string>>;
+}
+
 export interface FloatingImage {
   id: string;
   url: string; // Will store base64 string
+  fileName?: string;
   x: number;
   y: number;
   width: number;
+  height?: number;
   opacity: number;
   isLocked: boolean;
   rotation: number;
@@ -27,7 +37,7 @@ export interface FloatingImage {
   panX?: number;
   panY?: number;
   isHighRes?: boolean;
-  type?: 'image' | 'pdf';
+  type?: FloatingMediaType;
   documentPage?: number;
   documentNumPages?: number;
   isSearchInProgress?: boolean;
@@ -35,6 +45,7 @@ export interface FloatingImage {
   pHash?: string;
   annotations?: ImageAnnotationStroke[];
   pdfAnnotations?: Record<string, ImageAnnotationStroke[]>;
+  officeEdits?: OfficeDocumentEdits;
 }
 
 export interface FloatingNote {
@@ -45,6 +56,7 @@ export interface FloatingNote {
   width: number;
   height: number;
   color: string;
+  lockAspectRatio?: boolean;
   isLocked?: boolean;
   isCollapsed?: boolean;
 }

@@ -98,6 +98,44 @@ html:not(.dark) [class~="text-slate-950"] {
   color: #000000 !important;
 }
 
+/* PDF.js selectable text layer. The visible glyphs stay on the canvas while
+   these transparent, accurately positioned spans provide native selection and
+   clipboard behavior. */
+.pdf-text-layer {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  overflow: clip;
+  line-height: 1;
+  text-align: initial;
+  text-size-adjust: none;
+  transform-origin: 0 0;
+  user-select: text;
+  forced-color-adjust: none;
+}
+
+.pdf-text-layer :is(span, br) {
+  position: absolute;
+  color: transparent;
+  white-space: pre;
+  cursor: text;
+  transform-origin: 0 0;
+}
+
+.pdf-text-layer > :not(.markedContent),
+.pdf-text-layer .markedContent span:not(.markedContent) {
+  z-index: 1;
+}
+
+.pdf-text-layer span.markedContent {
+  top: 0;
+  height: 0;
+}
+
+.pdf-text-layer ::selection {
+  background: rgb(14 165 233 / 0.35);
+}
+
 html:not(.dark) [class~="bg-black/20"] {
   background-color: rgb(15 23 42 / 0.08) !important;
 }
