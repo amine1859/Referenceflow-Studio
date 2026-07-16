@@ -11,6 +11,7 @@ import { createLocalBoardManifest, createProjectMediaSnapshot, getBackgroundMedi
 import type { ProjectMediaSnapshot } from './lib/projectMedia';
 import { resizeWindowHorizontally, snapWindowRect } from './lib/windowGeometry';
 import type { HorizontalResizeEdge, WindowRect } from './lib/windowGeometry';
+import { getAnnotationPageKey, getSmoothStrokePath, getVisibleAnnotations, replaceVisibleAnnotations } from './lib/annotations';
 
 import { FloatingSketchWindow } from './components/FloatingSketchWindow';
 import { pdfjs } from 'react-pdf';
@@ -254,7 +255,9 @@ function PdfCanvas({
   width,
   scale,
   onLoadSuccess,
-  onLoadError
+  onLoadError,
+  onRenderSuccess,
+  children
 }: {
   url: string;
   pageNumber: number;
@@ -262,18 +265,18 @@ function PdfCanvas({
   scale: number;
   onLoadSuccess: (numPages: number) => void;
   onLoadError: (error: Error) => void;
+  onRenderSuccess?: () => void;
+  children?: React.ReactNode;
 }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [isLoadingPdf, setIsLoadingPdf] = useState(true);
+  const [pdfDocument, setPdfDocument] = useState<any>(null);
 
   useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-
     let cancelled = false;
-    let renderTask: any = null;
     let loadingTask: any = null;
     setIsLoadingPdf(true);
+    setPdfDocument(null);
 
     try {
       loadingTask = pdfjs.getDocument(getPdfFileSource(url) as any);
@@ -286,12 +289,35 @@ function PdfCanvas({
     }
 
     loadingTask.promise
-      .then(async (pdf) => {
+      .then((pdf: any) => {
         if (cancelled) return;
         onLoadSuccess(pdf.numPages);
-        const page = await pdf.getPage(pageNumber);
+        setPdfDocument(pdf);
+      })
+      .catch((error: Error) => {
         if (cancelled) return;
+        console.error('PDF failed to load:', error);
+        setIsLoadingPdf(false);
+        onLoadError(error);
+      });
 
+    return () => {
+      cancelled = true;
+      loadingTask?.destroy();
+    };
+  }, [url]);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas || !pdfDocument) return;
+
+    let cancelled = false;
+    let renderTask: any = null;
+    setIsLoadingPdf(true);
+
+    pdfDocument.getPage(pageNumber)
+      .then(async (page: any) => {
+        if (cancelled) return;
         const baseViewport = page.getViewport({ scale: 1 });
         const fitScale = width / baseViewport.width;
         const viewport = page.getViewport({ scale: fitScale * scale });
@@ -308,7 +334,10 @@ function PdfCanvas({
         context.clearRect(0, 0, viewport.width, viewport.height);
         renderTask = page.render({ canvas, canvasContext: context, viewport });
         await renderTask.promise;
-        if (!cancelled) setIsLoadingPdf(false);
+        if (!cancelled) {
+          setIsLoadingPdf(false);
+          onRenderSuccess?.();
+        }
       })
       .catch((error: Error) => {
         if (cancelled) return;
@@ -326,18 +355,18 @@ function PdfCanvas({
           // Ignore render cancellation during fast page/zoom changes.
         }
       }
-      loadingTask?.destroy();
     };
-  }, [url, pageNumber, width, scale]);
+  }, [pdfDocument, pageNumber, width, scale]);
 
   return (
-    <div className="relative flex justify-center">
+    <div className="relative inline-block shrink-0 align-top">
       {isLoadingPdf && (
-        <div className="absolute inset-0 min-h-32 flex items-center justify-center bg-slate-900/50 text-slate-200 text-sm">
+        <div className="absolute inset-0 z-20 min-h-32 flex items-center justify-center bg-slate-900/50 text-slate-200 text-sm pointer-events-none">
           Loading PDF...
         </div>
       )}
       <canvas ref={canvasRef} className="block max-w-none" />
+      {children}
     </div>
   );
 }
@@ -935,6 +964,7 @@ export default function App() {
     const saved = localStorage.getItem('ref-flow-pill-visible');
     return saved ? saved === 'true' : true;
   });
+  const [isPillContentReady, setIsPillContentReady] = useState(false);
   
   const [projects, setProjects] = useState<Project[]>([]);
   const projectsRef = useRef<Project[]>([]);
@@ -961,7 +991,16 @@ export default function App() {
   const [annotationModes, setAnnotationModes] = useState<Record<string, boolean>>({});
   const [annotationColors, setAnnotationColors] = useState<Record<string, string>>({});
   const imagePanSessionRef = useRef<{ id: string; pointerId: number; x: number; y: number } | null>(null);
-  const annotationSessionRef = useRef<{ id: string; pointerId: number } | null>(null);
+  const pdfViewportRefs = useRef<Map<string, HTMLDivElement>>(new Map());
+  const pdfPanSessionRef = useRef<{
+    id: string;
+    pointerId: number;
+    startX: number;
+    startY: number;
+    scrollLeft: number;
+    scrollTop: number;
+  } | null>(null);
+  const annotationSessionRef = useRef<{ id: string; pointerId: number; pageKey?: string } | null>(null);
   const [updateStatus, setUpdateStatus] = useState<AppUpdateStatus>({
     phase: 'idle',
     currentVersion: '',
@@ -970,6 +1009,22 @@ export default function App() {
   const [updateActionPending, setUpdateActionPending] = useState(false);
 
   const [floatingSketches, setFloatingSketches] = useState<FloatingSketch[]>([]);
+
+  useEffect(() => {
+    if (!isPillVisible || isRetracted) {
+      setIsPillContentReady(false);
+      return;
+    }
+
+    let timer: number | null = null;
+    const animationFrame = window.requestAnimationFrame(() => {
+      timer = window.setTimeout(() => setIsPillContentReady(true), 190);
+    });
+    return () => {
+      window.cancelAnimationFrame(animationFrame);
+      if (timer !== null) window.clearTimeout(timer);
+    };
+  }, [isPillVisible, isRetracted]);
 
   useEffect(() => {
     projectsRef.current = projects;
@@ -2529,7 +2584,12 @@ export default function App() {
       await writeTextFile('notes.md', content);
       await writeTextFile('sketches.json', JSON.stringify(project.floatingSketches || [], null, 2));
       await writeTextFile('annotations.json', JSON.stringify(
-        (project.floatingImages || []).map(image => ({ imageId: image.id, strokes: image.annotations || [] })),
+        (project.floatingImages || []).map(image => ({
+          imageId: image.id,
+          type: image.type || 'image',
+          strokes: image.annotations || [],
+          pages: image.type === 'pdf' ? image.pdfAnnotations || {} : undefined
+        })),
         null,
         2
       ));
@@ -2597,7 +2657,12 @@ export default function App() {
       writeText('board.json', JSON.stringify(manifestProject, null, 2));
       writeText('sketches.json', JSON.stringify(project.floatingSketches || [], null, 2));
       writeText('annotations.json', JSON.stringify(
-        (project.floatingImages || []).map(image => ({ imageId: image.id, strokes: image.annotations || [] })),
+        (project.floatingImages || []).map(image => ({
+          imageId: image.id,
+          type: image.type || 'image',
+          strokes: image.annotations || [],
+          pages: image.type === 'pdf' ? image.pdfAnnotations || {} : undefined
+        })),
         null,
         2
       ));
@@ -3847,6 +3912,91 @@ export default function App() {
 
   const clampNumber = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
 
+  const restorePdfViewportPosition = (image: FloatingImage, persistClampedPosition = false) => {
+    const viewport = pdfViewportRefs.current.get(image.id);
+    if (!viewport || pdfPanSessionRef.current?.id === image.id) return;
+    viewport.scrollLeft = Math.max(0, image.panX || 0);
+    viewport.scrollTop = Math.max(0, image.panY || 0);
+    if (!persistClampedPosition) return;
+
+    const panX = viewport.scrollLeft;
+    const panY = viewport.scrollTop;
+    if (Math.abs(panX - (image.panX || 0)) < 0.5 && Math.abs(panY - (image.panY || 0)) < 0.5) return;
+    setFloatingImages(prev => prev.map(item => item.id === image.id ? { ...item, panX, panY } : item));
+  };
+
+  const pdfViewportPositionKey = floatingImages
+    .filter(image => image.type === 'pdf')
+    .map(image => `${image.id}:${image.documentPage || 1}:${image.width}:${image.zoom || 1}:${image.panX || 0}:${image.panY || 0}`)
+    .join('|');
+
+  useEffect(() => {
+    for (const image of floatingImages) {
+      if (image.type === 'pdf') restorePdfViewportPosition(image);
+    }
+  }, [pdfViewportPositionKey]);
+
+  const handlePdfWheelZoom = (event: React.WheelEvent<HTMLDivElement>, image: FloatingImage) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const viewport = event.currentTarget;
+    const previousZoom = image.zoom || 1;
+    const limitedDelta = clampNumber(event.deltaY, -120, 120);
+    const rawZoom = clampNumber(previousZoom * Math.exp(-limitedDelta * 0.0025), 0.5, 5);
+    const nextZoom = Math.round(rawZoom * 20) / 20;
+    if (Math.abs(nextZoom - previousZoom) < 0.001) return;
+
+    const bounds = viewport.getBoundingClientRect();
+    const cursorX = event.clientX - bounds.left;
+    const cursorY = event.clientY - bounds.top;
+    const ratio = nextZoom / previousZoom;
+    const panX = Math.max(0, ((viewport.scrollLeft + cursorX) * ratio) - cursorX);
+    const panY = Math.max(0, ((viewport.scrollTop + cursorY) * ratio) - cursorY);
+
+    setFloatingImages(prev => prev.map(item => item.id === image.id
+      ? { ...item, zoom: nextZoom, panX, panY }
+      : item));
+    setTopWindowId(image.id);
+  };
+
+  const handlePdfPanPointerDown = (event: React.PointerEvent<HTMLDivElement>, image: FloatingImage) => {
+    if (event.button !== 1) return;
+    const viewport = event.currentTarget;
+    if (viewport.scrollWidth <= viewport.clientWidth && viewport.scrollHeight <= viewport.clientHeight) return;
+    event.preventDefault();
+    event.stopPropagation();
+    viewport.setPointerCapture(event.pointerId);
+    pdfPanSessionRef.current = {
+      id: image.id,
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      scrollLeft: viewport.scrollLeft,
+      scrollTop: viewport.scrollTop
+    };
+    setTopWindowId(image.id);
+  };
+
+  const handlePdfPanPointerMove = (event: React.PointerEvent<HTMLDivElement>, id: string) => {
+    const session = pdfPanSessionRef.current;
+    if (!session || session.id !== id || session.pointerId !== event.pointerId) return;
+    event.preventDefault();
+    event.stopPropagation();
+    event.currentTarget.scrollLeft = session.scrollLeft - (event.clientX - session.startX);
+    event.currentTarget.scrollTop = session.scrollTop - (event.clientY - session.startY);
+  };
+
+  const endPdfPan = (event: React.PointerEvent<HTMLDivElement>, id: string) => {
+    const session = pdfPanSessionRef.current;
+    if (!session || session.id !== id || session.pointerId !== event.pointerId) return;
+    const viewport = event.currentTarget;
+    if (viewport.hasPointerCapture(event.pointerId)) viewport.releasePointerCapture(event.pointerId);
+    pdfPanSessionRef.current = null;
+    const panX = viewport.scrollLeft;
+    const panY = viewport.scrollTop;
+    setFloatingImages(prev => prev.map(image => image.id === id ? { ...image, panX, panY } : image));
+  };
+
   const handleImageWheelZoom = (event: React.WheelEvent<HTMLDivElement>, id: string) => {
     event.preventDefault();
     event.stopPropagation();
@@ -3943,29 +4093,46 @@ export default function App() {
     event.preventDefault();
     event.stopPropagation();
     event.currentTarget.setPointerCapture(event.pointerId);
-    annotationSessionRef.current = { id, pointerId: event.pointerId };
+    const targetImage = floatingImages.find(image => image.id === id);
+    const pageKey = targetImage?.type === 'pdf' ? getAnnotationPageKey(targetImage) : undefined;
+    annotationSessionRef.current = { id, pointerId: event.pointerId, pageKey };
     const color = annotationColors[id] || '#ff3b30';
-    setFloatingImages(prev => prev.map(image => image.id === id ? {
-      ...image,
-      annotations: [...(image.annotations || []), { color, width: 8, points: [point] }]
-    } : image));
+    setFloatingImages(prev => prev.map(image => image.id === id
+      ? replaceVisibleAnnotations(
+          image,
+          [...getVisibleAnnotations(image, pageKey), { color, width: 8, points: [point] }],
+          pageKey
+        )
+      : image));
   };
 
   const continueImageAnnotation = (event: React.PointerEvent<SVGSVGElement>, id: string) => {
     const session = annotationSessionRef.current;
     if (!session || session.id !== id || session.pointerId !== event.pointerId) return;
-    const point = getAnnotationPoint(event.currentTarget, event.clientX, event.clientY);
-    if (!point) return;
+    const coalescedEvents = typeof event.nativeEvent.getCoalescedEvents === 'function'
+      ? event.nativeEvent.getCoalescedEvents()
+      : [event.nativeEvent];
+    const points = coalescedEvents
+      .map(pointerEvent => getAnnotationPoint(event.currentTarget, pointerEvent.clientX, pointerEvent.clientY))
+      .filter((point): point is ImageAnnotationPoint => point !== null);
+    if (points.length === 0) return;
     event.preventDefault();
     event.stopPropagation();
     setFloatingImages(prev => prev.map(image => {
-      if (image.id !== id || !image.annotations?.length) return image;
-      const annotations = [...image.annotations];
+      if (image.id !== id) return image;
+      const annotations = [...getVisibleAnnotations(image, session.pageKey)];
+      if (annotations.length === 0) return image;
       const lastStroke = annotations[annotations.length - 1];
-      const previousPoint = lastStroke.points[lastStroke.points.length - 1];
-      if (previousPoint && Math.hypot(point.x - previousPoint.x, point.y - previousPoint.y) < 1) return image;
-      annotations[annotations.length - 1] = { ...lastStroke, points: [...lastStroke.points, point] };
-      return { ...image, annotations };
+      const nextPoints = [...lastStroke.points];
+      for (const point of points) {
+        const previousPoint = nextPoints[nextPoints.length - 1];
+        if (!previousPoint || Math.hypot(point.x - previousPoint.x, point.y - previousPoint.y) >= 0.75) {
+          nextPoints.push(point);
+        }
+      }
+      if (nextPoints.length === lastStroke.points.length) return image;
+      annotations[annotations.length - 1] = { ...lastStroke, points: nextPoints };
+      return replaceVisibleAnnotations(image, annotations, session.pageKey);
     }));
   };
 
@@ -4133,6 +4300,8 @@ export default function App() {
             left: position.x,
             top: position.y,
             zIndex: 90000,
+            contain: 'layout style',
+            willChange: 'width, height, opacity, transform',
           }}
         >
           <div 
@@ -4140,7 +4309,7 @@ export default function App() {
              style={{ transition: 'border-radius 180ms cubic-bezier(0.22, 1, 0.36, 1), box-shadow 160ms ease, background-color 160ms ease' }}
              onMouseDown={handlePillMouseDown}
           >
-            <AnimatePresence mode="popLayout" initial={false}>
+            <AnimatePresence initial={false}>
               {isRetracted ? (
                   <motion.div 
                     key="retracted"
@@ -4206,7 +4375,12 @@ export default function App() {
                  <div 
                     className="flex-1 w-full h-full overflow-y-auto overflow-x-hidden no-scrollbar flex flex-wrap justify-center gap-2 py-2 content-start"
                  >
-                   {floatingImages.length === 0 && floatingNotes.length === 0 && floatingSketches.length === 0 ? (
+                   {!isPillContentReady ? (
+                     <div className="w-full px-2 py-4 space-y-2 pointer-events-none" aria-hidden="true">
+                       <div className="h-16 rounded-xl bg-black/5 dark:bg-white/5" />
+                       <div className="h-16 rounded-xl bg-black/5 dark:bg-white/5 opacity-60" />
+                     </div>
+                   ) : floatingImages.length === 0 && floatingNotes.length === 0 && floatingSketches.length === 0 ? (
                      <div className="text-[10px] text-slate-500 font-medium py-4 px-2 text-center opacity-70 drag-handle cursor-move w-full">
                        Drop<br/>Media / Notes<br/>Here
                      </div>
@@ -4229,11 +4403,13 @@ export default function App() {
                                <span className="text-[9px] truncate max-w-[70px]">PDF</span>
                              </div>
                            ) : (
-                             <img 
-                               src={img.url} 
-                               className="w-full h-full object-cover" 
-                               alt="Thumbnail" 
-                               draggable={false}
+                              <img
+                                src={img.url}
+                                className="w-full h-full object-cover"
+                                alt="Thumbnail"
+                                loading="lazy"
+                                decoding="async"
+                                draggable={false}
                                onClick={() => {
                                  setFloatingImages(prev => prev.map(f => f.id === img.id ? {...f, isCollapsed: false} : f));
                                  setTopWindowId(img.id);
@@ -5395,22 +5571,24 @@ export default function App() {
                 >
                   1:1
                 </button>
-                {img.type !== 'pdf' && (
-                  <button
-                    onClick={() => {
-                      const willDraw = !annotationModes[img.id];
-                      setAnnotationModes(prev => ({ ...prev, [img.id]: willDraw }));
-                      if (willDraw && img.isLocked) {
-                        setFloatingImages(prev => prev.map(f => f.id === img.id ? { ...f, isLocked: false } : f));
-                      }
-                    }}
-                    className={`p-1 rounded transition-colors ${annotationModes[img.id] ? 'bg-rose-500 text-white' : 'hover:bg-black/10 dark:hover:bg-white/10 text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'}`}
-                    title={annotationModes[img.id] ? 'Stop drawing' : 'Draw on image'}
-                  >
-                    <PenTool className="w-3 h-3" />
-                  </button>
-                )}
-                {annotationModes[img.id] && img.type !== 'pdf' && (
+                <button
+                  onClick={() => {
+                    const willDraw = !annotationModes[img.id];
+                    setAnnotationModes(prev => ({ ...prev, [img.id]: willDraw }));
+                    if (willDraw && img.isLocked) {
+                      setFloatingImages(prev => prev.map(f => f.id === img.id ? { ...f, isLocked: false } : f));
+                    }
+                  }}
+                  className={`p-1 rounded transition-colors ${annotationModes[img.id] ? 'bg-rose-500 text-white' : 'hover:bg-black/10 dark:hover:bg-white/10 text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'}`}
+                  title={annotationModes[img.id]
+                    ? 'Stop drawing'
+                    : img.type === 'pdf'
+                      ? `Draw on PDF page ${img.documentPage || 1}`
+                      : 'Draw on image'}
+                >
+                  <PenTool className="w-3 h-3" />
+                </button>
+                {annotationModes[img.id] && (
                   <input
                     type="color"
                     value={annotationColors[img.id] || '#ff3b30'}
@@ -5419,19 +5597,23 @@ export default function App() {
                     title="Drawing color"
                   />
                 )}
-                {(img.annotations?.length || 0) > 0 && img.type !== 'pdf' && (
+                {getVisibleAnnotations(img).length > 0 && (
                   <>
                     <button
-                      onClick={() => setFloatingImages(prev => prev.map(f => f.id === img.id ? { ...f, annotations: (f.annotations || []).slice(0, -1) } : f))}
+                      onClick={() => setFloatingImages(prev => prev.map(f => f.id === img.id
+                        ? replaceVisibleAnnotations(f, getVisibleAnnotations(f).slice(0, -1))
+                        : f))}
                       className="hover:bg-black/10 dark:hover:bg-white/10 p-1 rounded transition-colors text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white"
-                      title="Undo last drawing"
+                      title={img.type === 'pdf' ? 'Undo last drawing on this page' : 'Undo last drawing'}
                     >
                       <Eraser className="w-3 h-3" />
                     </button>
                     <button
-                      onClick={() => setFloatingImages(prev => prev.map(f => f.id === img.id ? { ...f, annotations: [] } : f))}
+                      onClick={() => setFloatingImages(prev => prev.map(f => f.id === img.id
+                        ? replaceVisibleAnnotations(f, [])
+                        : f))}
                       className="hover:bg-red-500/80 p-1 rounded transition-colors text-slate-500 dark:text-slate-400 hover:text-white"
-                      title="Clear all drawings"
+                      title={img.type === 'pdf' ? 'Clear drawings on this page' : 'Clear all drawings'}
                     >
                       <Trash2 className="w-3 h-3" />
                     </button>
@@ -5512,32 +5694,93 @@ export default function App() {
 
                   {img.type === 'pdf' ? (
                     <div className="relative flex flex-col items-center justify-center bg-slate-800/50 w-full">
-                      <div className="overflow-auto no-scrollbar w-full max-h-[75vh]" onMouseDown={(e) => { e.stopPropagation(); /* allow native pan */ }}>
-                        <PdfCanvas
-                          url={img.url}
-                          pageNumber={img.documentPage || 1}
-                          width={img.width}
-                          scale={img.zoom || 1}
-                          onLoadSuccess={(numPages) => setFloatingImages(prev => prev.map(f => f.id === img.id ? { ...f, documentNumPages: numPages } : f))}
-                          onLoadError={(error) => {
-                            console.error("PDF load failed:", error);
-                            setFloatingImages(prev => prev.map(f => f.id === img.id ? { ...f, searchStatus: `PDF failed to load: ${error.message}` } : f));
-                          }}
-                        />
+                      <div
+                        ref={(element) => {
+                          if (element) pdfViewportRefs.current.set(img.id, element);
+                          else pdfViewportRefs.current.delete(img.id);
+                        }}
+                        data-pdf-viewport={img.id}
+                        className={`overflow-auto no-scrollbar w-full max-h-[75vh] min-h-32 no-window-drag touch-none ${annotationModes[img.id] ? 'cursor-crosshair' : ((img.zoom || 1) > 1 ? 'cursor-grab' : 'cursor-default')}`}
+                        onWheel={(event) => handlePdfWheelZoom(event, img)}
+                        onPointerDown={(event) => handlePdfPanPointerDown(event, img)}
+                        onPointerMove={(event) => handlePdfPanPointerMove(event, img.id)}
+                        onPointerUp={(event) => endPdfPan(event, img.id)}
+                        onPointerCancel={(event) => endPdfPan(event, img.id)}
+                        onAuxClick={(event) => {
+                          if (event.button === 1) event.preventDefault();
+                        }}
+                        title={annotationModes[img.id]
+                          ? `Draw on PDF page ${img.documentPage || 1}. Scroll to zoom.`
+                          : 'Scroll to zoom. Middle-click and drag to pan.'}
+                      >
+                        <div className="inline-flex min-w-full justify-center">
+                          <PdfCanvas
+                            url={img.url}
+                            pageNumber={img.documentPage || 1}
+                            width={img.width}
+                            scale={img.zoom || 1}
+                            onLoadSuccess={(numPages) => setFloatingImages(prev => prev.map(f => {
+                              if (f.id !== img.id || f.documentNumPages === numPages) return f;
+                              return { ...f, documentNumPages: numPages };
+                            }))}
+                            onLoadError={(error) => {
+                              console.error("PDF load failed:", error);
+                              setFloatingImages(prev => prev.map(f => f.id === img.id ? { ...f, searchStatus: `PDF failed to load: ${error.message}` } : f));
+                            }}
+                            onRenderSuccess={() => restorePdfViewportPosition(img, true)}
+                          >
+                            <svg
+                              viewBox="0 0 1000 1000"
+                              preserveAspectRatio="none"
+                              className={`absolute inset-0 z-10 w-full h-full touch-none ${annotationModes[img.id] ? 'pointer-events-auto' : 'pointer-events-none'}`}
+                              onPointerDown={(event) => startImageAnnotation(event, img.id)}
+                              onPointerMove={(event) => continueImageAnnotation(event, img.id)}
+                              onPointerUp={(event) => endImageAnnotation(event, img.id)}
+                              onPointerCancel={(event) => endImageAnnotation(event, img.id)}
+                            >
+                              {getVisibleAnnotations(img).map((stroke, strokeIndex) => stroke.points.length === 1 ? (
+                                <circle
+                                  key={strokeIndex}
+                                  cx={stroke.points[0].x}
+                                  cy={stroke.points[0].y}
+                                  r={stroke.width / 2}
+                                  fill={stroke.color}
+                                />
+                              ) : (
+                                <path
+                                  key={strokeIndex}
+                                  d={getSmoothStrokePath(stroke.points)}
+                                  fill="none"
+                                  stroke={stroke.color}
+                                  strokeWidth={stroke.width}
+                                  strokeLinecap="round"
+                                  strokeLinejoin="round"
+                                />
+                              ))}
+                            </svg>
+                          </PdfCanvas>
+                        </div>
                       </div>
+                      {annotationModes[img.id] && (
+                        <div className="absolute left-2 top-2 z-40 rounded-md bg-slate-950/75 px-2 py-1 text-[9px] font-medium text-white pointer-events-none">
+                          Drawing on page {img.documentPage || 1}
+                        </div>
+                      )}
                       {/* Page Controls */}
                       {(img.documentNumPages || 0) > 1 && (
                         <div className="absolute bottom-4 left-1/2 -translate-x-1/2 bg-slate-900/80 backdrop-blur border border-white/10 rounded-full px-3 py-1 flex items-center space-x-3 shadow-xl z-50 pointer-events-auto">
                           <button 
-                            onClick={(e) => { e.stopPropagation(); setFloatingImages(prev => prev.map(f => f.id === img.id ? {...f, documentPage: Math.max(1, (f.documentPage || 1) - 1)} : f)); }}
+                            onClick={(e) => { e.stopPropagation(); setFloatingImages(prev => prev.map(f => f.id === img.id ? {...f, documentPage: Math.max(1, (f.documentPage || 1) - 1), panX: 0, panY: 0} : f)); }}
                             className="p-1 hover:bg-black/10 dark:hover:bg-white/10 rounded-full text-slate-500 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white"
+                            title="Previous PDF page"
                           >
                             <ChevronLeft className="w-4 h-4"/>
                           </button>
                           <span className="text-slate-900 dark:text-white text-xs font-medium font-mono">{img.documentPage || 1} / {img.documentNumPages}</span>
                           <button 
-                            onClick={(e) => { e.stopPropagation(); setFloatingImages(prev => prev.map(f => f.id === img.id ? {...f, documentPage: Math.min((f.documentNumPages || 1), (f.documentPage || 1) + 1)} : f)); }}
+                            onClick={(e) => { e.stopPropagation(); setFloatingImages(prev => prev.map(f => f.id === img.id ? {...f, documentPage: Math.min((f.documentNumPages || 1), (f.documentPage || 1) + 1), panX: 0, panY: 0} : f)); }}
                             className="p-1 hover:bg-black/10 dark:hover:bg-white/10 rounded-full text-slate-500 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white"
+                            title="Next PDF page"
                           >
                             <ChevronRight className="w-4 h-4"/>
                           </button>
@@ -5613,7 +5856,7 @@ export default function App() {
                           onPointerUp={(event) => endImageAnnotation(event, img.id)}
                           onPointerCancel={(event) => endImageAnnotation(event, img.id)}
                         >
-                          {(img.annotations || []).map((stroke, strokeIndex) => stroke.points.length === 1 ? (
+                          {getVisibleAnnotations(img).map((stroke, strokeIndex) => stroke.points.length === 1 ? (
                             <circle
                               key={strokeIndex}
                               cx={stroke.points[0].x}
@@ -5622,9 +5865,9 @@ export default function App() {
                               fill={stroke.color}
                             />
                           ) : (
-                            <polyline
+                            <path
                               key={strokeIndex}
-                              points={stroke.points.map(point => `${point.x},${point.y}`).join(' ')}
+                              d={getSmoothStrokePath(stroke.points)}
                               fill="none"
                               stroke={stroke.color}
                               strokeWidth={stroke.width}

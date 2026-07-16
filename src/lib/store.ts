@@ -34,6 +34,7 @@ export interface FloatingImage {
   searchStatus?: string;
   pHash?: string;
   annotations?: ImageAnnotationStroke[];
+  pdfAnnotations?: Record<string, ImageAnnotationStroke[]>;
 }
 
 export interface FloatingNote {

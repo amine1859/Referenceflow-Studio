@@ -1,7 +1,7 @@
 {
   "name": "ref-flow-studio",
   "private": false,
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "A Windows desktop reference-board app for artists, designers, and developers.",
   "author": "RefFlow Studio contributors",
   "license": "MIT",
