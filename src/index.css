@@ -189,7 +189,24 @@ html:not(.dark) [class~="border-slate-700"] {
 
 .floating-window {
   backface-visibility: hidden;
-  transform: translateZ(0);
+}
+
+/* Large boards favor responsiveness and lower GPU memory over decorative
+   compositing. The normal visual treatment remains unchanged below 12 open
+   references. */
+.large-board-performance .floating-window {
+  backface-visibility: visible;
+  filter: none !important;
+}
+
+.large-board-performance .floating-window [class*="backdrop-blur"] {
+  -webkit-backdrop-filter: none !important;
+  backdrop-filter: none !important;
+}
+
+.large-board-performance .floating-window,
+.large-board-performance .floating-window * {
+  transition-duration: 0.01ms !important;
 }
 
 .context-menu-button {

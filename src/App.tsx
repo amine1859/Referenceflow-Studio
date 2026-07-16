@@ -7,6 +7,8 @@ import { motion, AnimatePresence } from 'motion/react';
 import Markdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { FloatingImage, FloatingNote, FloatingSketch, FloatingSketchLine, ImageAnnotationPoint, Project, getProjects, createProject, updateProject, deleteProject, getActiveProjectId, setActiveProjectId, fileToBase64 } from './lib/store';
+import { createLocalBoardManifest, createProjectMediaSnapshot, getBackgroundMediaFileName, getFloatingMediaFileName, getSavedMediaExtension, projectMediaSnapshotsEqual, sanitizeExportStem } from './lib/projectMedia';
+import type { ProjectMediaSnapshot } from './lib/projectMedia';
 
 import { FloatingSketchWindow } from './components/FloatingSketchWindow';
 import { pdfjs } from 'react-pdf';
@@ -71,6 +73,175 @@ const getPdfFileSource = (url: string) => {
   }
   return { url };
 };
+
+const MAX_REFERENCE_PREVIEW_DIMENSION = 2048;
+const MAX_CONCURRENT_REFERENCE_PREVIEWS = 2;
+const MIN_BOUNDED_PREVIEW_SOURCE_LENGTH = 1_500_000;
+let activeReferencePreviewJobs = 0;
+const pendingReferencePreviewJobs: Array<() => void> = [];
+
+const drainReferencePreviewJobs = () => {
+  while (activeReferencePreviewJobs < MAX_CONCURRENT_REFERENCE_PREVIEWS && pendingReferencePreviewJobs.length > 0) {
+    pendingReferencePreviewJobs.shift()?.();
+  }
+};
+
+const withReferencePreviewSlot = <T,>(task: () => Promise<T>) => new Promise<T>((resolve, reject) => {
+  pendingReferencePreviewJobs.push(() => {
+    activeReferencePreviewJobs++;
+    void task().then(resolve, reject).finally(() => {
+      activeReferencePreviewJobs--;
+      drainReferencePreviewJobs();
+    });
+  });
+  drainReferencePreviewJobs();
+});
+
+const getReferencePreviewWidth = (displayWidth: number, zoom: number) => {
+  const requiredWidth = displayWidth * Math.max(1, zoom) * (window.devicePixelRatio || 1);
+  if (requiredWidth <= 512) return 512;
+  if (requiredWidth <= 1024) return 1024;
+  return MAX_REFERENCE_PREVIEW_DIMENSION;
+};
+
+const shouldKeepNativeImageRendering = (source: string) =>
+  !/^data:image\//i.test(source)
+  || source.length < MIN_BOUNDED_PREVIEW_SOURCE_LENGTH
+  || /^data:image\/(?:gif|webp)/i.test(source)
+  || /\.(?:gif|webp)(?:$|[?#])/i.test(source);
+
+// Render static references through a bounded canvas so a 10k source image does
+// not keep a 10k decoded GPU surface alive. The original source remains intact
+// for exporting, native drag-and-drop, palette extraction, and board storage.
+function ReferenceImagePreview({
+  src,
+  targetWidth,
+  className,
+  style,
+  draggable,
+  title,
+  onMouseDown,
+  onMouseEnter,
+  onDragStart
+}: {
+  src: string;
+  targetWidth: number;
+  className?: string;
+  style?: React.CSSProperties;
+  draggable: boolean;
+  title: string;
+  onMouseDown?: (event: React.MouseEvent<HTMLElement>) => void;
+  onMouseEnter?: () => void;
+  onDragStart?: (event: React.DragEvent<HTMLElement>) => void;
+}) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const failedSourceRef = useRef('');
+  const nativeRendering = shouldKeepNativeImageRendering(src);
+  const [fallbackToImage, setFallbackToImage] = useState(nativeRendering);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (nativeRendering || typeof createImageBitmap !== 'function') {
+      setFallbackToImage(true);
+      return;
+    }
+    if (failedSourceRef.current === src) {
+      setFallbackToImage(true);
+      return;
+    }
+    if (!canvas) {
+      setFallbackToImage(false);
+      return;
+    }
+
+    let disposed = false;
+    let bitmap: ImageBitmap | null = null;
+    const controller = new AbortController();
+    setFallbackToImage(false);
+
+    const renderPreview = async () => {
+      const response = await fetch(src, { signal: controller.signal });
+      if (!response.ok) throw new Error(`Image preview fetch failed with HTTP ${response.status}.`);
+      const blob = await response.blob();
+      bitmap = await createImageBitmap(blob);
+      if (disposed || !bitmap) return;
+      if (!bitmap.width || !bitmap.height) throw new Error('Image preview dimensions are invalid.');
+
+      const scale = Math.min(
+        1,
+        targetWidth / bitmap.width,
+        MAX_REFERENCE_PREVIEW_DIMENSION / bitmap.height
+      );
+      const previewWidth = Math.max(1, Math.round(bitmap.width * scale));
+      const previewHeight = Math.max(1, Math.round(bitmap.height * scale));
+      canvas.width = previewWidth;
+      canvas.height = previewHeight;
+      const context = canvas.getContext('2d', { alpha: true });
+      if (!context) throw new Error('Image preview canvas is unavailable.');
+      context.imageSmoothingEnabled = true;
+      context.imageSmoothingQuality = 'high';
+      context.clearRect(0, 0, previewWidth, previewHeight);
+      context.drawImage(bitmap, 0, 0, previewWidth, previewHeight);
+      bitmap.close();
+      bitmap = null;
+    };
+
+    void withReferencePreviewSlot(renderPreview).catch(error => {
+      if (disposed || controller.signal.aborted) return;
+      console.warn('Falling back to native image rendering:', error);
+      failedSourceRef.current = src;
+      setFallbackToImage(true);
+    });
+
+    return () => {
+      disposed = true;
+      controller.abort();
+      bitmap?.close();
+      bitmap = null;
+    };
+  }, [src, targetWidth, nativeRendering, fallbackToImage]);
+
+  useEffect(() => () => {
+    const canvas = canvasRef.current;
+    if (canvas) {
+      canvas.width = 0;
+      canvas.height = 0;
+    }
+  }, []);
+
+  if (fallbackToImage) {
+    return (
+      <img
+        src={src}
+        alt="Floating Reference"
+        loading="lazy"
+        decoding="async"
+        className={className}
+        style={style}
+        draggable={draggable}
+        title={title}
+        onMouseDown={event => onMouseDown?.(event)}
+        onMouseEnter={() => onMouseEnter?.()}
+        onDragStart={event => onDragStart?.(event)}
+      />
+    );
+  }
+
+  return (
+    <canvas
+      ref={canvasRef}
+      role="img"
+      aria-label="Floating Reference"
+      className={className}
+      style={{ ...style, width: '100%', height: 'auto' }}
+      draggable={draggable}
+      title={title}
+      onMouseDown={event => onMouseDown?.(event)}
+      onMouseEnter={() => onMouseEnter?.()}
+      onDragStart={event => onDragStart?.(event)}
+    />
+  );
+}
 
 function PdfCanvas({
   url,
@@ -761,6 +932,13 @@ export default function App() {
   });
   
   const [projects, setProjects] = useState<Project[]>([]);
+  const projectsRef = useRef<Project[]>([]);
+  const mirroredMediaSnapshotsRef = useRef<Map<string, ProjectMediaSnapshot>>(new Map());
+  const autosaveQueueRef = useRef<{
+    timer: number | null;
+    inFlight: boolean;
+    pending: (() => Promise<void>) | null;
+  }>({ timer: null, inFlight: false, pending: null });
   const [activeProjectId, setActiveProjectIdState] = useState<string | null>(null);
   const [showManager, setShowManager] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
@@ -787,6 +965,14 @@ export default function App() {
   const [updateActionPending, setUpdateActionPending] = useState(false);
 
   const [floatingSketches, setFloatingSketches] = useState<FloatingSketch[]>([]);
+
+  useEffect(() => {
+    projectsRef.current = projects;
+    const activeIds = new Set(projects.map(project => project.id));
+    for (const projectId of mirroredMediaSnapshotsRef.current.keys()) {
+      if (!activeIds.has(projectId)) mirroredMediaSnapshotsRef.current.delete(projectId);
+    }
+  }, [projects]);
 
   const fetchAndAddImage = async (url: string, asReference: boolean = false) => {
     try {
@@ -2069,8 +2255,34 @@ export default function App() {
     }
   };
 
+  const hasCompleteLocalMediaMirror = (project: Project, directoryPath: string) => {
+    const nodeRequire = getNodeRequire();
+    if (!nodeRequire || !directoryPath) return false;
+    try {
+      const fs = nodeRequire('fs');
+      const path = nodeRequire('path');
+      const imagesDirectory = path.join(directoryPath, 'images');
+      if (!fs.existsSync(imagesDirectory)) return false;
+      const backgroundFilesExist = (project.images || []).every((source, index) =>
+        fs.existsSync(path.join(imagesDirectory, getBackgroundMediaFileName(source, index)))
+      );
+      const floatingFilesExist = (project.floatingImages || []).every(image =>
+        fs.existsSync(path.join(imagesDirectory, getFloatingMediaFileName(image)))
+      );
+      return backgroundFilesExist && floatingFilesExist;
+    } catch {
+      return false;
+    }
+  };
+
   const ensureProjectLocalDirectory = async (project: Project, preferredRoot?: string): Promise<Project> => {
-    if (project.directoryPath || !getNodeRequire()) return project;
+    if (project.directoryPath) {
+      if (hasCompleteLocalMediaMirror(project, project.directoryPath)) {
+        mirroredMediaSnapshotsRef.current.set(project.id, createProjectMediaSnapshot(project));
+      }
+      return project;
+    }
+    if (!getNodeRequire()) return project;
     const root = preferredRoot || defaultAutosaveRoot || await getInstalledAutosaveRoot();
     const nodeRequire = getNodeRequire();
     if (!root || !nodeRequire) return project;
@@ -2211,6 +2423,9 @@ export default function App() {
           setFloatingSketches(activeProj.floatingSketches || []);
           
           if (activeProj.directoryPath) {
+             if (hasCompleteLocalMediaMirror(activeProj, activeProj.directoryPath)) {
+               mirroredMediaSnapshotsRef.current.set(activeProj.id, createProjectMediaSnapshot(activeProj));
+             }
              setNeedsPermission(false);
           } else if (installedRoot) {
              const nodeRequire = getNodeRequire();
@@ -2235,16 +2450,11 @@ export default function App() {
     init();
   }, []);
 
-  const syncBoardToHandle = async (project: Project, dirHandle: any) => {
+  const syncBoardToHandle = async (project: Project, dirHandle: any, syncMedia = true) => {
     try {
       if ((await dirHandle.queryPermission({ mode: 'readwrite' })) !== 'granted') {
           return;
       }
-
-      const sanitizeName = (value: string) => (value || 'untitled')
-        .replace(/[^a-z0-9._-]+/gi, '_')
-        .replace(/^_+|_+$/g, '')
-        .slice(0, 80) || 'untitled';
 
       const extensionForUrl = (url: string, fallback = 'bin') => {
         const lower = (url || '').toLowerCase();
@@ -2280,11 +2490,16 @@ export default function App() {
       const manifestProject = {
         ...project,
         directoryHandle: undefined,
+        images: (project.images || []).map((source, index) => `background_${index + 1}.${extensionForUrl(source, 'png')}`),
+        floatingImages: (project.floatingImages || []).map(image => ({
+          ...image,
+          url: `floating_${sanitizeExportStem(image.id)}.${extensionForUrl(image.url, image.type === 'pdf' ? 'pdf' : 'png')}`
+        })),
         exportedAt: new Date().toISOString()
       };
       await writeTextFile('board.json', JSON.stringify(manifestProject, null, 2));
 
-      if (project.images && project.images.length > 0) {
+      if (syncMedia && project.images && project.images.length > 0) {
         let i = 1;
         for (const img of project.images) {
           await saveBase64(img, `background_${i}.${extensionForUrl(img, 'png')}`);
@@ -2292,9 +2507,9 @@ export default function App() {
         }
       }
 
-      if (project.floatingImages && project.floatingImages.length > 0) {
+      if (syncMedia && project.floatingImages && project.floatingImages.length > 0) {
         for (const img of project.floatingImages) {
-          await saveBase64(img.url, `floating_${sanitizeName(img.id)}.${extensionForUrl(img.url, img.type === 'pdf' ? 'pdf' : 'png')}`);
+          await saveBase64(img.url, `floating_${sanitizeExportStem(img.id)}.${extensionForUrl(img.url, img.type === 'pdf' ? 'pdf' : 'png')}`);
         }
       }
 
@@ -2313,12 +2528,15 @@ export default function App() {
         null,
         2
       ));
+      if (syncMedia) {
+        mirroredMediaSnapshotsRef.current.set(project.id, createProjectMediaSnapshot(project));
+      }
     } catch (err: any) {
       console.error("Auto-sync failed", err);
     }
   };
 
-  const syncBoardToPath = async (project: Project, directoryPath: string): Promise<{ saved: number; failed: string[] }> => {
+  const syncBoardToPath = async (project: Project, directoryPath: string, syncMedia = true): Promise<{ saved: number; failed: string[] }> => {
     const nodeRequire = getNodeRequire();
     if (!nodeRequire || !directoryPath) {
       return { saved: 0, failed: ['Desktop filesystem access is unavailable.'] };
@@ -2328,15 +2546,11 @@ export default function App() {
       const electron = nodeRequire('electron');
       const fs = nodeRequire('fs');
       const path = nodeRequire('path');
+      const crypto = nodeRequire('crypto');
       const { fileURLToPath } = nodeRequire('url');
       fs.mkdirSync(directoryPath, { recursive: true });
       const imagesDirectory = path.join(directoryPath, 'images');
       fs.mkdirSync(imagesDirectory, { recursive: true });
-
-      const sanitizeName = (value: string) => (value || 'untitled')
-        .replace(/[^a-z0-9._-]+/gi, '_')
-        .replace(/^_+|_+$/g, '')
-        .slice(0, 80) || 'untitled';
 
       const writeText = (fileName: string, content: string) => {
         fs.writeFileSync(path.join(directoryPath, fileName), content, 'utf8');
@@ -2361,24 +2575,19 @@ export default function App() {
 
       const saveMedia = async (source: string, fileStem: string, type: 'image' | 'pdf' = 'image') => {
         const sourceBuffer = await readMedia(source);
-        if (type === 'pdf' || /^data:application\/pdf/i.test(source) || /\.pdf(?:$|[?#])/i.test(source)) {
+        const extension = getSavedMediaExtension(source, type);
+        if (extension === 'pdf') {
           fs.writeFileSync(path.join(imagesDirectory, `${fileStem}.pdf`), sourceBuffer);
           return;
         }
 
         const decodedImage = electron.nativeImage.createFromBuffer(sourceBuffer);
         if (decodedImage.isEmpty()) throw new Error('The image could not be decoded.');
-        const shouldUseJpeg = /^data:image\/jpe?g/i.test(source) || /\.jpe?g(?:$|[?#])/i.test(source);
-        const extension = shouldUseJpeg ? 'jpg' : 'png';
-        const encodedImage = shouldUseJpeg ? decodedImage.toJPEG(95) : decodedImage.toPNG();
+        const encodedImage = extension === 'jpg' ? decodedImage.toJPEG(95) : decodedImage.toPNG();
         fs.writeFileSync(path.join(imagesDirectory, `${fileStem}.${extension}`), encodedImage);
       };
 
-      const manifestProject = {
-        ...project,
-        directoryHandle: undefined,
-        exportedAt: new Date().toISOString()
-      };
+      const manifestProject = createLocalBoardManifest(project, 'images/');
 
       writeText('board.json', JSON.stringify(manifestProject, null, 2));
       writeText('sketches.json', JSON.stringify(project.floatingSketches || [], null, 2));
@@ -2398,28 +2607,88 @@ export default function App() {
       }
       writeText('notes.md', notes);
 
-      for (const fileName of fs.readdirSync(imagesDirectory)) {
-        if (/^(background_|floating_)/i.test(fileName)) {
-          fs.unlinkSync(path.join(imagesDirectory, fileName));
-        }
-      }
-
       let saved = 0;
       const failed: string[] = [];
-      for (let index = 0; index < (project.images || []).length; index++) {
+      if (syncMedia) {
+        const previousSnapshot = mirroredMediaSnapshotsRef.current.get(project.id);
+        const previousFloatingSources = new Map(
+          (previousSnapshot?.floatingSources || []).map(item => [item.id, item])
+        );
+        const mediaIndexPath = path.join(imagesDirectory, '.refflow-media-index.json');
+        let previousMediaIndex: Record<string, string> = {};
         try {
-          await saveMedia(project.images[index], `background_${index + 1}`);
-          saved++;
-        } catch (error: any) {
-          failed.push(`Background ${index + 1}: ${error?.message || String(error)}`);
+          if (fs.existsSync(mediaIndexPath)) {
+            previousMediaIndex = JSON.parse(fs.readFileSync(mediaIndexPath, 'utf8'));
+          }
+        } catch (error) {
+          console.warn('Could not read the board media index; changed files will be rebuilt.', error);
         }
-      }
-      for (const image of project.floatingImages || []) {
-        try {
-          await saveMedia(image.url, `floating_${sanitizeName(image.id)}`, image.type === 'pdf' ? 'pdf' : 'image');
-          saved++;
-        } catch (error: any) {
-          failed.push(`Image ${image.id}: ${error?.message || String(error)}`);
+
+        const nextMediaIndex: Record<string, string> = {};
+        const expectedFileNames = new Set<string>();
+        const saveIndexedMedia = async (
+          source: string,
+          fileStem: string,
+          fileName: string,
+          label: string,
+          type: 'image' | 'pdf' = 'image',
+          sourceUnchanged = false
+        ) => {
+          expectedFileNames.add(fileName);
+          const destination = path.join(imagesDirectory, fileName);
+          if (sourceUnchanged && fs.existsSync(destination)) {
+            nextMediaIndex[fileName] = previousMediaIndex[fileName]
+              || crypto.createHash('sha256').update(source).digest('hex');
+            saved++;
+            return;
+          }
+          const fingerprint = crypto.createHash('sha256').update(source).digest('hex');
+          if (previousMediaIndex[fileName] === fingerprint && fs.existsSync(destination)) {
+            nextMediaIndex[fileName] = fingerprint;
+            saved++;
+            return;
+          }
+          try {
+            await saveMedia(source, fileStem, type);
+            nextMediaIndex[fileName] = fingerprint;
+            saved++;
+          } catch (error: any) {
+            failed.push(`${label}: ${error?.message || String(error)}`);
+          }
+        };
+
+        for (let index = 0; index < (project.images || []).length; index++) {
+          const source = project.images[index];
+          await saveIndexedMedia(
+            source,
+            `background_${index + 1}`,
+            getBackgroundMediaFileName(source, index),
+            `Background ${index + 1}`,
+            'image',
+            previousSnapshot?.backgroundSources[index] === source
+          );
+        }
+        for (const image of project.floatingImages || []) {
+          const previousImage = previousFloatingSources.get(image.id);
+          const mediaType = image.type === 'pdf' ? 'pdf' : 'image';
+          await saveIndexedMedia(
+            image.url,
+            `floating_${sanitizeExportStem(image.id)}`,
+            getFloatingMediaFileName(image),
+            `Image ${image.id}`,
+            mediaType,
+            previousImage?.source === image.url && previousImage.type === mediaType
+          );
+        }
+
+        for (const fileName of fs.readdirSync(imagesDirectory)) {
+          if (/^(background_|floating_)/i.test(fileName) && !expectedFileNames.has(fileName)) {
+            fs.unlinkSync(path.join(imagesDirectory, fileName));
+          }
+        }
+        fs.writeFileSync(mediaIndexPath, JSON.stringify(nextMediaIndex, null, 2), 'utf8');
+        if (failed.length === 0) {
+          mirroredMediaSnapshotsRef.current.set(project.id, createProjectMediaSnapshot(project));
         }
       }
       return { saved, failed };
@@ -2429,37 +2698,93 @@ export default function App() {
     }
   };
 
-  // Save changes automatically
-  const debounceTimer = useRef<number | null>(null);
+  const drainAutosaveQueue = useCallback(async () => {
+    const queue = autosaveQueueRef.current;
+    if (queue.inFlight) return;
+    queue.inFlight = true;
+    try {
+      while (queue.pending) {
+        const pendingSave = queue.pending;
+        queue.pending = null;
+        try {
+          await pendingSave();
+        } catch (error) {
+          console.error('Project autosave failed:', error);
+        }
+      }
+    } finally {
+      queue.inFlight = false;
+    }
+  }, []);
+
+  // Save changes automatically. Work is serialized and coalesced so a large
+  // board can never build up overlapping IndexedDB and filesystem writes.
   useEffect(() => {
     if (isLoading || !activeProjectId) return;
-    
-    if (debounceTimer.current) window.clearTimeout(debounceTimer.current);
-    debounceTimer.current = window.setTimeout(async () => {
-      await updateProject(activeProjectId, {
-        images,
-        floatingImages,
-        floatingNotes,
-        floatingSketches
-      });
-      const all = await getProjects();
-      setProjects(all);
-      
-      const activeProj = all.find(p => p.id === activeProjectId);
-      if (activeProj?.directoryPath) {
-        const syncResult = await syncBoardToPath(activeProj, activeProj.directoryPath);
-        if (syncResult.failed.length > 0) {
-          console.warn('Some board media could not be mirrored locally:', syncResult.failed);
+
+    const queue = autosaveQueueRef.current;
+    if (queue.timer) window.clearTimeout(queue.timer);
+    const baseProject = projectsRef.current.find(project => project.id === activeProjectId);
+    if (!baseProject) return;
+    const projectSnapshot: Project = {
+      ...baseProject,
+      images,
+      floatingImages,
+      floatingNotes,
+      floatingSketches
+    };
+
+    queue.timer = window.setTimeout(() => {
+      queue.timer = null;
+      queue.pending = async () => {
+        const savedAt = Date.now();
+        await updateProject(activeProjectId, {
+          images: projectSnapshot.images,
+          floatingImages: projectSnapshot.floatingImages,
+          floatingNotes: projectSnapshot.floatingNotes,
+          floatingSketches: projectSnapshot.floatingSketches
+        });
+        setProjects(current => {
+          const next = current.map(project => project.id === activeProjectId
+            ? {
+                ...project,
+                images: projectSnapshot.images,
+                floatingImages: projectSnapshot.floatingImages,
+                floatingNotes: projectSnapshot.floatingNotes,
+                floatingSketches: projectSnapshot.floatingSketches,
+                updatedAt: savedAt
+              }
+            : project
+          );
+          projectsRef.current = next;
+          return next;
+        });
+
+        const mediaSnapshot = createProjectMediaSnapshot(projectSnapshot);
+        const syncMedia = !projectMediaSnapshotsEqual(
+          mirroredMediaSnapshotsRef.current.get(activeProjectId),
+          mediaSnapshot
+        );
+
+        if (projectSnapshot.directoryPath) {
+          const syncResult = await syncBoardToPath(projectSnapshot, projectSnapshot.directoryPath, syncMedia);
+          if (syncResult.failed.length > 0) {
+            console.warn('Some board media could not be mirrored locally:', syncResult.failed);
+          }
+        } else if (projectSnapshot.directoryHandle) {
+          await syncBoardToHandle(projectSnapshot, projectSnapshot.directoryHandle, syncMedia);
         }
-      } else if (activeProj?.directoryHandle) {
-        await syncBoardToHandle(activeProj, activeProj.directoryHandle);
-      }
-    }, 1000);
-    
+      };
+      void drainAutosaveQueue();
+    }, 1500);
+
     return () => {
-      if (debounceTimer.current) window.clearTimeout(debounceTimer.current);
-    }
-  }, [images, floatingImages, floatingNotes, floatingSketches, activeProjectId, isLoading]);
+      if (queue.timer) {
+        window.clearTimeout(queue.timer);
+        queue.timer = null;
+      }
+    };
+  }, [images, floatingImages, floatingNotes, floatingSketches, activeProjectId, isLoading, drainAutosaveQueue]);
 
   const exportBoard = async (project: Project) => {
     try {
@@ -2953,6 +3278,7 @@ export default function App() {
   }, []);
 
   const prevActivePanelsRef = useRef<Record<string, boolean>>({});
+  const lastInteractiveRegionsPayloadRef = useRef('');
 
   // Effect to log opens and closes of panels
   useEffect(() => {
@@ -2995,6 +3321,12 @@ export default function App() {
   // Publish real interactive rectangles to the main process. The main process
   // polls the native cursor, so click-through can recover even when Chromium no
   // longer receives normal pointer events over a transparent desktop area.
+  const interactiveWindowModeKey = [
+    floatingImages.map(image => `i:${image.id}:${image.isLocked ? 1 : 0}:${image.isCollapsed ? 1 : 0}`).join(','),
+    floatingNotes.map(note => `n:${note.id}:${note.isLocked ? 1 : 0}:${note.isCollapsed ? 1 : 0}`).join(','),
+    floatingSketches.map(sketch => `s:${sketch.id}:${sketch.isLocked ? 1 : 0}:${sketch.isCollapsed ? 1 : 0}`).join(',')
+  ].join('|');
+
   useEffect(() => {
     const isDragActive = !!(
       isDraggingPill || 
@@ -3016,30 +3348,52 @@ export default function App() {
       window.cancelAnimationFrame(animationFrame);
       animationFrame = window.requestAnimationFrame(() => {
         const elements = Array.from(document.querySelectorAll<HTMLElement>('.pointer-events-auto, [data-native-interactive="true"]'));
-        const regions = elements.flatMap(element => {
+        const regions: Array<{ x: number; y: number; width: number; height: number }> = [];
+        const dragHandleSelector = '.floating-drag-handle, .floating-note-drag-handle, .floating-sketch-drag-handle';
+        for (const element of elements) {
           const floatingWindow = element.closest<HTMLElement>('.floating-window');
-          if (floatingWindow?.dataset.collapsed === 'true') return [];
-          if (floatingWindow?.dataset.clickThrough === 'true') {
-            const isUnlockSurface = !!element.closest('.floating-drag-handle, .floating-note-drag-handle, .floating-sketch-drag-handle');
-            if (!isUnlockSurface) return [];
+          if (floatingWindow?.dataset.collapsed === 'true') continue;
+
+          if (floatingWindow) {
+            const dragHandle = element.closest<HTMLElement>(dragHandleSelector);
+            const isWindowSurface = element === floatingWindow;
+            const isDragHandleSurface = dragHandle === element;
+            if (floatingWindow.dataset.clickThrough === 'true') {
+              if (!isDragHandleSurface) continue;
+            } else if (!isWindowSurface && !isDragHandleSurface) {
+              // Child buttons and images are already covered by the window and
+              // handle rectangles. Measuring every descendant scales badly on
+              // boards with dozens of references.
+              continue;
+            }
+          } else {
+            const interactiveAncestor = element.parentElement?.closest<HTMLElement>('.pointer-events-auto, [data-native-interactive="true"]');
+            if (interactiveAncestor) continue;
           }
+
           const style = window.getComputedStyle(element);
-          if (style.display === 'none' || style.visibility === 'hidden' || style.pointerEvents === 'none') return [];
+          if (style.display === 'none' || style.visibility === 'hidden' || style.pointerEvents === 'none') continue;
           const rect = element.getBoundingClientRect();
-          if (rect.width < 1 || rect.height < 1 || rect.right <= 0 || rect.bottom <= 0 || rect.left >= window.innerWidth || rect.top >= window.innerHeight) return [];
-          return [{
-            x: Math.max(0, rect.left),
-            y: Math.max(0, rect.top),
-            width: Math.min(window.innerWidth, rect.right) - Math.max(0, rect.left),
-            height: Math.min(window.innerHeight, rect.bottom) - Math.max(0, rect.top)
-          }];
-        });
+          if (rect.width < 1 || rect.height < 1 || rect.right <= 0 || rect.bottom <= 0 || rect.left >= window.innerWidth || rect.top >= window.innerHeight) continue;
+          const left = Math.max(0, rect.left);
+          const top = Math.max(0, rect.top);
+          regions.push({
+            x: Math.round(left),
+            y: Math.round(top),
+            width: Math.round(Math.min(window.innerWidth, rect.right) - left),
+            height: Math.round(Math.min(window.innerHeight, rect.bottom) - top)
+          });
+        }
+
+        const payloadFingerprint = `${isDragActive ? 1 : 0}:${regions.map(region => `${region.x},${region.y},${region.width},${region.height}`).join('|')}`;
+        if (payloadFingerprint === lastInteractiveRegionsPayloadRef.current) return;
+        lastInteractiveRegionsPayloadRef.current = payloadFingerprint;
         ipcRenderer.send('update-interactive-regions', { regions, forceInteractive: isDragActive });
       });
     };
 
     publishInteractiveRegions();
-    const interval = window.setInterval(publishInteractiveRegions, 120);
+    const interval = window.setInterval(publishInteractiveRegions, 250);
     window.addEventListener('resize', publishInteractiveRegions);
     return () => {
       window.cancelAnimationFrame(animationFrame);
@@ -3055,9 +3409,7 @@ export default function App() {
     resizingNoteId, 
     resizingSketchId, 
     isResizingPill,
-    floatingImages,
-    floatingNotes,
-    floatingSketches,
+    interactiveWindowModeKey,
     isPillVisible,
     isRetracted,
     showSearchComponent,
@@ -3068,8 +3420,7 @@ export default function App() {
     searchContextMenu,
     floatingContextMenu,
     editingProjectId,
-    managingProjectId,
-    editingNotes
+    managingProjectId
   ]);
 
   const handlePillResizeMouseDown = (e: React.MouseEvent) => {
@@ -3631,9 +3982,13 @@ export default function App() {
 
   const emptyBoardBounds = displayLayout?.primary;
   const managerBounds = displayLayout?.primary;
+  const visibleReferenceCount = floatingImages.filter(image => !image.isCollapsed).length
+    + floatingNotes.filter(note => !note.isCollapsed).length
+    + floatingSketches.filter(sketch => !sketch.isCollapsed).length;
+  const reduceLargeBoardEffects = visibleReferenceCount >= 12;
 
   return (
-    <div className="w-screen h-screen overflow-hidden pointer-events-none relative" style={{ WebkitAppRegion: 'no-drag' } as any}>
+    <div className={`w-screen h-screen overflow-hidden pointer-events-none relative ${reduceLargeBoardEffects ? 'large-board-performance' : ''}`} style={{ WebkitAppRegion: 'no-drag' } as any}>
       {/* Global Drag Overlay to prevent mouse events being swallowed by canvas/iframes/pill while dragging */}
       {(isDraggingPill || draggingFloatingId || draggingNoteId || draggingSketchId || resizingFloatingId || resizingNoteId || resizingSketchId || isResizingPill) && (
         <div className={`absolute inset-0 z-[100000] pointer-events-auto ${(resizingFloatingId || resizingNoteId || resizingSketchId || isResizingPill) ? 'cursor-nwse-resize' : 'cursor-move'}`} />
@@ -4874,7 +5229,7 @@ export default function App() {
         ============================================================
       */}
       <AnimatePresence>
-        {floatingImages.map(img => (
+        {floatingImages.filter(img => !img.isCollapsed).map(img => (
           <motion.div 
             key={img.id}
             initial={{ opacity: 0, scale: 0.95, y: 10 }}
@@ -4884,7 +5239,7 @@ export default function App() {
               y: img.isCollapsed ? 10 : 0
             }}
             exit={{ opacity: 0, scale: 0.95, y: 10 }}
-            transition={(draggingFloatingId === img.id || resizingFloatingId === img.id) ? { type: "tween", duration: 0 } : { type: "spring", damping: 25, stiffness: 300, mass: 0.5 }}
+            transition={(reduceLargeBoardEffects || draggingFloatingId === img.id || resizingFloatingId === img.id) ? { type: "tween", duration: 0 } : { type: "spring", damping: 25, stiffness: 300, mass: 0.5 }}
             className={`absolute bg-transparent flex flex-col group pointer-events-auto floating-window`}
             data-id={img.id}
             data-click-through={img.isLocked ? 'true' : 'false'}
@@ -5045,7 +5400,7 @@ export default function App() {
                 height: img.isCollapsed ? 0 : 'auto',
                 borderWidth: img.isCollapsed ? 0 : 1
               }}
-              transition={resizingFloatingId === img.id ? { duration: 0 } : { duration: 0.2, ease: "easeInOut" }}
+              transition={(reduceLargeBoardEffects || resizingFloatingId === img.id) ? { duration: 0 } : { duration: 0.2, ease: "easeInOut" }}
               className={`relative shadow-2xl rounded-b-lg rounded-t-none border-white/10 overflow-hidden bg-black/40 flex flex-col ${img.isLocked ? 'pointer-events-none' : 'pointer-events-auto'}`}
               style={{ width: img.width, opacity: img.isCollapsed ? 0 : img.opacity }}
             >
@@ -5124,9 +5479,9 @@ export default function App() {
                           transformOrigin: 'center center'
                         }}
                       >
-                        <img
+                        <ReferenceImagePreview
                           src={img.url}
-                          alt="Floating Reference"
+                          targetWidth={getReferencePreviewWidth(img.width, img.zoom || 1)}
                           className="block w-full pointer-events-auto select-none no-window-drag"
                           style={{ objectFit: 'contain' }}
                           draggable={!img.isLocked && !annotationModes[img.id]}
@@ -5258,7 +5613,7 @@ export default function App() {
               y: note.isCollapsed ? 10 : 0
             }}
             exit={{ opacity: 0, scale: 0.95, y: 10 }}
-            transition={(draggingNoteId === note.id || resizingNoteId === note.id) ? { type: "tween", duration: 0 } : { type: "spring", damping: 25, stiffness: 300, mass: 0.5 }}
+            transition={(reduceLargeBoardEffects || draggingNoteId === note.id || resizingNoteId === note.id) ? { type: "tween", duration: 0 } : { type: "spring", damping: 25, stiffness: 300, mass: 0.5 }}
             className={`absolute bg-transparent flex flex-col group drop-shadow-2xl pointer-events-auto floating-window`}
             data-id={note.id}
             data-click-through={note.isLocked ? 'true' : 'false'}
