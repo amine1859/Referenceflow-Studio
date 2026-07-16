@@ -94,6 +94,12 @@ The installer is written to `dist_desktop/`.
 - [Code signing policy](CODE_SIGNING.md) — free code signing provided by SignPath.io, certificate by SignPath Foundation.
 - [Privacy policy](PRIVACY.md) — explains local storage and the user-initiated connections made by search and support features.
 
+## Updates
+
+- Starting with v1.0.3, installed builds check GitHub Releases after startup and periodically while running. Updates download in the background, and RefFlow Studio asks before restarting to install them.
+- If you have v1.0.2 or older, download the current installer from [GitHub Releases](https://github.com/amine1859/Referenceflow-Studio/releases) and run it once over the existing installation. The stable app ID and Windows data directory preserve local boards and preferences. Later releases can then update in-app.
+- Release automation must publish the signed installer together with the matching `latest.yml` generated after signing.
+
 ## License
 
 MIT

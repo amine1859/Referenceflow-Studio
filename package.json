@@ -15,9 +15,12 @@
     "lint": "tsc --noEmit",
     "electron:dev": "cross-env NODE_ENV=development electron electron-main.cjs",
     "electron:start": "vite build && cross-env NODE_ENV=production electron electron-main.cjs",
-    "electron:dist": "vite build && electron-builder --win --x64"
+    "electron:dist": "vite build && electron-builder --win --x64",
+    "update:metadata": "node tools/generate-update-metadata.cjs"
   },
-  "dependencies": {},
+  "dependencies": {
+    "electron-updater": "^6.8.5"
+  },
   "devDependencies": {
     "@google/genai": "^2.4.0",
     "@tailwindcss/typography": "^0.5.20",
@@ -52,9 +55,17 @@
   "build": {
     "appId": "com.refflow.studio",
     "productName": "RefFlowStudio",
+    "electronUpdaterCompatibility": ">=2.16",
     "directories": {
       "output": "dist_desktop"
     },
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "amine1859",
+        "repo": "Referenceflow-Studio"
+      }
+    ],
     "files": [
       "dist/**/*",
       "assets/**/*",

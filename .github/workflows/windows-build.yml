@@ -46,5 +46,6 @@ jobs:
           path: |
             dist_desktop/RefFlowStudio-*-x64-Setup.exe
             dist_desktop/RefFlowStudio-*-x64-Setup.exe.blockmap
+            dist_desktop/latest.yml
           if-no-files-found: error
           retention-days: 14

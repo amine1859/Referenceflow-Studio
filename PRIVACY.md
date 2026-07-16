@@ -6,9 +6,11 @@ RefFlow Studio is a local-first desktop application. It does not require a RefFl
 
 The app stores project boards, references, notes, sketches, annotations, preferences, search history, and provider settings locally on your device. When local board autosave or export is enabled, board files and media are written to the folder you select or to the configured ReferenceFlow data folder. Provider API keys are stored locally in the app's browser storage.
 
-## User-initiated network connections
+## Network connections
 
-RefFlow Studio connects to networked services only when you request a feature that needs them. Examples include image search, downloading a search result, high-resolution or reverse-image lookup, opening a provider in your browser, and opening the Patreon support page. Depending on the chosen feature and provider, search terms, image URLs, image data, and a provider API key may be sent directly to that third-party service. Those services apply their own privacy policies.
+RefFlow Studio connects to networked services when you request a feature that needs them. Examples include image search, downloading a search result, high-resolution or reverse-image lookup, opening a provider in your browser, and opening the Patreon support page. Depending on the chosen feature and provider, search terms, image URLs, image data, and a provider API key may be sent directly to that third-party service. Those services apply their own privacy policies.
+
+Installed builds also contact GitHub Releases after startup and periodically while running to check the current version and download an available update. These requests contain normal network metadata, such as your IP address and app version, but do not include boards, references, notes, API keys, or clipboard contents.
 
 ## Clipboard and desktop integration
 
