@@ -1,4 +1,5 @@
 const { app, BrowserWindow, Menu, screen, ipcMain, nativeImage, dialog, Tray, globalShortcut, clipboard, shell } = require('electron');
+const { autoUpdater } = require('electron-updater');
 const path = require('path');
 const fs = require('fs');
 const { execFile } = require('child_process');
@@ -41,8 +42,207 @@ let lastIgnoreMouseEvents = null;
 let lastRendererHeartbeat = 0;
 let rendererRecoveryTimer = null;
 let rendererRecoveryAttempts = 0;
+let updateCheckInFlight = null;
+let updateInitialTimer = null;
+let updateInterval = null;
+let autoUpdatesConfigured = false;
+let promptedUpdateVersion = null;
+let updateStatus = {
+  phase: app.isPackaged ? 'idle' : 'development',
+  currentVersion: app.getVersion(),
+  availableVersion: null,
+  percent: null,
+  bytesPerSecond: null,
+  transferred: null,
+  total: null,
+  checkedAt: null,
+  message: app.isPackaged
+    ? 'Updates are checked automatically.'
+    : 'Update checks are available in the installed app.'
+};
 
 const FALLBACK_ICON_PNG = "iVBORw0KGgoAAAANSUhEUgAAABAAAAEACAIAAADTED8xAAAAK0lEQVR4nGNk+M+ABzAyMsrBQMDAwKAQZGRkkGJgYGBgUGRgYBAAAI0sA6oGWmQqAAAAAElFTkSuQmCC";
+
+function emitUpdateStatus(patch = {}) {
+  updateStatus = {
+    ...updateStatus,
+    ...patch,
+    currentVersion: app.getVersion()
+  };
+
+  if (mainWindow && !mainWindow.isDestroyed() && !mainWindow.webContents.isDestroyed()) {
+    mainWindow.webContents.send('update-status', updateStatus);
+  }
+  return { ...updateStatus };
+}
+
+function normalizeUpdateError(error) {
+  const message = error instanceof Error ? error.message : String(error || 'Unknown update error');
+  return message.replace(/\s+/g, ' ').trim();
+}
+
+function installDownloadedUpdate() {
+  if (updateStatus.phase !== 'ready') return false;
+
+  emitUpdateStatus({
+    phase: 'installing',
+    message: `Restarting to install v${updateStatus.availableVersion || 'latest'}...`
+  });
+  isQuitting = true;
+  setImmediate(() => {
+    try {
+      autoUpdater.quitAndInstall(false, true);
+    } catch (error) {
+      isQuitting = false;
+      emitUpdateStatus({
+        phase: 'error',
+        message: `Could not start the installer: ${normalizeUpdateError(error)}`
+      });
+    }
+  });
+  return true;
+}
+
+async function promptToInstallUpdate(info) {
+  const version = info?.version || updateStatus.availableVersion || 'latest';
+  if (promptedUpdateVersion === version) return;
+  promptedUpdateVersion = version;
+
+  const options = {
+    type: 'info',
+    title: 'RefFlow Studio update ready',
+    message: `RefFlow Studio v${version} is ready to install.`,
+    detail: 'Restart now to finish the update, or choose Later to keep working. The update will also install when you next quit the app.',
+    buttons: ['Restart now', 'Later'],
+    defaultId: 0,
+    cancelId: 1,
+    noLink: true
+  };
+
+  try {
+    const parent = mainWindow && !mainWindow.isDestroyed() && mainWindow.isVisible() ? mainWindow : null;
+    const result = parent
+      ? await dialog.showMessageBox(parent, options)
+      : await dialog.showMessageBox(options);
+    if (result.response === 0) installDownloadedUpdate();
+  } catch (error) {
+    console.error('Failed to show the update prompt:', error);
+  }
+}
+
+async function checkForAppUpdates(manual = false) {
+  if (!app.isPackaged) {
+    return emitUpdateStatus({
+      phase: 'development',
+      message: 'Update checks are available in the installed app.'
+    });
+  }
+
+  if (['downloading', 'ready', 'installing'].includes(updateStatus.phase)) {
+    return { ...updateStatus };
+  }
+  if (updateCheckInFlight) {
+    await updateCheckInFlight;
+    return { ...updateStatus };
+  }
+
+  emitUpdateStatus({
+    phase: 'checking',
+    message: manual ? 'Checking GitHub Releases for an update...' : 'Checking for updates...'
+  });
+
+  updateCheckInFlight = autoUpdater.checkForUpdates();
+  try {
+    await updateCheckInFlight;
+  } catch (error) {
+    if (updateStatus.phase !== 'error') {
+      emitUpdateStatus({
+        phase: 'error',
+        checkedAt: new Date().toISOString(),
+        message: `Update check failed: ${normalizeUpdateError(error)}`
+      });
+    }
+  } finally {
+    updateCheckInFlight = null;
+  }
+  return { ...updateStatus };
+}
+
+function configureAutoUpdates() {
+  if (autoUpdatesConfigured) return;
+  autoUpdatesConfigured = true;
+
+  if (!app.isPackaged) {
+    emitUpdateStatus({
+      phase: 'development',
+      message: 'Update checks are available in the installed app.'
+    });
+    return;
+  }
+
+  autoUpdater.autoDownload = true;
+  autoUpdater.autoInstallOnAppQuit = true;
+  autoUpdater.autoRunAppAfterInstall = true;
+  autoUpdater.allowPrerelease = false;
+  // SignPath signs the final installer after packaging. Full downloads avoid
+  // using a pre-signing blockmap whose bytes no longer match the signed file.
+  autoUpdater.disableDifferentialDownload = true;
+  autoUpdater.logger = console;
+
+  autoUpdater.on('checking-for-update', () => {
+    emitUpdateStatus({ phase: 'checking', message: 'Checking for updates...' });
+  });
+  autoUpdater.on('update-available', info => {
+    emitUpdateStatus({
+      phase: 'available',
+      availableVersion: info.version,
+      percent: 0,
+      message: `Downloading RefFlow Studio v${info.version}...`
+    });
+  });
+  autoUpdater.on('download-progress', progress => {
+    emitUpdateStatus({
+      phase: 'downloading',
+      percent: Number.isFinite(progress.percent) ? progress.percent : 0,
+      bytesPerSecond: Number.isFinite(progress.bytesPerSecond) ? progress.bytesPerSecond : null,
+      transferred: Number.isFinite(progress.transferred) ? progress.transferred : null,
+      total: Number.isFinite(progress.total) ? progress.total : null,
+      message: `Downloading update... ${Math.round(progress.percent || 0)}%`
+    });
+  });
+  autoUpdater.on('update-not-available', () => {
+    emitUpdateStatus({
+      phase: 'up-to-date',
+      availableVersion: null,
+      percent: null,
+      checkedAt: new Date().toISOString(),
+      message: `RefFlow Studio v${app.getVersion()} is up to date.`
+    });
+  });
+  autoUpdater.on('update-downloaded', info => {
+    emitUpdateStatus({
+      phase: 'ready',
+      availableVersion: info.version,
+      percent: 100,
+      checkedAt: new Date().toISOString(),
+      message: `RefFlow Studio v${info.version} is ready to install.`
+    });
+    void promptToInstallUpdate(info);
+  });
+  autoUpdater.on('error', error => {
+    emitUpdateStatus({
+      phase: 'error',
+      checkedAt: new Date().toISOString(),
+      message: `Update failed: ${normalizeUpdateError(error)}`
+    });
+  });
+
+  updateInitialTimer = setTimeout(() => {
+    updateInitialTimer = null;
+    void checkForAppUpdates(false);
+  }, isBackgroundLaunch ? 30000 : 12000);
+  updateInterval = setInterval(() => void checkForAppUpdates(false), 6 * 60 * 60 * 1000);
+}
 
 function getAppIcon() {
   const candidatePaths = [
@@ -502,6 +702,14 @@ ipcMain.handle('get-launch-context', async () => ({
   shouldRevealPill: !isBackgroundLaunch
 }));
 
+ipcMain.handle('get-update-status', async () => ({ ...updateStatus }));
+
+ipcMain.handle('check-for-updates', async () => {
+  return await checkForAppUpdates(true);
+});
+
+ipcMain.handle('install-update', async () => installDownloadedUpdate());
+
 ipcMain.handle('open-external-url', async (_event, targetUrl) => {
   if (typeof targetUrl !== 'string') return false;
 
@@ -809,6 +1017,19 @@ function createTray() {
         }
       }
     },
+    {
+      label: 'Check for Updates',
+      click: () => {
+        if (mainWindow) {
+          forceWindowInteractive = true;
+          applyIgnoreMouseEvents(false);
+          mainWindow.show();
+          mainWindow.focus();
+          mainWindow.webContents.send('tray-action', 'show-settings');
+        }
+        void checkForAppUpdates(true);
+      }
+    },
     { type: 'separator' },
     {
       label: 'Show All References',
@@ -878,12 +1099,15 @@ if (gotSingleInstanceLock) {
   app.on('ready', () => {
     createWindow();
     createTray();
+    configureAutoUpdates();
   });
 }
 
 app.on('will-quit', () => {
   globalShortcut.unregisterAll();
   if (interactionPollTimer) clearInterval(interactionPollTimer);
+  if (updateInitialTimer) clearTimeout(updateInitialTimer);
+  if (updateInterval) clearInterval(updateInterval);
 });
 
 app.on('window-all-closed', function () {

@@ -20,6 +20,20 @@ pdfjs.GlobalWorkerOptions.workerSrc = new URL(
 
 const PATREON_URL = 'https://www.patreon.com/RefFlowStudio';
 
+type AppUpdatePhase = 'idle' | 'development' | 'checking' | 'available' | 'downloading' | 'up-to-date' | 'ready' | 'installing' | 'error';
+
+type AppUpdateStatus = {
+  phase: AppUpdatePhase;
+  currentVersion: string;
+  availableVersion?: string | null;
+  percent?: number | null;
+  bytesPerSecond?: number | null;
+  transferred?: number | null;
+  total?: number | null;
+  checkedAt?: string | null;
+  message?: string;
+};
+
 const getNodeRequire = () => {
   if (typeof window === 'undefined') return null;
   return typeof (window as any).require === 'function' ? (window as any).require : null;
@@ -765,6 +779,12 @@ export default function App() {
   const [annotationColors, setAnnotationColors] = useState<Record<string, string>>({});
   const imagePanSessionRef = useRef<{ id: string; pointerId: number; x: number; y: number } | null>(null);
   const annotationSessionRef = useRef<{ id: string; pointerId: number } | null>(null);
+  const [updateStatus, setUpdateStatus] = useState<AppUpdateStatus>({
+    phase: 'idle',
+    currentVersion: '',
+    message: 'Updates are checked automatically.'
+  });
+  const [updateActionPending, setUpdateActionPending] = useState(false);
 
   const [floatingSketches, setFloatingSketches] = useState<FloatingSketch[]>([]);
 
@@ -1967,6 +1987,67 @@ export default function App() {
     window.open(PATREON_URL, '_blank', 'noopener,noreferrer');
   };
 
+  const requestUpdateCheck = async () => {
+    const electron = getElectron();
+    if (!electron?.ipcRenderer) {
+      setUpdateStatus(current => ({
+        ...current,
+        phase: 'development',
+        message: 'Update checks are available in the installed app.'
+      }));
+      return;
+    }
+
+    setUpdateActionPending(true);
+    try {
+      const status = await electron.ipcRenderer.invoke('check-for-updates');
+      if (status?.phase) setUpdateStatus(status);
+    } catch (error) {
+      setUpdateStatus(current => ({
+        ...current,
+        phase: 'error',
+        message: `Update check failed: ${error instanceof Error ? error.message : String(error)}`
+      }));
+    } finally {
+      setUpdateActionPending(false);
+    }
+  };
+
+  const restartToInstallUpdate = async () => {
+    const electron = getElectron();
+    if (!electron?.ipcRenderer) return;
+    setUpdateActionPending(true);
+    try {
+      const started = await electron.ipcRenderer.invoke('install-update');
+      if (!started) {
+        setUpdateStatus(current => ({
+          ...current,
+          phase: 'error',
+          message: 'The update is not ready yet. Check again in a moment.'
+        }));
+        setUpdateActionPending(false);
+      }
+    } catch (error) {
+      setUpdateStatus(current => ({
+        ...current,
+        phase: 'error',
+        message: `Could not start the installer: ${error instanceof Error ? error.message : String(error)}`
+      }));
+      setUpdateActionPending(false);
+    }
+  };
+
+  const updateIsBusy = updateActionPending || ['checking', 'available', 'downloading', 'installing'].includes(updateStatus.phase);
+  const updateButtonLabel = updateStatus.phase === 'ready'
+    ? `Restart to install v${updateStatus.availableVersion || 'latest'}`
+    : updateStatus.phase === 'checking'
+      ? 'Checking for updates...'
+      : ['available', 'downloading'].includes(updateStatus.phase)
+        ? `Downloading... ${Math.round(updateStatus.percent || 0)}%`
+        : updateStatus.phase === 'installing'
+          ? 'Restarting...'
+          : 'Check for updates';
+
   const sanitizeProjectFolderName = (name: string) =>
     (name || 'board')
       .replace(/[^a-z0-9._-]+/gi, '_')
@@ -2006,6 +2087,35 @@ export default function App() {
     setProjects(await getProjects());
     return projectWithDirectory;
   };
+
+  useEffect(() => {
+    const electron = getElectron();
+    if (!electron?.ipcRenderer) {
+      setUpdateStatus(current => ({
+        ...current,
+        phase: 'development',
+        message: 'Update checks are available in the installed app.'
+      }));
+      return;
+    }
+
+    let isMounted = true;
+    const handleUpdateStatus = (_event: any, status: AppUpdateStatus) => {
+      if (isMounted && status?.phase) setUpdateStatus(status);
+    };
+
+    electron.ipcRenderer.invoke('get-update-status').then((status: AppUpdateStatus) => {
+      if (isMounted && status?.phase) setUpdateStatus(status);
+    }).catch((error: unknown) => {
+      console.warn('Could not read update status:', error);
+    });
+    electron.ipcRenderer.on('update-status', handleUpdateStatus);
+
+    return () => {
+      isMounted = false;
+      electron.ipcRenderer.removeListener('update-status', handleUpdateStatus);
+    };
+  }, []);
 
   useEffect(() => {
     const electron = getElectron();
@@ -2703,6 +2813,12 @@ export default function App() {
           break;
         case 'toggle-settings':
           setShowSettings(prev => !prev);
+          break;
+        case 'show-settings':
+          setIsPillVisible(true);
+          setIsRetracted(false);
+          setShowSearchComponent(false);
+          setShowSettings(true);
           break;
         case 'show-all-references':
           setFloatingImages(prev => prev.map(i => ({ ...i, isCollapsed: false })));
@@ -3830,7 +3946,7 @@ export default function App() {
                   
                   <button 
                     onClick={() => { setShowSettings(!showSettings); setShowSearchComponent(false); }}
-                    className={`w-10 h-10 rounded-full flex items-center justify-center transition-colors ${
+                    className={`relative w-10 h-10 rounded-full flex items-center justify-center transition-colors ${
                       showSettings
                         ? (theme === 'dark' ? 'bg-white/20 text-white' : 'bg-slate-200 text-slate-900')
                         : (theme === 'dark'
@@ -3840,6 +3956,9 @@ export default function App() {
                     title="Settings"
                   >
                     <Settings className="w-5 h-5" />
+                    {updateStatus.phase === 'ready' && (
+                      <span className="absolute right-0 top-0 h-2.5 w-2.5 rounded-full border-2 border-white dark:border-[#15151a] bg-emerald-500" />
+                    )}
                   </button>
                 </div>
               </motion.div>
@@ -3951,6 +4070,43 @@ export default function App() {
               />
               <span className="text-xs text-slate-700 dark:text-slate-300 group-hover:text-slate-950 dark:group-hover:text-white transition-colors">Show ReferenceFlow in Taskbar</span>
             </label>
+
+            <div className={`pt-3 border-t space-y-2 ${theme === 'light' ? 'border-black/10' : 'border-white/5'}`}>
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-[10px] text-slate-500 uppercase tracking-wider font-bold">App Updates</span>
+                <span className="text-[9px] font-mono text-slate-500">
+                  {updateStatus.currentVersion ? `v${updateStatus.currentVersion}` : 'installed build'}
+                </span>
+              </div>
+              <p className={`text-[10px] leading-4 ${updateStatus.phase === 'error' ? 'text-red-500' : updateStatus.phase === 'ready' ? 'text-emerald-500' : 'text-slate-500 dark:text-slate-400'}`}>
+                {updateStatus.message || 'Updates are checked automatically.'}
+              </p>
+              {['available', 'downloading'].includes(updateStatus.phase) && (
+                <div className="h-1.5 overflow-hidden rounded-full bg-black/10 dark:bg-white/10">
+                  <motion.div
+                    className="h-full rounded-full bg-sky-500"
+                    initial={false}
+                    animate={{ width: `${Math.max(0, Math.min(100, updateStatus.percent || 0))}%` }}
+                    transition={{ duration: 0.2 }}
+                  />
+                </div>
+              )}
+              <button
+                onClick={updateStatus.phase === 'ready' ? restartToInstallUpdate : requestUpdateCheck}
+                disabled={updateIsBusy || updateStatus.phase === 'development'}
+                className={`w-full flex items-center justify-center gap-2 rounded-lg border px-3 py-2 text-xs font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-60 ${
+                  updateStatus.phase === 'ready'
+                    ? 'border-emerald-500/30 bg-emerald-500/15 text-emerald-600 dark:text-emerald-300 hover:bg-emerald-500 hover:text-white'
+                    : 'border-sky-500/20 bg-sky-500/15 text-sky-600 dark:text-sky-300 hover:bg-sky-500 hover:text-white'
+                }`}
+              >
+                {updateIsBusy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : updateStatus.phase === 'ready' ? <Check className="w-3.5 h-3.5" /> : <RotateCw className="w-3.5 h-3.5" />}
+                {updateButtonLabel}
+              </button>
+              <p className="text-[9px] leading-4 text-slate-500 dark:text-slate-400">
+                Updates come from the official GitHub Releases page. Your boards and settings stay in place.
+              </p>
+            </div>
 
             <div className={`pt-3 border-t space-y-3 ${theme === 'light' ? 'border-black/10' : 'border-white/5'}`}>
               <div className="space-y-2">
