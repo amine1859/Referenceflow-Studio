@@ -15,7 +15,7 @@
     "lint": "tsc --noEmit",
     "electron:dev": "cross-env NODE_ENV=development electron electron-main.cjs",
     "electron:start": "vite build && cross-env NODE_ENV=production electron electron-main.cjs",
-    "electron:dist": "vite build && electron-builder --win --x64",
+    "electron:dist": "vite build && electron-builder --win --x64 --publish never",
     "update:metadata": "node tools/generate-update-metadata.cjs"
   },
   "dependencies": {
