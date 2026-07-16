@@ -4051,7 +4051,7 @@ export default function App() {
           }}
           exit={{ opacity: 0, scale: 0.92, y: 8 }}
           transition={isResizingPill ? { duration: 0 } : { type: "tween", duration: 0.18, ease: [0.22, 1, 0.36, 1] }}
-          className="absolute floating-window floating-pill pill-shell"
+          className="absolute floating-window floating-pill pill-shell pointer-events-auto"
           data-id="pill"
           style={{
             left: position.x,
