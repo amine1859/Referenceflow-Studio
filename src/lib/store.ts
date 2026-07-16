@@ -1,6 +1,17 @@
 import { get, set } from 'idb-keyval';
 import { v4 as uuidv4 } from 'uuid';
 
+export interface ImageAnnotationPoint {
+  x: number;
+  y: number;
+}
+
+export interface ImageAnnotationStroke {
+  color: string;
+  width: number;
+  points: ImageAnnotationPoint[];
+}
+
 export interface FloatingImage {
   id: string;
   url: string; // Will store base64 string
@@ -22,6 +33,7 @@ export interface FloatingImage {
   isSearchInProgress?: boolean;
   searchStatus?: string;
   pHash?: string;
+  annotations?: ImageAnnotationStroke[];
 }
 
 export interface FloatingNote {

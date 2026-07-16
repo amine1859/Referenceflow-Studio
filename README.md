@@ -89,6 +89,11 @@ The installer is written to `dist_desktop/`.
 - The installer uses `assets/referenceflow.ico` for installer, uninstaller, and app executable branding.
 - The app executable runs as the current user so normal desktop interactions are not blocked by Windows elevation rules.
 
+## Security and privacy
+
+- [Code signing policy](CODE_SIGNING.md) — free code signing provided by SignPath.io, certificate by SignPath Foundation.
+- [Privacy policy](PRIVACY.md) — explains local storage and the user-initiated connections made by search and support features.
+
 ## License
 
 MIT
