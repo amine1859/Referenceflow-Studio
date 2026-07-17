@@ -4,6 +4,7 @@ const { version: expectedVersion } = require('../package.json');
 
 const browserURL = process.argv[2] || 'http://127.0.0.1:9333';
 const startupEntryName = process.argv[3] || 'RefFlowStudio Test';
+const startupExecutablePattern = new RegExp(`${startupEntryName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\.exe`, 'i');
 const runKey = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run';
 
 async function main() {
@@ -17,14 +18,37 @@ async function main() {
     await page.waitForSelector('.floating-pill[data-pill-drag-rendering="imperative"]', { timeout: 20_000 });
     const packagedVersion = await page.evaluate(() => window.require('electron').ipcRenderer.invoke('get-update-status'));
     assert.strictEqual(packagedVersion.currentVersion, expectedVersion);
+    assert.ok(packagedVersion.phase, 'The packaged updater should report a runtime phase.');
+
+    const displayLayout = await page.evaluate(() => window.require('electron').ipcRenderer.invoke('get-display-layout'));
+    assert.ok(Array.isArray(displayLayout.displays) && displayLayout.displays.length > 0, 'Electron should expose at least one display.');
+    assert.ok(displayLayout.displays.some(display => display.isPrimary), 'The display layout should identify the primary monitor.');
+    assert.ok(displayLayout.virtual.width > 0 && displayLayout.virtual.height > 0, 'The virtual multi-monitor bounds should be usable.');
 
     const settingsInitiallyOpen = await page.evaluate(() => Boolean(document.querySelector('input[aria-label="Start on Boot"]')));
     if (settingsInitiallyOpen) {
       await page.evaluate(() => document.querySelector('button[title="Settings"]')?.click());
     }
-    await page.waitForSelector('[data-empty-board-prompt]', { timeout: 10_000 });
-    await page.evaluate(() => document.querySelector('button[aria-label="Close start board menu"]')?.click());
-    await page.waitForFunction(() => !document.querySelector('[data-empty-board-prompt]'));
+    const welcomeShown = Boolean(await page.$('[data-empty-board-prompt]'));
+    if (welcomeShown) {
+      await page.evaluate(() => document.querySelector('button[aria-label="Close start board menu"]')?.click());
+      await page.waitForFunction(() => !document.querySelector('[data-empty-board-prompt]'));
+    }
+
+    assert.strictEqual(await page.$$eval('[data-expanded-pill-brand] svg', elements => elements.length), 0, 'The packaged expanded pill should not show the stars icon.');
+    const pillActionColors = await page.$$eval('[data-pill-main-action]', buttons => buttons.map(button => getComputedStyle(button).color));
+    assert.strictEqual(pillActionColors.length, 4, 'The packaged pill should show all four primary actions.');
+    assert.ok(pillActionColors.every(color => color === 'rgb(255, 255, 255)'), `Packaged pill actions should be white at rest: ${pillActionColors.join(', ')}.`);
+    await page.hover('[data-pill-main-action]');
+    await new Promise(resolve => setTimeout(resolve, 240));
+    assert.strictEqual(await page.$eval('[data-pill-main-action]', button => getComputedStyle(button).color), 'rgb(94, 107, 255)', 'Packaged pill actions should turn purple on hover.');
+    const pillResizeFrame = await page.$eval('[data-invisible-resize-frame="pill"]', frame => ({
+      edges: frame.querySelectorAll('[data-resize-edge]').length,
+      visibleGrips: frame.querySelectorAll('[data-visible-resize-grip]').length
+    }));
+    assert.strictEqual(pillResizeFrame.edges, 8, 'The packaged pill should expose all invisible resize zones.');
+    assert.strictEqual(pillResizeFrame.visibleGrips, 0, 'The packaged pill resize zones should have no visible grips.');
+    await page.mouse.move(2200, 900);
 
     const readStartupEntry = () => page.evaluate(({ key, name }) => {
       try {
@@ -88,14 +112,28 @@ async function main() {
     assert.doesNotMatch(enabled.message, /still reports|could not|did not confirm/i);
     const enabledRegistryEntry = await readStartupEntry();
     assert.match(enabledRegistryEntry, /--background/i);
-    assert.match(enabledRegistryEntry, /RefFlowStudio Test\.exe/i);
+    assert.match(enabledRegistryEntry, startupExecutablePattern);
 
     const disabled = await setStartup(false);
     assert.strictEqual(disabled.checked, false);
     assert.match(disabled.message, /disabled|is off/i);
-    assert.strictEqual(await readStartupEntry(), '', 'The test startup entry should be removed after verification.');
+    assert.strictEqual(await readStartupEntry(), '', 'The startup entry should be removed after verification.');
 
-    console.log(JSON.stringify({ packagedVersion: packagedVersion.currentVersion, welcomeDismissed: true, searchSources, enabled, disabled, registryEntryVerified: true, cleanedUp: true }, null, 2));
+    console.log(JSON.stringify({
+      packagedVersion: packagedVersion.currentVersion,
+      updaterPhase: packagedVersion.phase,
+      displayCount: displayLayout.displays.length,
+      virtualDisplayBounds: displayLayout.virtual,
+      welcomeDismissed: welcomeShown,
+      expandedStarRemoved: true,
+      pillActionColors: 'white at rest, purple on hover',
+      pillResizeZones: pillResizeFrame.edges,
+      searchSources,
+      enabled,
+      disabled,
+      registryEntryVerified: true,
+      cleanedUp: true
+    }, null, 2));
   } finally {
     browser.disconnect();
   }

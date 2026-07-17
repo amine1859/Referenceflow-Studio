@@ -1,7 +1,7 @@
 ﻿import React, { useState, useCallback, useRef, useEffect } from 'react';
 import { 
   Settings, Plus, X, Trash2, Maximize2, Minimize2, Move, Lock, Unlock, SlidersHorizontal, ChevronLeft, ChevronRight, RotateCw, Palette, FileText, Monitor, Check, Edit2, Download,
-  Pin, PinOff, Eye, EyeOff, Edit3, ChevronDown, ChevronUp, PenTool, Eraser, ZoomIn, ZoomOut, Maximize, Bold, Italic, List, Search, Loader2, Heart, Link as LinkIcon, Table2, Copy
+  Pin, PinOff, Eye, EyeOff, Edit3, ChevronDown, ChevronUp, PenTool, Eraser, ZoomIn, ZoomOut, Maximize, Bold, Italic, List, Search, Loader2, Heart, Link as LinkIcon, Table2, Copy, Sparkles, FolderOpen, LayoutGrid, PanelLeftClose, PanelLeftOpen
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import Markdown from 'react-markdown';
@@ -16,6 +16,11 @@ import { getAnnotationPageKey, getSmoothStrokePath, getVisibleAnnotations, repla
 import { FloatingSketchWindow } from './components/FloatingSketchWindow';
 import { OfficeDocumentWindow } from './components/OfficeDocumentWindow';
 import { getWindowResizeCursorClass, InvisibleResizeFrame } from './components/InvisibleResizeFrame';
+import { Button } from './components/ui/button';
+import { Skeleton } from './components/ui/skeleton';
+import { Switch } from './components/ui/switch';
+import { ToolbarButton } from './components/ui/toolbar-button';
+import { TooltipProvider } from './components/ui/tooltip';
 import { pdfjs } from 'react-pdf';
 
 // PDF.js requires an explicit worker URL in packaged Electron builds. Keeping
@@ -42,6 +47,31 @@ const getImportedMediaType = (file: Pick<File, 'name' | 'type'>): FloatingMediaT
 
 const isOfficeDocument = (type?: FloatingMediaType) => type === 'docx' || type === 'xlsx';
 
+const getSourceFileName = (source: string) => {
+  if (!source || source.startsWith('data:')) return '';
+  try {
+    const parsed = new URL(source, window.location.href);
+    const candidate = decodeURIComponent(parsed.pathname.split('/').filter(Boolean).pop() || '');
+    return candidate && candidate.includes('.') ? candidate : '';
+  } catch {
+    const candidate = source.split(/[\\/]/).pop()?.split(/[?#]/)[0] || '';
+    return candidate && candidate.includes('.') ? candidate : '';
+  }
+};
+
+const getMediaDisplayName = (media: FloatingImage, index = 0) => {
+  const savedName = String(media.fileName || '').trim();
+  if (savedName) return savedName;
+  const sourceName = getSourceFileName(media.url);
+  if (sourceName) return sourceName;
+  const type = media.type || 'image';
+  return `${type === 'image' ? 'Image' : type.toUpperCase()} ${index + 1}`;
+};
+
+const getNoteDisplayName = (note: FloatingNote, index = 0) => String(note.name || '').trim() || `Note ${index + 1}`;
+
+const getSketchDisplayName = (sketch: FloatingSketch, index = 0) => String(sketch.name || '').trim() || `Sketch ${index + 1}`;
+
 type AppUpdatePhase = 'idle' | 'development' | 'checking' | 'available' | 'downloading' | 'up-to-date' | 'ready' | 'installing' | 'error';
 
 type AppUpdateStatus = {
@@ -55,6 +85,54 @@ type AppUpdateStatus = {
   checkedAt?: string | null;
   message?: string;
 };
+
+type SettingsToggleProps = {
+  label: string;
+  description?: string;
+  checked: boolean;
+  disabled?: boolean;
+  onCheckedChange: (checked: boolean) => void;
+  compatibilityAriaLabel?: string;
+};
+
+function SettingsToggle({
+  label,
+  description,
+  checked,
+  disabled = false,
+  onCheckedChange,
+  compatibilityAriaLabel,
+}: SettingsToggleProps) {
+  return (
+    <div className="flex items-center gap-4 px-4 py-3.5">
+      <div className="min-w-0 flex-1">
+        <div className="text-xs font-medium text-foreground">{label}</div>
+        {description && <div className="mt-1 text-[10px] leading-4 text-muted-foreground">{description}</div>}
+      </div>
+      <div className="relative shrink-0">
+        <Switch
+          checked={checked}
+          disabled={disabled}
+          onCheckedChange={onCheckedChange}
+          aria-label={`Toggle ${label}`}
+          className={compatibilityAriaLabel ? 'pointer-events-none' : undefined}
+        />
+        {compatibilityAriaLabel && (
+          <input
+            type="checkbox"
+            className="absolute inset-0 z-10 h-full w-full cursor-pointer opacity-0"
+            aria-hidden="true"
+            aria-label={compatibilityAriaLabel}
+            tabIndex={-1}
+            checked={checked}
+            disabled={disabled}
+            onChange={(event) => onCheckedChange(event.target.checked)}
+          />
+        )}
+      </div>
+    </div>
+  );
+}
 
 const getNodeRequire = () => {
   if (typeof window === 'undefined') return null;
@@ -581,7 +659,11 @@ function PillPdfPreview({ media }: { media: FloatingImage }) {
       const page = await document.getPage(1);
       if (cancelled) return;
       const baseViewport = page.getViewport({ scale: 1 });
-      const scale = Math.min(76 / baseViewport.width, 58 / baseViewport.height);
+      // Render enough pixels to cover a square tile. CSS crops the page at the
+      // edges instead of shrinking it into an unreadable stamp surrounded by
+      // empty gray space.
+      const previewSize = 220;
+      const scale = Math.max(previewSize / baseViewport.width, previewSize / baseViewport.height);
       const viewport = page.getViewport({ scale });
       const canvas = canvasRef.current;
       const context = canvas?.getContext('2d');
@@ -589,8 +671,6 @@ function PillPdfPreview({ media }: { media: FloatingImage }) {
       const deviceScale = Math.min(2, window.devicePixelRatio || 1);
       canvas.width = Math.max(1, Math.floor(viewport.width * deviceScale));
       canvas.height = Math.max(1, Math.floor(viewport.height * deviceScale));
-      canvas.style.width = `${viewport.width}px`;
-      canvas.style.height = `${viewport.height}px`;
       context.setTransform(deviceScale, 0, 0, deviceScale, 0, 0);
       renderTask = page.render({ canvas, canvasContext: context, viewport });
       await renderTask.promise;
@@ -609,9 +689,17 @@ function PillPdfPreview({ media }: { media: FloatingImage }) {
   }, [media.url]);
 
   return (
-    <div className="relative flex h-full w-full items-center justify-center overflow-hidden bg-slate-200" data-preview-status={status}>
-      {status !== 'ready' && <FileText className="absolute h-5 w-5 text-rose-400" />}
-      <canvas ref={canvasRef} className={`max-h-full max-w-full object-contain transition-opacity ${status === 'ready' ? 'opacity-100' : 'opacity-0'}`} />
+    <div
+      className="relative flex h-full w-full items-center justify-center overflow-hidden bg-[linear-gradient(145deg,#eef1f6,#d8dde7)]"
+      data-preview-status={status}
+      data-pdf-preview-surface
+    >
+      {status !== 'ready' && <FileText className="absolute z-10 h-5 w-5 text-primary/65" />}
+      <canvas
+        ref={canvasRef}
+        className={`h-full w-full object-cover object-top transition-opacity duration-200 ${status === 'ready' ? 'opacity-100' : 'opacity-0'}`}
+      />
+      <div className="pointer-events-none absolute inset-0 border border-white/20 shadow-[inset_0_1px_0_rgba(255,255,255,0.35)]" />
     </div>
   );
 }
@@ -1345,11 +1433,22 @@ export default function App() {
   }>({ timer: null, inFlight: false, pending: null });
   const [activeProjectId, setActiveProjectIdState] = useState<string | null>(null);
   const [showManager, setShowManager] = useState(false);
+  const [isManagerSidebarCollapsed, setIsManagerSidebarCollapsed] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
   const [isEmptyBoardPromptDismissed, setIsEmptyBoardPromptDismissed] = useState(false);
   const [managingProjectId, setManagingProjectId] = useState<string | null>(null);
   const [editingProjectId, setEditingProjectId] = useState<string | null>(null);
+  const [editingProjectSurface, setEditingProjectSurface] = useState<'card' | 'sidebar' | null>(null);
   const [editingProjectName, setEditingProjectName] = useState("");
+  const [editingMediaId, setEditingMediaId] = useState<string | null>(null);
+  const [editingMediaProjectId, setEditingMediaProjectId] = useState<string | null>(null);
+  const [editingMediaName, setEditingMediaName] = useState("");
+  const [editingCanvasItem, setEditingCanvasItem] = useState<{
+    kind: 'note' | 'sketch';
+    id: string;
+    projectId: string | null;
+    name: string;
+  } | null>(null);
   const [needsPermission, setNeedsPermission] = useState(false);
   const [dragError, setDragError] = useState<string>('');
   const [defaultAutosaveRoot, setDefaultAutosaveRoot] = useState<string>("");
@@ -1413,7 +1512,8 @@ export default function App() {
     }
   }, [projects]);
 
-  const fetchAndAddImage = async (url: string, asReference: boolean = false) => {
+  const fetchAndAddImage = async (url: string, suggestedName?: string) => {
+    const displayName = String(suggestedName || '').trim() || getSourceFileName(url);
     try {
       // Attempt to cache as base64 to prevent hotlinking and improve offline support
       const response = await fetch(url);
@@ -1421,22 +1521,23 @@ export default function App() {
       const reader = new FileReader();
       reader.onloadend = () => {
         const base64Url = reader.result as string;
-        addSearchResultToWorkspace(base64Url);
+        addSearchResultToWorkspace(base64Url, displayName);
       };
       reader.readAsDataURL(blob);
     } catch (e) {
       console.warn("[Search] CORS prevented downloading image as blob. Using direct URL as fallback.");
-      addSearchResultToWorkspace(url);
+      addSearchResultToWorkspace(url, displayName);
     }
   };
 
-  const addSearchResultToWorkspace = (url: string) => {
+  const addSearchResultToWorkspace = (url: string, fileName = '') => {
     setIsRetracted(false);
     setFloatingImages(prev => [
       ...prev,
       {
         id: Math.random().toString(36).substr(2, 9),
         url,
+        fileName: fileName || undefined,
         x: position.x + pillDimensions.width + 100 + (Math.random() * 50),
         y: position.y + (Math.random() * 50),
         width: 400,
@@ -2089,9 +2190,9 @@ export default function App() {
   }, []);
 
   // Settings
-  const [pillOpacity, setPillOpacity] = useState<number>(() => {
-    const saved = localStorage.getItem('ref-flow-pill-opacity');
-    return saved ? parseFloat(saved) : 0.95;
+  const [glassTranslucency, setGlassTranslucency] = useState<number>(() => {
+    const saved = Number.parseFloat(localStorage.getItem('ref-flow-glass-translucency') || '');
+    return Number.isFinite(saved) ? Math.min(0.75, Math.max(0, saved)) : 0.22;
   });
   const [alwaysOnTop, setAlwaysOnTop] = useState<boolean>(() => {
     const saved = localStorage.getItem('ref-flow-always-on-top');
@@ -2144,6 +2245,7 @@ export default function App() {
 
   useEffect(() => {
     localStorage.removeItem('ref-flow-api-keys');
+    localStorage.removeItem('ref-flow-pill-opacity');
     localStorage.setItem('ref-flow-provider-order', JSON.stringify(providerOrder));
     localStorage.setItem('ref-flow-provider-status', JSON.stringify(providerStatus));
   }, []);
@@ -2582,6 +2684,13 @@ export default function App() {
       document.documentElement.classList.remove('dark');
     }
   }, [theme]);
+
+  useEffect(() => {
+    const panelStrength = Math.round((1 - glassTranslucency) * 100);
+    const cardStrength = Math.round((1 - (glassTranslucency * 0.64)) * 100);
+    document.documentElement.style.setProperty('--glass-panel-strength', `${panelStrength}%`);
+    document.documentElement.style.setProperty('--glass-card-strength', `${cardStrength}%`);
+  }, [glassTranslucency]);
 
   // Initialize DB
   useEffect(() => {
@@ -3092,6 +3201,7 @@ export default function App() {
   const dragStartPos = useRef({ x: 0, y: 0 });
   const pillElementRef = useRef<HTMLDivElement>(null);
   const pillDragActiveRef = useRef(false);
+  const pillDragMovedRef = useRef(false);
   const pillDragOriginRef = useRef({ x: 0, y: 0 });
   const pillDragPositionRef = useRef<{ x: number; y: number } | null>(null);
   const pillFollowerOriginsRef = useRef<Array<{ element: HTMLElement; left: number; top: number }>>([]);
@@ -3116,7 +3226,7 @@ export default function App() {
   const [pillDimensions, setPillDimensions] = useState(() => {
     const saved = localStorage.getItem('ref-flow-pill-dim-vert');
     if (saved) return JSON.parse(saved);
-    return { width: 180, height: 400 };
+    return { width: 216, height: 480 };
   });
   const [retractedPillSize, setRetractedPillSize] = useState(() => {
     const saved = Number(localStorage.getItem('ref-flow-retracted-pill-size'));
@@ -3188,7 +3298,16 @@ export default function App() {
     }).catch((error: any) => console.warn('Could not read launch context:', error));
   }, []);
   const [isResizingPill, setIsResizingPill] = useState(false);
-  const resizePillStart = useRef({ x: 0, y: 0, width: 0, height: 0, retractedSize: 48 });
+  const resizePillStart = useRef<EdgeResizeStart & { retractedSize: number }>({
+    pointerX: 0,
+    pointerY: 0,
+    x: 0,
+    y: 0,
+    width: 0,
+    height: 0,
+    edge: 'bottom-right',
+    retractedSize: 48
+  });
 
   // Handle Dragging global floating images
   const [draggingFloatingId, setDraggingFloatingId] = useState<string | null>(null);
@@ -3738,29 +3857,33 @@ export default function App() {
     managingProjectId
   ]);
 
-  const handlePillResizeMouseDown = (e: React.MouseEvent) => {
+  const handlePillResizeMouseDown = (e: React.MouseEvent, edge: WindowResizeEdge) => {
     if (e.button !== 0) return;
     e.preventDefault();
     e.stopPropagation();
     setIsResizingPill(true);
     resizePillStart.current = {
-      x: e.clientX,
-      y: e.clientY,
-      width: pillDimensions.width,
-      height: pillDimensions.height,
+      pointerX: e.clientX,
+      pointerY: e.clientY,
+      x: position.x,
+      y: position.y,
+      width: isRetracted ? retractedPillSize : pillDimensions.width,
+      height: isRetracted ? retractedPillSize : pillDimensions.height,
+      edge,
       retractedSize: retractedPillSize,
     };
   };
 
   const handlePillMouseDown = (e: React.MouseEvent) => {
     if (e.button !== 0) return;
-    if ((e.target as HTMLElement).closest('button')) {
+    if (!isRetracted && (e.target as HTMLElement).closest('button')) {
       return;
     }
     if ((e.target as HTMLElement).closest('.drag-handle')) {
       e.preventDefault();
       e.stopPropagation();
       pillDragActiveRef.current = true;
+      pillDragMovedRef.current = false;
       pillDragOriginRef.current = { ...position };
       pillDragPositionRef.current = { ...position };
       pillFollowerOriginsRef.current = Array.from(document.querySelectorAll<HTMLElement>('[data-pill-position-follower="true"]')).map(element => {
@@ -3982,12 +4105,14 @@ export default function App() {
         localStorage.setItem('ref-flow-pill-dim-vert', JSON.stringify(pillDimensions));
       }
       if (pillDragActiveRef.current) {
+        const shouldExpandRetractedPill = isRetracted && !pillDragMovedRef.current;
         pillDragActiveRef.current = false;
         const nextPosition = clampPillToConnectedDisplay(pillDragPositionRef.current || pillDragOriginRef.current);
         previewImperativePillMove(nextPosition);
         setPosition(nextPosition);
         pillDragPositionRef.current = null;
         pillFollowerOriginsRef.current = [];
+        if (shouldExpandRetractedPill) setIsRetracted(false);
       } else if (isResizingPill) {
         setPosition(current => clampPillToConnectedDisplay(current));
       }
@@ -4025,23 +4150,37 @@ export default function App() {
         latestMouseEvent = null;
 
         if (isResizingPill) {
-          const diffX = moveEvent.clientX - resizePillStart.current.x;
-          const diffY = moveEvent.clientY - resizePillStart.current.y;
-
+          const start = resizePillStart.current;
           if (isRetracted) {
-            const sizeDelta = (diffX + diffY) / 2;
-            setRetractedPillSize(Math.min(96, Math.max(40, resizePillStart.current.retractedSize + sizeDelta)));
-          } else {
-            setPillDimensions({
-               width: Math.max(160, resizePillStart.current.width + diffX),
-               height: Math.max(200, resizePillStart.current.height + diffY)
+            const resized = resizeWindowWithAspectRatio(start, moveEvent.clientX, moveEvent.clientY, 40, 40);
+            const size = Math.min(96, Math.max(40, Math.round(resized.width)));
+            const edge = start.edge;
+            const fromLeft = edge.endsWith('left');
+            const fromRight = edge.endsWith('right');
+            const fromTop = edge.startsWith('top');
+            const fromBottom = edge.startsWith('bottom');
+            setRetractedPillSize(size);
+            setPosition({
+              x: fromLeft
+                ? start.x + start.width - size
+                : (fromRight ? start.x : start.x + (start.width - size) / 2),
+              y: fromTop
+                ? start.y + start.height - size
+                : (fromBottom ? start.y : start.y + (start.height - size) / 2)
             });
+          } else {
+            const resized = resizeWindowFromEdge(start, moveEvent.clientX, moveEvent.clientY, 160, 200);
+            setPillDimensions({ width: resized.width, height: resized.height });
+            setPosition({ x: resized.x, y: resized.y });
           }
         }
 
         if (isDraggingPill && pillDragActiveRef.current) {
           const newX = moveEvent.clientX - dragStartPos.current.x;
           const newY = moveEvent.clientY - dragStartPos.current.y;
+          if (Math.hypot(newX - pillDragOriginRef.current.x, newY - pillDragOriginRef.current.y) >= 4) {
+            pillDragMovedRef.current = true;
+          }
           previewImperativePillMove({ x: newX, y: newY });
         }
 
@@ -4235,6 +4374,7 @@ export default function App() {
       {
         id: newId,
         url,
+        fileName: getSourceFileName(url) || undefined,
         x: position.x + pillDimensions.width + 20,
         y: position.y,
         width: 300,
@@ -4492,6 +4632,7 @@ export default function App() {
       ...prev,
       {
         id: newId,
+        name: `Sketch ${floatingSketches.length + 1}`,
         lines: [],
         x: origin.x,
         y: origin.y + 200,
@@ -4515,6 +4656,7 @@ export default function App() {
       ...prev,
       {
         id: newId,
+        name: `Note ${floatingNotes.length + 1}`,
         text: '',
         x: origin.x,
         y: origin.y + 100,
@@ -4542,6 +4684,136 @@ export default function App() {
     }
   };
 
+  const beginProjectRename = (project: Project, surface: 'card' | 'sidebar' = 'card') => {
+    setEditingProjectId(project.id);
+    setEditingProjectSurface(surface);
+    setEditingProjectName(project.name || 'Untitled Board');
+  };
+
+  const commitProjectRename = async (project: Project) => {
+    if (editingProjectId !== project.id) return;
+    const nextName = editingProjectName.trim() || 'Untitled Board';
+    await updateProject(project.id, { name: nextName });
+    if (project.directoryPath) {
+      await syncBoardToPath({ ...project, name: nextName }, project.directoryPath);
+    }
+    setProjects(await getProjects());
+    setEditingProjectId(null);
+    setEditingProjectSurface(null);
+    setEditingProjectName('');
+  };
+
+  const beginMediaRename = (media: FloatingImage, projectId: string | null = null) => {
+    setEditingMediaId(media.id);
+    setEditingMediaProjectId(projectId);
+    setEditingMediaName(getMediaDisplayName(media));
+  };
+
+  const cancelMediaRename = () => {
+    setEditingMediaId(null);
+    setEditingMediaProjectId(null);
+    setEditingMediaName('');
+  };
+
+  const commitMediaRename = async (media: FloatingImage, project: Project | null = null) => {
+    const expectedProjectId = project?.id || null;
+    if (editingMediaId !== media.id || editingMediaProjectId !== expectedProjectId) return;
+    const nextName = editingMediaName.trim() || getMediaDisplayName(media);
+
+    if (project) {
+      const updatedMedia = (project.floatingImages || []).map(item => item.id === media.id ? { ...item, fileName: nextName } : item);
+      await updateProject(project.id, { floatingImages: updatedMedia });
+      if (project.directoryPath) {
+        await syncBoardToPath({ ...project, floatingImages: updatedMedia }, project.directoryPath);
+      }
+      setProjects(await getProjects());
+      if (project.id === activeProjectId) setFloatingImages(updatedMedia);
+    } else {
+      setFloatingImages(current => current.map(item => item.id === media.id ? { ...item, fileName: nextName } : item));
+    }
+
+    cancelMediaRename();
+  };
+
+  const beginCanvasItemRename = (
+    kind: 'note' | 'sketch',
+    id: string,
+    name: string,
+    projectId: string | null = null
+  ) => {
+    setEditingCanvasItem({ kind, id, projectId, name });
+  };
+
+  const cancelCanvasItemRename = () => setEditingCanvasItem(null);
+
+  const commitCanvasItemRename = async (
+    kind: 'note' | 'sketch',
+    item: FloatingNote | FloatingSketch,
+    project: Project | null = null
+  ) => {
+    const expectedProjectId = project?.id || null;
+    if (!editingCanvasItem
+      || editingCanvasItem.kind !== kind
+      || editingCanvasItem.id !== item.id
+      || editingCanvasItem.projectId !== expectedProjectId) return;
+
+    const fallbackName = kind === 'note'
+      ? getNoteDisplayName(item as FloatingNote)
+      : getSketchDisplayName(item as FloatingSketch);
+    const nextName = editingCanvasItem.name.trim() || fallbackName;
+
+    if (kind === 'note') {
+      if (project) {
+        const updatedNotes = (project.floatingNotes || []).map(note => note.id === item.id ? { ...note, name: nextName } : note);
+        await updateProject(project.id, { floatingNotes: updatedNotes });
+        if (project.directoryPath) {
+          await syncBoardToPath({ ...project, floatingNotes: updatedNotes }, project.directoryPath);
+        }
+        setProjects(await getProjects());
+        if (project.id === activeProjectId) setFloatingNotes(updatedNotes);
+      } else {
+        setFloatingNotes(current => current.map(note => note.id === item.id ? { ...note, name: nextName } : note));
+      }
+    } else if (project) {
+      const updatedSketches = (project.floatingSketches || []).map(sketch => sketch.id === item.id ? { ...sketch, name: nextName } : sketch);
+      await updateProject(project.id, { floatingSketches: updatedSketches });
+      if (project.directoryPath) {
+        await syncBoardToPath({ ...project, floatingSketches: updatedSketches }, project.directoryPath);
+      }
+      setProjects(await getProjects());
+      if (project.id === activeProjectId) setFloatingSketches(updatedSketches);
+    } else {
+      setFloatingSketches(current => current.map(sketch => sketch.id === item.id ? { ...sketch, name: nextName } : sketch));
+    }
+
+    cancelCanvasItemRename();
+  };
+
+  const createNewProjectBoard = async () => {
+    const project = await createProject(`Board ${projects.length + 1}`);
+    let createdProject = project;
+    const autosaveRoot = defaultAutosaveRoot || await getInstalledAutosaveRoot();
+    if (autosaveRoot) {
+      setDefaultAutosaveRoot(autosaveRoot);
+      const nodeRequire = getNodeRequire();
+      const path = nodeRequire ? nodeRequire('path') : null;
+      const directoryPath = path ? path.join(autosaveRoot, getProjectFolderName(project)) : '';
+      if (directoryPath) {
+        createdProject = { ...project, directoryPath };
+        await updateProject(project.id, { directoryPath });
+        await syncBoardToPath(createdProject, directoryPath);
+      }
+    }
+    const allProjects = await getProjects();
+    setProjects(allProjects);
+    setActiveProjectIdState(project.id);
+    await setActiveProjectId(project.id);
+    setImages([]);
+    setFloatingImages([]);
+    setFloatingNotes([]);
+    setFloatingSketches([]);
+  };
+
   const openProjectManager = () => {
     setShowManager(true);
     setIsRetracted(true);
@@ -4555,9 +4827,18 @@ export default function App() {
   const visibleReferenceCount = floatingImages.filter(image => !image.isCollapsed).length
     + floatingNotes.filter(note => !note.isCollapsed).length
     + floatingSketches.filter(sketch => !sketch.isCollapsed).length;
+  const totalReferenceCount = floatingImages.length + floatingNotes.length + floatingSketches.length;
+  const pillPreviewColumnCount = pillDimensions.width >= 520
+    ? 4
+    : pillDimensions.width >= 360
+      ? 3
+      : pillDimensions.width >= 200
+        ? 2
+        : 1;
   const reduceLargeBoardEffects = visibleReferenceCount >= 12;
 
   return (
+    <TooltipProvider delayDuration={500} skipDelayDuration={150}>
     <div className={`w-screen h-screen overflow-hidden pointer-events-none relative ${reduceLargeBoardEffects ? 'large-board-performance' : ''}`} style={{ WebkitAppRegion: 'no-drag' } as any}>
       {(draggingFloatingId || draggingNoteId || draggingSketchId) && windowSnapGuides.x !== undefined && (
         <div
@@ -4584,7 +4865,7 @@ export default function App() {
               : resizingSketchId
                 ? getWindowResizeCursorClass(resizeSketchStart.current.edge)
                 : isResizingPill
-                  ? 'cursor-nwse-resize'
+                  ? getWindowResizeCursorClass(resizePillStart.current.edge)
                   : 'cursor-move'
         }`} />
       )}
@@ -4602,40 +4883,45 @@ export default function App() {
           } : undefined}
         >
           <div
-            className={`pointer-events-auto relative w-full max-w-xl border rounded-2xl p-6 shadow-2xl backdrop-blur-xl ${theme === 'light' ? 'bg-white/85 border-black/10 text-slate-800' : 'bg-slate-950/75 border-white/10 text-slate-100'}`}
+            className="rf-panel pointer-events-auto relative w-full max-w-2xl overflow-hidden rounded-3xl p-8"
             data-empty-board-prompt
           >
-            <button
+            <div className="pointer-events-none absolute -right-20 -top-20 size-64 rounded-full bg-primary/10 blur-3xl" />
+            <Button
               type="button"
+              variant="ghost"
+              size="icon-sm"
               onClick={() => setIsEmptyBoardPromptDismissed(true)}
-              className="absolute right-3 top-3 rounded-lg p-1.5 text-slate-400 transition-colors hover:bg-black/10 hover:text-slate-900 dark:hover:bg-white/10 dark:hover:text-white"
+              className="absolute right-4 top-4 z-10 text-muted-foreground"
               title="Close start board menu"
               aria-label="Close start board menu"
             >
               <X className="h-4 w-4" />
-            </button>
-            <div className="flex items-start gap-4">
-              <div className="w-11 h-11 rounded-xl bg-sky-500/15 text-sky-400 flex items-center justify-center shrink-0">
-                <Palette className="w-5 h-5" />
+            </Button>
+            <div className="relative flex items-start gap-5 pr-8">
+              <div className="flex size-12 shrink-0 items-center justify-center rounded-2xl border border-primary/25 bg-primary/14 text-primary shadow-[0_10px_30px_rgba(94,107,255,0.18)]">
+                <Sparkles className="size-5" />
               </div>
-              <div className="min-w-0">
-                <h2 className="text-lg font-semibold tracking-tight">Start a reference board</h2>
-                <p className="mt-1 text-sm text-slate-500 dark:text-slate-400 leading-6">
-                  Drop images, PDFs, Word documents, or Excel workbooks anywhere, paste a URL from search, or create notes and sketches beside your references.
+              <div className="min-w-0 flex-1">
+                <div className="rf-kicker mb-2 text-primary">Your visual workspace</div>
+                <h2 className="text-[22px] font-semibold leading-tight tracking-[-0.025em] text-foreground">Start a reference board</h2>
+                <p className="mt-2 max-w-lg text-sm leading-6 text-secondary">
+                  Bring images, PDFs, Word documents, spreadsheets, notes, and sketches together in one focused canvas.
                 </p>
               </div>
             </div>
-            <div className="mt-5 grid grid-cols-1 sm:grid-cols-3 gap-2">
-              <button onClick={triggerNativeFilePicker} className="flex items-center justify-center gap-2 rounded-lg bg-sky-500 px-3 py-2.5 text-sm font-semibold text-white hover:bg-sky-400 transition-colors">
+            <div className="relative mt-7 grid grid-cols-1 gap-2.5 sm:grid-cols-3">
+              <Button onClick={triggerNativeFilePicker} variant="primary" size="lg" className="w-full">
                 <Plus className="w-4 h-4" /> Add media
-              </button>
-              <button onClick={createNote} className="flex items-center justify-center gap-2 rounded-lg bg-black/5 dark:bg-white/10 px-3 py-2.5 text-sm font-semibold hover:bg-black/10 dark:hover:bg-white/15 transition-colors">
+              </Button>
+              <Button onClick={createNote} variant="secondary" size="lg" className="w-full">
                 <FileText className="w-4 h-4" /> New note
-              </button>
-              <button onClick={createSketch} className="flex items-center justify-center gap-2 rounded-lg bg-black/5 dark:bg-white/10 px-3 py-2.5 text-sm font-semibold hover:bg-black/10 dark:hover:bg-white/15 transition-colors">
+              </Button>
+              <Button onClick={createSketch} variant="secondary" size="lg" className="w-full">
                 <PenTool className="w-4 h-4" /> Sketch
-              </button>
+              </Button>
             </div>
+            <p className="relative mt-4 text-center text-xs text-muted-foreground">You can also drop supported files anywhere on the desktop.</p>
           </div>
         </motion.div>
       )}
@@ -4653,7 +4939,7 @@ export default function App() {
           animate={{
             width: isRetracted ? retractedPillSize : pillDimensions.width,
             height: isRetracted ? retractedPillSize : pillDimensions.height,
-            opacity: pillOpacity,
+            opacity: 1,
             scale: 1,
             y: 0,
           }}
@@ -4671,8 +4957,8 @@ export default function App() {
           }}
         >
           <div 
-             className={`w-full h-full relative pointer-events-auto border overflow-hidden ${theme === 'light' ? 'bg-white border-black/10' : 'bg-[#1e1e24] border-white/10'} ${isDragOver ? 'ring-4 ring-sky-500 shadow-[0_0_40px_rgba(14,165,233,0.5)]' : 'shadow-2xl'} ${isRetracted ? 'rounded-full flex items-center justify-center drag-handle cursor-move' : 'rounded-[24px] p-2 flex flex-col items-center group'}`}
-             style={{ transition: 'border-radius 180ms cubic-bezier(0.22, 1, 0.36, 1), box-shadow 160ms ease, background-color 160ms ease' }}
+             className={`rf-panel relative h-full w-full overflow-hidden pointer-events-auto ${isDragOver ? 'ring-2 ring-primary shadow-[0_0_42px_rgba(94,107,255,0.42)]' : ''} ${isRetracted ? 'drag-handle flex cursor-move items-center justify-center rounded-full' : 'group flex flex-col items-center rounded-3xl p-2'}`}
+             style={{ transition: 'border-radius 180ms cubic-bezier(0.22, 1, 0.36, 1), box-shadow 180ms ease, background-color 180ms ease' }}
              onMouseDown={handlePillMouseDown}
           >
             <AnimatePresence initial={false}>
@@ -4683,16 +4969,23 @@ export default function App() {
                     animate={{ opacity: 1, scale: 1 }}
                     exit={{ opacity: 0, scale: 0.5 }}
                     transition={{ duration: 0.12 }}
-                    className="w-full h-full flex items-center justify-center rounded-full transition-colors drag-handle cursor-move group hover:bg-white/5"
+                    className="drag-handle group flex h-full w-full cursor-move items-center justify-center rounded-full bg-[radial-gradient(circle_at_35%_28%,rgba(94,107,255,0.2),transparent_58%)] transition-colors hover:bg-primary/10"
                     title="Drag pill"
                   >
                     <button 
-                      onClick={() => setIsRetracted(false)}
-                      className="flex items-center justify-center rounded-full text-sky-600 dark:text-sky-300 hover:text-slate-900 dark:hover:text-white hover:bg-black/10 dark:hover:bg-white/10 transition-colors pointer-events-auto"
+                      onClick={() => {
+                        if (pillDragMovedRef.current) {
+                          pillDragMovedRef.current = false;
+                          return;
+                        }
+                        setIsRetracted(false);
+                      }}
+                      className="pointer-events-auto flex cursor-move items-center justify-center rounded-full border border-transparent text-primary transition-all duration-200 hover:scale-105 hover:border-primary/20 hover:bg-primary/12 hover:text-foreground active:scale-95"
                       style={{ width: Math.max(32, retractedPillSize - 8), height: Math.max(32, retractedPillSize - 8) }}
                       title="Expand Pill"
+                      aria-label="Expand Pill"
                     >
-                      <ChevronRight className="w-5 h-5 pointer-events-none" />
+                      <Sparkles className="pointer-events-none size-4" />
                     </button>
                   </motion.div>
               ) : (
@@ -4704,61 +4997,82 @@ export default function App() {
                   transition={{ duration: 0.14, delay: 0.04 }}
                   className="w-full h-full flex flex-col relative"
                 >
-                  {/* Top Drag Handle & Toggle */}
-                  <div className="shrink-0 flex flex-col items-center pb-2 drag-handle cursor-move w-full pt-1">
-                    <div className="w-8 h-1 rounded-full bg-slate-500/50 mb-2 pointer-events-none"></div>
-                    <div className="flex space-x-1">
-                      <button 
+                  {/* Compact brand header doubles as the reliable drag surface. */}
+                  <div className="drag-handle flex h-11 w-full shrink-0 cursor-move items-center gap-2 rounded-2xl px-2">
+                    <div className="pointer-events-none flex min-w-0 flex-1 items-center" data-expanded-pill-brand>
+                      <div className="min-w-0 leading-none">
+                        <div className="truncate text-[11px] font-semibold tracking-[-0.01em] text-foreground">RefFlow</div>
+                        <div className="mt-1 truncate text-[9px] text-muted-foreground">{totalReferenceCount} {totalReferenceCount === 1 ? 'reference' : 'references'}</div>
+                      </div>
+                    </div>
+                    <div className="flex shrink-0 items-center gap-0.5" onMouseDown={(event) => event.stopPropagation()}>
+                      <ToolbarButton
+                        label="Quick Minimize / Restore All"
+                        tooltipSide="bottom"
                         onClick={() => {
                           const allCollapsed = floatingNotes.every(n => n.isCollapsed) && floatingImages.every(i => i.isCollapsed) && floatingSketches.every(s => s.isCollapsed);
                           setFloatingNotes(prev => prev.map(n => ({...n, isCollapsed: !allCollapsed})));
                           setFloatingImages(prev => prev.map(i => ({...i, isCollapsed: !allCollapsed})));
                           setFloatingSketches(prev => prev.map(s => ({...s, isCollapsed: !allCollapsed})));
                         }}
-                        className="p-1 hover:bg-white/10 rounded-full text-slate-400 transition-colors"
-                        title="Quick Minimize / Restore All"
                       >
-                        <EyeOff className="w-4 h-4" />
-                      </button>
-                      <button 
+                        <EyeOff className="size-3.5" />
+                      </ToolbarButton>
+                      <ToolbarButton
+                        label="Retract"
+                        tooltipSide="bottom"
                         onClick={() => setIsRetracted(true)}
-                        className="p-1 hover:bg-white/10 rounded-full text-slate-400 transition-colors"
-                        title="Retract"
                       >
-                        <ChevronLeft className="w-4 h-4" />
-                      </button>
-                      <button 
+                        <ChevronLeft className="size-3.5" />
+                      </ToolbarButton>
+                      <ToolbarButton
+                        label="Close Control Pill (Hides to Tray)"
+                        danger
+                        tooltipSide="bottom"
                         onClick={() => setIsPillVisible(false)}
-                        className="p-1 hover:bg-black/10 dark:hover:bg-red-500/20 rounded-full text-slate-400 hover:text-red-500 transition-colors"
-                        title="Close Control Pill (Hides to Tray)"
                       >
-                        <X className="w-4 h-4" />
-                      </button>
+                        <X className="size-3.5" />
+                      </ToolbarButton>
                     </div>
                   </div>
 
                  {/* The Image Viewer / List */}
                  <div 
-                    className="flex-1 w-full h-full overflow-y-auto overflow-x-hidden no-scrollbar flex flex-wrap justify-center gap-2 py-2 content-start"
+                    className="pill-preview-grid grid min-h-0 w-full flex-1 content-start items-start gap-3 overflow-y-auto overflow-x-hidden px-1 py-2"
+                    style={{
+                      gridTemplateColumns: `repeat(${pillPreviewColumnCount}, minmax(0, 1fr))`,
+                      gridAutoRows: 'max-content'
+                    }}
+                    data-pill-preview-columns={pillPreviewColumnCount}
                  >
                    {!isPillContentReady ? (
-                     <div className="w-full px-2 py-4 space-y-2 pointer-events-none" aria-hidden="true">
-                       <div className="h-16 rounded-xl bg-black/5 dark:bg-white/5" />
-                       <div className="h-16 rounded-xl bg-black/5 dark:bg-white/5 opacity-60" />
+                     <div
+                       className="pointer-events-none col-span-full grid gap-3 py-2"
+                       style={{ gridTemplateColumns: `repeat(${pillPreviewColumnCount}, minmax(0, 1fr))` }}
+                       aria-hidden="true"
+                     >
+                       <Skeleton className="aspect-square" />
+                       <Skeleton className="aspect-square opacity-70" />
+                       <Skeleton className="aspect-square opacity-50" />
                      </div>
                    ) : floatingImages.length === 0 && floatingNotes.length === 0 && floatingSketches.length === 0 ? (
-                     <div className="text-[10px] text-slate-500 font-medium py-4 px-2 text-center opacity-70 drag-handle cursor-move w-full">
-                       Drop<br/>Media / Notes<br/>Here
+                     <div className="drag-handle col-span-full flex min-h-40 w-full cursor-move flex-col items-center justify-center rounded-2xl border border-dashed border-border bg-surface-elevated/35 px-4 py-6 text-center">
+                       <div className="mb-3 flex size-9 items-center justify-center rounded-xl border border-primary/20 bg-primary/10 text-primary">
+                         <Plus className="size-4" />
+                       </div>
+                       <div className="text-[11px] font-medium text-secondary">Drop references here</div>
+                       <div className="mt-1 text-[9px] leading-4 text-muted-foreground">Images, documents, notes, and sketches</div>
                      </div>
                    ) : (
                      <>
                        {floatingImages.map((img, mediaIndex) => {
                          const previewType = img.type || 'image';
-                         const mediaLabel = img.fileName || `${previewType === 'image' ? 'Image' : previewType.toUpperCase()} ${mediaIndex + 1}`;
+                         const mediaLabel = getMediaDisplayName(img, mediaIndex);
                          return (
                            <div
                              key={img.id}
-                             className={`relative group rounded-xl overflow-hidden border-2 transition-all cursor-pointer shrink-0 w-20 h-20 bg-black/20 flex items-center justify-center ${img.isCollapsed ? 'border-dashed border-slate-500/50 opacity-60' : 'border-transparent hover:border-sky-400'}`}
+                             className={`rf-card rf-preview-card relative group aspect-square w-full min-w-0 self-start cursor-pointer overflow-hidden flex items-center justify-center ${img.isCollapsed ? 'border-dashed' : 'hover:border-primary/60 hover:-translate-y-0.5'}`}
+                             data-pill-preview-card
                              data-pill-preview-type={previewType}
                              data-pill-label={mediaLabel}
                              title={mediaLabel}
@@ -4781,16 +5095,45 @@ export default function App() {
                                  draggable={false}
                                />
                              )}
-                             <div className="absolute inset-x-0 bottom-0 z-10 bg-slate-950/85 px-1 py-1 text-center pointer-events-none">
-                               <span className="block truncate text-[8px] font-medium text-white">{mediaLabel}</span>
+                             <div
+                               className="pill-preview-caption"
+                               onMouseDown={(event) => event.stopPropagation()}
+                               onClick={(event) => event.stopPropagation()}
+                             >
+                               {editingMediaId === img.id && editingMediaProjectId === null ? (
+                                 <input
+                                   autoFocus
+                                   value={editingMediaName}
+                                   onChange={(event) => setEditingMediaName(event.target.value)}
+                                   onBlur={() => { void commitMediaRename(img); }}
+                                   onKeyDown={(event) => {
+                                     event.stopPropagation();
+                                     if (event.key === 'Enter') event.currentTarget.blur();
+                                     if (event.key === 'Escape') cancelMediaRename();
+                                   }}
+                                   className="h-5 w-full rounded-md border border-white/20 bg-black/25 px-1.5 text-center text-[8px] font-medium text-white outline-none focus:border-primary"
+                                   aria-label={`Rename ${mediaLabel}`}
+                                   data-pill-media-name-input
+                                 />
+                               ) : (
+                                 <button
+                                   type="button"
+                                   className="block w-full truncate rounded text-[8px] font-medium text-white/95 outline-none transition-colors hover:text-primary focus-visible:text-primary"
+                                   onClick={() => beginMediaRename(img)}
+                                   title="Click to rename reference"
+                                   data-pill-media-name
+                                 >
+                                   {mediaLabel}
+                                 </button>
+                               )}
                              </div>
                              {img.isCollapsed && (
-                               <div className="absolute left-1 top-1 z-20 rounded bg-sky-500/90 px-1 py-0.5 text-[6px] font-bold uppercase tracking-wide text-white pointer-events-none">min</div>
+                               <div className="pointer-events-none absolute left-1.5 top-1.5 z-20 rounded-md border border-primary/30 bg-primary/90 px-1 py-0.5 text-[6px] font-semibold uppercase tracking-wide text-white">Hidden</div>
                              )}
                              <div className="absolute top-1 right-1 z-30 opacity-0 group-hover:opacity-100 transition-opacity flex space-x-1">
                                <button
                                  onClick={(e) => { e.stopPropagation(); setFloatingImages(prev => prev.filter(f => f.id !== img.id)); }}
-                                 className="bg-red-500 hover:bg-red-600 text-white p-1 rounded-md shadow-lg"
+                                 className="rounded-lg border border-white/10 bg-black/65 p-1.5 text-white shadow-lg backdrop-blur-md transition-colors hover:bg-danger"
                                  title="Delete Permanently"
                                >
                                  <Trash2 className="w-3 h-3" />
@@ -4801,13 +5144,14 @@ export default function App() {
                        })}
 
                        {floatingNotes.map((note, noteIndex) => {
-                         const noteLabel = `Note ${noteIndex + 1}`;
+                         const noteLabel = getNoteDisplayName(note, noteIndex);
                          const notePreview = note.text.replace(/\s+/g, ' ').trim();
                          return (
                            <div
                              key={note.id}
-                             className={`relative group rounded-xl overflow-hidden border-2 transition-all cursor-pointer shrink-0 w-20 h-20 ${note.isCollapsed ? 'border-dashed border-slate-500/50 opacity-60' : 'border-transparent hover:border-sky-400'}`}
+                             className={`rf-card rf-preview-card relative group aspect-square w-full min-w-0 self-start cursor-pointer overflow-hidden ${note.isCollapsed ? 'border-dashed' : 'hover:border-primary/60 hover:-translate-y-0.5'}`}
                              style={{ backgroundColor: note.color || '#fef3c7' }}
+                             data-pill-preview-card
                              data-pill-preview-type="note"
                              data-pill-label={noteLabel}
                              title={notePreview ? `${noteLabel}: ${notePreview}` : noteLabel}
@@ -4824,16 +5168,45 @@ export default function App() {
                                  </div>
                                )}
                              </div>
-                             <div className="absolute inset-x-0 bottom-0 z-10 bg-slate-950/85 px-1 py-1 text-center pointer-events-none">
-                               <span className="block truncate text-[8px] font-medium text-white">{noteLabel}</span>
+                             <div
+                               className="pill-preview-caption"
+                               onMouseDown={(event) => event.stopPropagation()}
+                               onClick={(event) => event.stopPropagation()}
+                             >
+                               {editingCanvasItem?.kind === 'note' && editingCanvasItem.id === note.id && editingCanvasItem.projectId === null ? (
+                                 <input
+                                   autoFocus
+                                   value={editingCanvasItem.name}
+                                   onChange={(event) => setEditingCanvasItem(current => current ? { ...current, name: event.target.value } : current)}
+                                   onBlur={() => { void commitCanvasItemRename('note', note); }}
+                                   onKeyDown={(event) => {
+                                     event.stopPropagation();
+                                     if (event.key === 'Enter') event.currentTarget.blur();
+                                     if (event.key === 'Escape') cancelCanvasItemRename();
+                                   }}
+                                   className="h-5 w-full rounded-md border border-white/20 bg-black/25 px-1.5 text-center text-[8px] font-medium text-white outline-none focus:border-primary"
+                                   aria-label={`Rename ${noteLabel}`}
+                                   data-pill-note-name-input
+                                 />
+                               ) : (
+                                 <button
+                                   type="button"
+                                   className="block w-full truncate rounded text-[8px] font-medium text-white/95 outline-none transition-colors hover:text-primary focus-visible:text-primary"
+                                   onClick={() => beginCanvasItemRename('note', note.id, noteLabel)}
+                                   title="Click to rename note"
+                                   data-pill-note-name
+                                 >
+                                   {noteLabel}
+                                 </button>
+                               )}
                              </div>
                              {note.isCollapsed && (
-                               <div className="absolute left-1 top-1 z-20 rounded bg-sky-500/90 px-1 py-0.5 text-[6px] font-bold uppercase tracking-wide text-white pointer-events-none">min</div>
+                               <div className="pointer-events-none absolute left-1.5 top-1.5 z-20 rounded-md border border-primary/30 bg-primary/90 px-1 py-0.5 text-[6px] font-semibold uppercase tracking-wide text-white">Hidden</div>
                              )}
                              <div className="absolute top-1 right-1 z-30 opacity-0 group-hover:opacity-100 transition-opacity flex space-x-1">
                                <button
                                  onClick={(e) => { e.stopPropagation(); setFloatingNotes(prev => prev.filter(f => f.id !== note.id)); }}
-                                 className="bg-red-500 hover:bg-red-600 text-white p-1 rounded-md shadow-lg"
+                                 className="rounded-lg border border-white/10 bg-black/65 p-1.5 text-white shadow-lg backdrop-blur-md transition-colors hover:bg-danger"
                                  title="Delete Permanently"
                                >
                                  <Trash2 className="w-3 h-3" />
@@ -4844,11 +5217,12 @@ export default function App() {
                        })}
 
                        {floatingSketches.map((sketch, sketchIndex) => {
-                         const sketchLabel = `Sketch ${sketchIndex + 1}`;
+                         const sketchLabel = getSketchDisplayName(sketch, sketchIndex);
                          return (
                            <div
                              key={sketch.id}
-                             className={`relative group rounded-xl overflow-hidden border-2 transition-all cursor-pointer shrink-0 w-20 h-20 bg-black/20 flex items-center justify-center ${sketch.isCollapsed ? 'border-dashed border-slate-500/50 opacity-60' : 'border-transparent hover:border-sky-400'}`}
+                             className={`rf-card rf-preview-card relative group aspect-square w-full min-w-0 self-start cursor-pointer overflow-hidden flex items-center justify-center ${sketch.isCollapsed ? 'border-dashed' : 'hover:border-primary/60 hover:-translate-y-0.5'}`}
+                             data-pill-preview-card
                              data-pill-preview-type="sketch"
                              data-pill-label={sketchLabel}
                              title={sketchLabel}
@@ -4884,17 +5258,46 @@ export default function App() {
                                  />
                                ))}
                              </svg>
-                             {sketch.lines.length === 0 && <PenTool className="absolute h-5 w-5 text-purple-400" />}
-                             <div className="absolute inset-x-0 bottom-0 z-10 bg-slate-950/85 px-1 py-1 text-center pointer-events-none">
-                               <span className="block truncate text-[8px] font-medium text-white">{sketchLabel}</span>
+                             {sketch.lines.length === 0 && <PenTool className="absolute h-5 w-5 text-primary" />}
+                             <div
+                               className="pill-preview-caption"
+                               onMouseDown={(event) => event.stopPropagation()}
+                               onClick={(event) => event.stopPropagation()}
+                             >
+                               {editingCanvasItem?.kind === 'sketch' && editingCanvasItem.id === sketch.id && editingCanvasItem.projectId === null ? (
+                                 <input
+                                   autoFocus
+                                   value={editingCanvasItem.name}
+                                   onChange={(event) => setEditingCanvasItem(current => current ? { ...current, name: event.target.value } : current)}
+                                   onBlur={() => { void commitCanvasItemRename('sketch', sketch); }}
+                                   onKeyDown={(event) => {
+                                     event.stopPropagation();
+                                     if (event.key === 'Enter') event.currentTarget.blur();
+                                     if (event.key === 'Escape') cancelCanvasItemRename();
+                                   }}
+                                   className="h-5 w-full rounded-md border border-white/20 bg-black/25 px-1.5 text-center text-[8px] font-medium text-white outline-none focus:border-primary"
+                                   aria-label={`Rename ${sketchLabel}`}
+                                   data-pill-sketch-name-input
+                                 />
+                               ) : (
+                                 <button
+                                   type="button"
+                                   className="block w-full truncate rounded text-[8px] font-medium text-white/95 outline-none transition-colors hover:text-primary focus-visible:text-primary"
+                                   onClick={() => beginCanvasItemRename('sketch', sketch.id, sketchLabel)}
+                                   title="Click to rename sketch"
+                                   data-pill-sketch-name
+                                 >
+                                   {sketchLabel}
+                                 </button>
+                               )}
                              </div>
                              {sketch.isCollapsed && (
-                               <div className="absolute left-1 top-1 z-20 rounded bg-sky-500/90 px-1 py-0.5 text-[6px] font-bold uppercase tracking-wide text-white pointer-events-none">min</div>
+                               <div className="pointer-events-none absolute left-1.5 top-1.5 z-20 rounded-md border border-primary/30 bg-primary/90 px-1 py-0.5 text-[6px] font-semibold uppercase tracking-wide text-white">Hidden</div>
                              )}
                              <div className="absolute top-1 right-1 z-30 opacity-0 group-hover:opacity-100 transition-opacity flex space-x-1">
                                <button
                                  onClick={(e) => { e.stopPropagation(); setFloatingSketches(prev => prev.filter(f => f.id !== sketch.id)); }}
-                                 className="bg-red-500 hover:bg-red-600 text-white p-1 rounded-md shadow-lg"
+                                 className="rounded-lg border border-white/10 bg-black/65 p-1.5 text-white shadow-lg backdrop-blur-md transition-colors hover:bg-danger"
                                  title="Delete Permanently"
                                >
                                  <Trash2 className="w-3 h-3" />
@@ -4907,93 +5310,93 @@ export default function App() {
                    )}
                  </div>
 
-                {/* Bottom Controls */}
-                <div className="mt-2 shrink-0 border-t border-white/5 pt-2 w-full flex flex-wrap justify-center gap-2 drag-handle cursor-move">
-                  <button
+                {/* Actions are grouped by purpose: create, navigate, then utilities. */}
+                <div className="drag-handle mt-2 w-full shrink-0 cursor-move border-t border-border pt-2">
+                  <div className="grid grid-cols-4 gap-1 rounded-2xl border border-border bg-surface-elevated/65 p-1">
+                  <ToolbarButton
+                    label="Full Screen Manager"
+                    tooltipSide="top"
                     onClick={openProjectManager}
-                    className="w-10 h-10 rounded-xl bg-sky-500/10 border border-sky-500/30 flex items-center justify-center hover:bg-sky-500/20 transition-colors text-sky-400 group"
-                    title="Full Screen Manager"
+                    className="pill-main-action w-full"
+                    data-pill-main-action
                   >
-                    <Monitor className="w-5 h-5 group-hover:scale-110 transition-transform" />
-                  </button>
-                  <button 
+                    <Monitor className="size-4" />
+                  </ToolbarButton>
+                  <ToolbarButton
+                    label="Add Floating Sketch"
+                    tooltipSide="top"
                     onClick={createSketch}
-                    className="w-10 h-10 rounded-xl border border-dashed border-purple-500/50 flex items-center justify-center hover:bg-purple-500/20 transition-colors text-purple-500/80 hover:text-purple-400 group bg-purple-500/5"
-                    title="Add Floating Sketch"
+                    className="pill-main-action w-full"
+                    data-pill-main-action
                   >
-                    <PenTool className="w-5 h-5 group-hover:scale-110 transition-transform" />
-                  </button>
-                  <button 
+                    <PenTool className="size-4" />
+                  </ToolbarButton>
+                  <ToolbarButton
+                    label="Add Floating Note"
+                    tooltipSide="top"
                     onClick={createNote}
-                    className="w-10 h-10 rounded-xl border border-dashed border-yellow-500/50 flex items-center justify-center hover:bg-yellow-500/20 transition-colors text-yellow-500/80 hover:text-yellow-400 group bg-yellow-500/5"
-                    title="Add Floating Note"
+                    className="pill-main-action w-full"
+                    data-pill-main-action
                   >
-                    <FileText className="w-5 h-5 group-hover:scale-110 transition-transform" />
-                  </button>
-                  <button 
+                    <FileText className="size-4" />
+                  </ToolbarButton>
+                  <ToolbarButton
+                    label="Add Media / Drop Zone"
+                    tooltipSide="top"
                     onClick={triggerNativeFilePicker}
-                    className={`w-10 h-10 rounded-xl border border-dashed flex items-center justify-center transition-colors group ${
-                      theme === 'dark'
-                        ? 'border-slate-700 bg-white/5 hover:bg-white/10 text-slate-400 hover:text-white'
-                        : 'border-slate-300 bg-black/5 hover:bg-black/10 text-slate-500 hover:text-slate-900'
-                    }`}
-                    title="Add Media / Drop Zone"
+                    className="pill-main-action w-full"
+                    data-pill-main-action
                   >
-                    <Plus className="w-5 h-5 group-hover:scale-110 transition-transform" />
-                  </button>
-                  <button 
+                    <Plus className="size-4" />
+                  </ToolbarButton>
+                  </div>
+
+                  <div className="mt-2 flex items-center gap-1.5">
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant={showSearchComponent ? 'primary' : 'outline'}
                     onClick={() => {
                       setShowSearchComponent(!showSearchComponent);
                       setShowSettings(false);
                       setShowProviderSettings(false);
                     }}
-                    className={`w-10 h-10 rounded-xl flex items-center justify-center transition-colors border ${
-                      showSearchComponent
-                        ? 'bg-sky-500 text-white border-sky-500'
-                        : theme === 'dark'
-                          ? 'border-slate-700 bg-white/5 hover:bg-white/10 text-slate-400 hover:text-white'
-                          : 'border-slate-300 bg-black/5 hover:bg-black/10 text-slate-500 hover:text-slate-900'
-                    }`}
                     title="Quick Reference Search"
+                    className="min-w-0 flex-1 justify-start px-3"
                   >
-                    <Search className="w-5 h-5" />
-                  </button>
-                  
-                  <button 
+                    <Search className="size-3.5" />
+                    <span className="truncate">Search references</span>
+                  </Button>
+
+                  <ToolbarButton
+                    label="Settings"
+                    tooltipSide="top"
+                    active={showSettings}
+                    className="relative size-8"
                     onClick={() => {
                       const nextShowSettings = !showSettings;
                       setShowSettings(nextShowSettings);
                       setShowProviderSettings(false);
                       setShowSearchComponent(false);
                     }}
-                    className={`relative w-10 h-10 rounded-full flex items-center justify-center transition-colors ${
-                      showSettings
-                        ? (theme === 'dark' ? 'bg-white/20 text-white' : 'bg-slate-200 text-slate-900')
-                        : (theme === 'dark'
-                           ? 'hover:bg-white/10 text-slate-400 hover:text-white'
-                           : 'hover:bg-black/10 text-slate-500 hover:text-slate-900')
-                    }`}
-                    title="Settings"
                   >
-                    <Settings className="w-5 h-5" />
+                    <Settings className="size-4" />
                     {updateStatus.phase === 'ready' && (
-                      <span className="absolute right-0 top-0 h-2.5 w-2.5 rounded-full border-2 border-white dark:border-[#15151a] bg-emerald-500" />
+                      <span className="absolute right-0.5 top-0.5 size-2 rounded-full border border-surface bg-success" />
                     )}
-                  </button>
+                  </ToolbarButton>
+                  </div>
                 </div>
               </motion.div>
             )}
           </AnimatePresence>
         </div>
         
-        {/* Modern Edge-Based Pill Resize Handle */}
-        <div
-          className="pill-resize-handle absolute bottom-0 right-0 w-6 h-6 cursor-nwse-resize z-[1000] flex items-end justify-end group/resize pointer-events-auto"
-          onMouseDown={handlePillResizeMouseDown}
-          title={isRetracted ? 'Resize compact pill' : 'Resize pill'}
-        >
-          <div className={`mr-1 mb-1 w-2.5 h-2.5 border-r-[2px] border-b-[2px] transition-all duration-150 rounded-br-[3px] ${isResizingPill ? 'opacity-100 border-sky-400 scale-110 bg-sky-400/20' : 'opacity-0 group-hover/resize:opacity-100 border-slate-400'}`}></div>
-        </div>
+        <InvisibleResizeFrame
+          kind="pill"
+          toolbarHeight={0}
+          onResizeMouseDown={handlePillResizeMouseDown}
+        />
       </motion.div>
       )}
       </AnimatePresence>
@@ -5009,192 +5412,200 @@ export default function App() {
             initial={{ opacity: 0, x: -10, scale: 0.95 }}
             animate={{ opacity: 1, x: 0, scale: 1 }}
             exit={{ opacity: 0, x: -10, scale: 0.95 }}
-            transition={{ duration: 0.2 }}
-                  className={`settings-panel light-contrast-panel absolute pointer-events-auto border p-5 rounded-[24px] shadow-2xl w-80 max-w-[calc(100vw-1rem)] text-sm font-sans z-[99999] ${theme === 'light' ? 'bg-white border-black/10 text-slate-900' : 'bg-[#1e1e24] border-white/10 text-slate-200'}`}
+            transition={{ duration: 0.2, ease: [0.22, 1, 0.36, 1] }}
+            className="settings-panel light-contrast-panel rf-panel absolute z-[99999] w-[420px] max-w-[calc(100vw-1rem)] overflow-hidden rounded-3xl p-0 text-sm font-sans pointer-events-auto"
             data-pill-position-follower="true"
             style={{
               top: position.y,
               left: position.x + (isRetracted ? retractedPillSize : pillDimensions.width) + 16,
             }}
           >
-          <div className={`flex items-center justify-between mb-4 pb-2 border-b ${theme === 'light' ? 'border-black/10' : 'border-white/10'}`}>
-            <h3 className="font-bold uppercase tracking-widest text-[11px] text-slate-600 dark:text-slate-400 drag-handle cursor-move flex-1" onMouseDown={handlePillMouseDown}>Settings App</h3>
-            <button onClick={() => { setShowSettings(false); setShowProviderSettings(false); }} className="text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white p-1 hover:bg-black/10 dark:hover:bg-white/10 rounded">
-              <X className="w-4 h-4" />
-            </button>
+          <div className="drag-handle flex cursor-move items-center justify-between border-b border-border px-5 py-4" onMouseDown={handlePillMouseDown}>
+            <div>
+              <div className="text-sm font-semibold tracking-[-0.015em] text-foreground">Settings</div>
+              <div className="mt-1 text-[10px] text-muted-foreground">Tune RefFlow to your workflow.</div>
+            </div>
+            <ToolbarButton label="Close Settings" tooltipSide="bottom" onClick={() => { setShowSettings(false); setShowProviderSettings(false); }}>
+              <X className="size-4" />
+            </ToolbarButton>
           </div>
           
-          <div className="space-y-4 max-h-[85vh] overflow-y-auto no-scrollbar pb-2">
+          <div className="max-h-[82vh] space-y-3 overflow-y-auto p-4">
             
-            <div className="flex gap-2 p-1 bg-black/20 rounded-lg border border-white/5">
-              <button
+            <section className="rf-card p-4">
+              <div className="rf-kicker mb-3">Appearance</div>
+              <div className="flex gap-1 rounded-xl border border-border bg-background/45 p-1">
+              <Button
+                type="button"
+                size="sm"
+                variant={theme === 'light' ? 'primary' : 'ghost'}
                 onClick={() => {
                   setTheme('light');
                   localStorage.setItem('ref-flow-theme', 'light');
                 }}
-                className={`flex-1 py-1 text-xs rounded-md transition-colors ${theme === 'light' ? 'bg-sky-500 text-white' : 'text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'}`}
+                className="flex-1"
               >
                 Light
-              </button>
-              <button
+              </Button>
+              <Button
+                type="button"
+                size="sm"
+                variant={theme === 'dark' ? 'primary' : 'ghost'}
                 onClick={() => {
                   setTheme('dark');
                   localStorage.setItem('ref-flow-theme', 'dark');
                 }}
-                className={`flex-1 py-1 text-xs rounded-md transition-colors ${theme === 'dark' ? 'bg-sky-500 text-white' : 'text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'}`}
+                className="flex-1"
               >
                 Dark
-              </button>
-            </div>
+              </Button>
+              </div>
+              <div className="mt-4 space-y-2 border-t border-border pt-4">
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <div className="text-[11px] font-semibold text-foreground">Glass translucency</div>
+                    <div className="mt-0.5 text-[9px] text-muted-foreground">Adjust shared panels, cards, and floating toolbars.</div>
+                  </div>
+                  <span className="shrink-0 text-[10px] font-medium tabular-nums text-secondary">{Math.round(glassTranslucency * 100)}%</span>
+                </div>
+                <input
+                  type="range"
+                  min="0"
+                  max="0.75"
+                  step="0.01"
+                  value={glassTranslucency}
+                  aria-label="Glass translucency"
+                  data-glass-translucency
+                  className="smooth-range w-full"
+                  onChange={(event) => {
+                    const nextValue = Number.parseFloat(event.target.value);
+                    setGlassTranslucency(nextValue);
+                    localStorage.setItem('ref-flow-glass-translucency', nextValue.toString());
+                  }}
+                />
+              </div>
+            </section>
 
-            <label className="flex items-center space-x-3 cursor-pointer group">
-              <input 
-                type="checkbox" 
-                className="w-4 h-4 rounded border-slate-600 bg-slate-900 accent-sky-500" 
-                checked={alwaysOnTop} 
-                onChange={(e) => {
-                  setAlwaysOnTop(e.target.checked);
-                }} 
-              />
-              <span className="text-xs text-slate-700 dark:text-slate-300 group-hover:text-slate-950 dark:group-hover:text-white transition-colors">Always on Top</span>
-            </label>
-            
-            <label className="flex items-center space-x-3 cursor-pointer group">
-              <input 
-                type="checkbox" 
-                className="w-4 h-4 rounded border-slate-600 bg-slate-900 accent-sky-500"
-                checked={startOnBoot}
-                disabled={startOnBootStatus.phase === 'checking' || startOnBootStatus.phase === 'saving' || startOnBootStatus.phase === 'unavailable'}
-                onChange={(e) => { void changeStartOnBoot(e.target.checked); }}
-                aria-label="Start on Boot"
-              />
-              <span className="text-xs text-slate-700 dark:text-slate-300 group-hover:text-slate-950 dark:group-hover:text-white transition-colors">Start on Boot</span>
-            </label>
+            <section className="rf-card overflow-hidden">
+              <div className="rf-kicker border-b border-border px-4 py-3">Window behavior</div>
+              <div className="divide-y divide-border">
+                <SettingsToggle
+                  label="Always on top"
+                  description="Keep references visible above your creative apps."
+                  checked={alwaysOnTop}
+                  onCheckedChange={setAlwaysOnTop}
+                />
+                <div>
+                  <SettingsToggle
+                    label="Start on boot"
+                    description="Launch RefFlow when you sign in to Windows."
+                    checked={startOnBoot}
+                    disabled={startOnBootStatus.phase === 'checking' || startOnBootStatus.phase === 'saving' || startOnBootStatus.phase === 'unavailable'}
+                    onCheckedChange={(checked) => { void changeStartOnBoot(checked); }}
+                    compatibilityAriaLabel="Start on Boot"
+                  />
+                  <p className={`-mt-2 px-4 pb-3 text-[9px] leading-4 ${startOnBootStatus.phase === 'error' ? 'text-danger' : startOnBootStatus.phase === 'saving' ? 'text-primary' : 'text-muted-foreground'}`} data-start-on-boot-status>
+                    {startOnBootStatus.message}
+                  </p>
+                </div>
+                <SettingsToggle
+                  label="Start in tray"
+                  description="Open quietly without showing the pill immediately."
+                  checked={launchMinimized}
+                  onCheckedChange={setLaunchMinimized}
+                />
+                <SettingsToggle
+                  label="Show in taskbar"
+                  description="Keep a standard RefFlow button in the Windows taskbar."
+                  checked={showInTaskbar}
+                  onCheckedChange={setShowInTaskbar}
+                />
+              </div>
+            </section>
 
-            <p className={`-mt-2 pl-7 text-[9px] leading-4 ${startOnBootStatus.phase === 'error' ? 'text-red-500' : startOnBootStatus.phase === 'saving' ? 'text-sky-500' : 'text-slate-500 dark:text-slate-400'}`} data-start-on-boot-status>
-              {startOnBootStatus.message}
-            </p>
-
-            <label className="flex items-center space-x-3 cursor-pointer group">
-              <input
-                type="checkbox"
-                className="w-4 h-4 rounded border-slate-600 bg-slate-900 accent-sky-500"
-                checked={launchMinimized}
-                onChange={(e) => setLaunchMinimized(e.target.checked)}
-              />
-              <span className="text-xs text-slate-700 dark:text-slate-300 group-hover:text-slate-950 dark:group-hover:text-white transition-colors">Start with Windows in tray</span>
-            </label>
-
-            <label className="flex items-center space-x-3 cursor-pointer group">
-              <input 
-                type="checkbox" 
-                className="w-4 h-4 rounded border-slate-600 bg-slate-900 accent-sky-500"
-                checked={showInTaskbar}
-                onChange={(e) => {
-                  setShowInTaskbar(e.target.checked);
-                }}
-              />
-              <span className="text-xs text-slate-700 dark:text-slate-300 group-hover:text-slate-950 dark:group-hover:text-white transition-colors">Show ReferenceFlow in Taskbar</span>
-            </label>
-
-            <div className={`pt-3 border-t space-y-2 ${theme === 'light' ? 'border-black/10' : 'border-white/5'}`}>
+            <div className="rf-card space-y-3 p-4">
               <div className="flex items-center justify-between gap-2">
-                <span className="text-[10px] text-slate-500 uppercase tracking-wider font-bold">App Updates</span>
-                <span className="text-[9px] font-mono text-slate-500">
+                <span className="rf-kicker">App updates</span>
+                <span className="rounded-full border border-border bg-background/50 px-2 py-0.5 text-[9px] font-mono text-muted-foreground">
                   {updateStatus.currentVersion ? `v${updateStatus.currentVersion}` : 'installed build'}
                 </span>
               </div>
-              <p className={`text-[10px] leading-4 ${updateStatus.phase === 'error' ? 'text-red-500' : updateStatus.phase === 'ready' ? 'text-emerald-500' : 'text-slate-500 dark:text-slate-400'}`}>
+              <p className={`text-[10px] leading-4 ${updateStatus.phase === 'error' ? 'text-danger' : updateStatus.phase === 'ready' ? 'text-success' : 'text-muted-foreground'}`}>
                 {updateStatus.message || 'Updates are checked automatically.'}
               </p>
               {['available', 'downloading'].includes(updateStatus.phase) && (
                 <div className="h-1.5 overflow-hidden rounded-full bg-black/10 dark:bg-white/10">
                   <motion.div
-                    className="h-full rounded-full bg-sky-500"
+                    className="h-full rounded-full bg-primary"
                     initial={false}
                     animate={{ width: `${Math.max(0, Math.min(100, updateStatus.percent || 0))}%` }}
                     transition={{ duration: 0.2 }}
                   />
                 </div>
               )}
-              <button
+              <Button
+                type="button"
+                variant={updateStatus.phase === 'ready' ? 'primary' : 'secondary'}
+                size="sm"
                 onClick={updateStatus.phase === 'ready' ? restartToInstallUpdate : requestUpdateCheck}
                 disabled={updateIsBusy || updateStatus.phase === 'development'}
-                className={`w-full flex items-center justify-center gap-2 rounded-lg border px-3 py-2 text-xs font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-60 ${
-                  updateStatus.phase === 'ready'
-                    ? 'border-emerald-500/30 bg-emerald-500/15 text-emerald-600 dark:text-emerald-300 hover:bg-emerald-500 hover:text-white'
-                    : 'border-sky-500/20 bg-sky-500/15 text-sky-600 dark:text-sky-300 hover:bg-sky-500 hover:text-white'
-                }`}
+                className="w-full"
               >
                 {updateIsBusy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : updateStatus.phase === 'ready' ? <Check className="w-3.5 h-3.5" /> : <RotateCw className="w-3.5 h-3.5" />}
                 {updateButtonLabel}
-              </button>
-              <p className="text-[9px] leading-4 text-slate-500 dark:text-slate-400">
+              </Button>
+              <p className="text-[9px] leading-4 text-muted-foreground">
                 Updates come from the official GitHub Releases page. Your boards and settings stay in place.
               </p>
             </div>
 
-            <div className={`pt-3 border-t space-y-3 ${theme === 'light' ? 'border-black/10' : 'border-white/5'}`}>
+            <div className="rf-card space-y-3 p-4">
               <div className="space-y-2">
-                <span className="text-[10px] text-slate-500 uppercase tracking-wider block font-bold">Local Board Folder</span>
+                <span className="rf-kicker block">Local board folder</span>
                 {defaultAutosaveRoot && (
-                  <div className="rounded-md bg-black/5 dark:bg-white/5 border border-black/10 dark:border-white/10 px-2 py-1 text-[9px] leading-4 text-slate-700 dark:text-slate-300 break-all">
+                  <div className="break-all rounded-xl border border-border bg-background/50 px-3 py-2 text-[9px] leading-4 text-secondary">
                     {defaultAutosaveRoot}
                   </div>
                 )}
-                <button
+                <Button
+                  type="button"
+                  variant="secondary"
+                  size="sm"
                   onClick={() => {
                     const active = projects.find(p => p.id === activeProjectId);
                     if (active) exportBoard(active);
                   }}
-                  className="w-full flex items-center justify-center gap-2 rounded-lg bg-sky-500/15 text-sky-600 dark:text-sky-300 hover:bg-sky-500 hover:text-white border border-sky-500/20 px-3 py-2 text-xs font-semibold transition-colors"
+                  className="w-full"
                 >
                   <Download className="w-3.5 h-3.5" /> Choose / Change Autosave Folder
-                </button>
-                <p className="text-[10px] leading-4 text-slate-500 dark:text-slate-400">
+                </Button>
+                <p className="text-[10px] leading-4 text-muted-foreground">
                   Saves board JSON, media, notes, and sketches into an editable local folder.
                 </p>
               </div>
             </div>
 
-            <div className={`pt-3 border-t space-y-3 ${theme === 'light' ? 'border-black/10' : 'border-white/5'}`}>
+            <div className="rf-card p-2">
               <button
                 type="button"
                 onClick={() => setShowProviderSettings(true)}
-                className={`w-full flex items-center gap-3 rounded-xl border p-3 text-left transition-colors ${theme === 'light' ? 'border-black/10 bg-black/[0.03] hover:bg-black/[0.07]' : 'border-white/10 bg-white/[0.04] hover:bg-white/[0.08]'}`}
+                className="flex w-full items-center gap-3 rounded-xl p-3 text-left transition-colors hover:bg-surface-elevated"
                 title="Manage no-key search sources"
               >
-                <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-sky-500/15 text-sky-500">
+                <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-primary/20 bg-primary/12 text-primary">
                   <Search className="h-4 w-4" />
                 </div>
                 <div className="min-w-0 flex-1">
-                  <span className="block text-[11px] font-semibold text-slate-900 dark:text-slate-100">Search Providers</span>
-                  <span className="block text-[9px] leading-4 text-slate-500 dark:text-slate-400">No-key sources, fallback order, and diagnostics</span>
+                  <span className="block text-[11px] font-semibold text-foreground">Search providers</span>
+                  <span className="block text-[9px] leading-4 text-muted-foreground">No-key sources, fallback order, and diagnostics</span>
                 </div>
-                <ChevronRight className="h-4 w-4 shrink-0 text-slate-400" />
+                <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground" />
               </button>
             </div>
 
-            <div className="pt-3 border-t border-white/5 space-y-2">
-              <span className="text-[10px] text-slate-500 uppercase tracking-wider block">Pill Opacity</span>
-              <input 
-                type="range"
-                min="0.2" 
-                max="1" 
-                step="0.01" 
-                value={pillOpacity} 
-                className="w-full smooth-range"
-                onChange={(e) => {
-                  const val = parseFloat(e.target.value);
-                  setPillOpacity(val);
-                  localStorage.setItem('ref-flow-pill-opacity', val.toString());
-                }}
-              />
-            </div>
-
-            <div className="pt-3 border-t border-white/5 space-y-2">
-              <span className="text-[10px] text-slate-500 uppercase tracking-wider block">Shortcuts</span>
-              <p className="text-[9px] leading-4 text-slate-500">Focus a binding and press the full combination you want, such as Shift + M. Unassign disables it.</p>
+            <div className="rf-card space-y-2 p-4">
+              <span className="rf-kicker block">Keyboard shortcuts</span>
+              <p className="pb-1 text-[9px] leading-4 text-muted-foreground">Focus a binding and press the full combination you want, such as Shift + M. Unassign disables it.</p>
               {[
                 { key: 'minimize', label: 'Minimize/Expand pill' },
                 { key: 'newNote', label: 'New Note' },
@@ -5211,8 +5622,8 @@ export default function App() {
                   ? [parsed.ctrl && 'Ctrl', parsed.alt && 'Alt', parsed.shift && 'Shift', parsed.meta && 'Win', shortcutKeyLabel(parsed.key)].filter(Boolean).join(' + ')
                   : 'Unassigned';
                 return (
-                  <div key={key} className="grid grid-cols-[minmax(0,1fr)_9.5rem] items-center gap-3 py-1" data-shortcut-row>
-                    <span className="min-w-0 break-words text-[10px] leading-4 text-slate-400" data-shortcut-label>{label}</span>
+                  <div key={key} className="grid grid-cols-[minmax(0,1fr)_10rem] items-center gap-3 py-1.5" data-shortcut-row>
+                    <span className="min-w-0 break-words text-[10px] leading-4 text-secondary" data-shortcut-label>{label}</span>
                     <div className="grid min-w-0 grid-cols-[minmax(0,1fr)_auto] items-center gap-1" data-shortcut-controls>
                       <input
                         type="text"
@@ -5235,7 +5646,7 @@ export default function App() {
                             key: capturedKey
                           }));
                         }}
-                        className={`h-7 w-full min-w-0 cursor-pointer rounded border px-1.5 text-center font-mono text-[9px] font-bold outline-none focus:border-sky-500 ${combo ? 'border-white/10 bg-black/20 text-sky-400' : 'border-dashed border-white/10 bg-black/10 text-slate-500'}`}
+                        className={`h-8 w-full min-w-0 cursor-pointer rounded-lg border px-2 text-center font-mono text-[9px] font-semibold outline-none focus:border-primary ${combo ? 'border-primary/25 bg-primary/8 text-primary' : 'border-dashed border-border bg-background/45 text-muted-foreground'}`}
                         title="Click, then press the complete shortcut combination"
                         aria-label={`${label} shortcut`}
                       />
@@ -5243,7 +5654,7 @@ export default function App() {
                         type="button"
                         onClick={() => setShortcutBinding(key, '')}
                         disabled={!combo}
-                        className="rounded px-1 py-1 text-[9px] text-slate-500 hover:bg-rose-500/20 hover:text-rose-400 disabled:opacity-30"
+                        className="rounded-lg px-1.5 py-1 text-[9px] text-muted-foreground transition-colors hover:bg-danger/10 hover:text-danger disabled:opacity-30"
                         title={`Unassign ${label}`}
                       >
                         Clear
@@ -5254,21 +5665,24 @@ export default function App() {
               })}
             </div>
 
-            <div className={`pt-3 border-t ${theme === 'light' ? 'border-black/10' : 'border-white/5'}`}>
-              <button
+            <div className="rf-card p-4">
+              <Button
+                type="button"
+                variant="outline"
+                size="md"
                 onClick={openSupportPage}
-                className="w-full flex items-center justify-center gap-2 rounded-lg border border-pink-500/25 bg-pink-500/10 px-3 py-2.5 text-xs font-semibold text-pink-600 dark:text-pink-300 hover:bg-pink-500 hover:text-white transition-colors"
+                className="w-full border-primary/20 bg-primary/8 text-primary hover:border-primary/35 hover:bg-primary/14 hover:text-primary"
                 title="Support RefFlow Studio on Patreon"
               >
                 <Heart className="w-3.5 h-3.5" /> Support RefFlow Studio
-              </button>
-              <p className="mt-2 text-[10px] leading-4 text-center text-slate-500 dark:text-slate-400">
+              </Button>
+              <p className="mt-2 text-center text-[10px] leading-4 text-muted-foreground">
                 Help fund bug fixes, improvements, and new features.
               </p>
             </div>
             
             <div 
-              className="pt-4 text-[10px] text-slate-500 text-center drag-handle cursor-move"
+              className="drag-handle cursor-move pb-1 pt-2 text-center text-[9px] text-muted-foreground"
               onMouseDown={handlePillMouseDown}
             >
               Drag this panel from the header.
@@ -5285,7 +5699,7 @@ export default function App() {
             animate={{ opacity: 1, x: 0, scale: 1 }}
             exit={{ opacity: 0, x: 10, scale: 0.96 }}
             transition={{ duration: 0.18 }}
-            className={`settings-panel provider-settings-panel light-contrast-panel absolute pointer-events-auto border p-5 rounded-[24px] shadow-2xl w-72 text-sm font-sans z-[99999] ${theme === 'light' ? 'bg-white border-black/10 text-slate-900' : 'bg-[#1e1e24] border-white/10 text-slate-200'}`}
+            className="settings-panel provider-settings-panel light-contrast-panel rf-panel absolute z-[99999] w-80 overflow-hidden rounded-3xl p-0 text-sm font-sans pointer-events-auto"
             data-pill-position-follower="true"
             style={{
               top: position.y,
@@ -5293,96 +5707,94 @@ export default function App() {
             }}
             data-settings-section="providers"
           >
-            <div className={`flex items-center gap-2 mb-4 pb-2 border-b ${theme === 'light' ? 'border-black/10' : 'border-white/10'}`}>
-              <button
-                type="button"
+            <div className="drag-handle flex cursor-move items-center gap-2 border-b border-border px-4 py-4" onMouseDown={handlePillMouseDown}>
+              <ToolbarButton
+                label="Back to Settings"
+                tooltipSide="bottom"
                 onClick={() => setShowProviderSettings(false)}
-                className="shrink-0 text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white p-1 hover:bg-black/10 dark:hover:bg-white/10 rounded"
-                title="Back to Settings"
               >
                 <ChevronLeft className="w-4 h-4" />
-              </button>
-              <h3 className="min-w-0 flex-1 font-bold uppercase tracking-widest text-[11px] text-slate-600 dark:text-slate-400 drag-handle cursor-move" onMouseDown={handlePillMouseDown}>Search Providers</h3>
-              <button
+              </ToolbarButton>
+              <div className="min-w-0 flex-1">
+                <h3 className="truncate text-sm font-semibold tracking-[-0.015em] text-foreground">Search providers</h3>
+                <p className="mt-1 text-[9px] text-muted-foreground">No-key sources and fallback order</p>
+              </div>
+              <Button
                 type="button"
+                variant="ghost"
+                size="sm"
                 onClick={() => setShowDiagnosticsModal(true)}
-                className="text-[9px] text-sky-500 hover:text-sky-400 font-mono transition-colors border border-sky-400/30 bg-sky-400/10 px-1.5 py-0.5 rounded"
+                className="h-7 px-2 text-[9px] text-primary"
                 title="Open Search Diagnostics"
               >
                 Diagnostics
-              </button>
-              <button
-                type="button"
+              </Button>
+              <ToolbarButton
+                label="Close Search Providers"
+                tooltipSide="bottom"
                 onClick={() => { setShowSettings(false); setShowProviderSettings(false); }}
-                className="shrink-0 text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white p-1 hover:bg-black/10 dark:hover:bg-white/10 rounded"
-                title="Close Search Providers"
               >
                 <X className="w-4 h-4" />
-              </button>
+              </ToolbarButton>
             </div>
 
-            <p className="mb-3 text-[10px] leading-4 text-slate-500 dark:text-slate-400">
+            <p className="px-4 pt-4 text-[10px] leading-4 text-muted-foreground">
               RefFlow now uses only no-key in-app sources. Enable them or change their fallback order here.
             </p>
 
-            <div className="space-y-2 max-h-[75vh] overflow-y-auto no-scrollbar pr-0.5">
+            <div className="max-h-[70vh] space-y-2 overflow-y-auto p-4">
               {providerOrder.map((provider, index) => {
                 const conf = getProviderConfig(provider);
                 const providerLabel = provider;
                 return (
-                  <div key={provider} className="flex flex-col gap-1.5 bg-slate-100 dark:bg-black/10 border border-slate-300 dark:border-white/5 p-2 rounded-lg" data-provider={provider}>
+                  <div key={provider} className="rf-card flex flex-col gap-2 p-3" data-provider={provider}>
                     <div className="flex items-center justify-between gap-2">
                       <div className="flex min-w-0 items-center gap-2">
-                        <div className="flex flex-col items-center justify-center shrink-0 w-4">
+                        <div className="flex w-5 shrink-0 flex-col items-center justify-center">
                           <button
                             type="button"
                             aria-label={`Move ${providerLabel} up`}
-                            className={`text-[8px] ${index === 0 ? 'text-transparent pointer-events-none' : 'text-slate-600 dark:text-slate-400 hover:text-sky-500'}`}
+                            className={`rounded text-muted-foreground hover:bg-surface-elevated hover:text-primary ${index === 0 ? 'pointer-events-none opacity-0' : ''}`}
                             onClick={() => {
                               const newOrder = [...providerOrder];
                               [newOrder[index - 1], newOrder[index]] = [newOrder[index], newOrder[index - 1]];
                               updateProviderOrder(newOrder);
                             }}
                           >
-                            ▲
+                            <ChevronUp className="size-3" />
                           </button>
                           <button
                             type="button"
                             aria-label={`Move ${providerLabel} down`}
-                            className={`text-[8px] ${index === providerOrder.length - 1 ? 'text-transparent pointer-events-none' : 'text-slate-600 dark:text-slate-400 hover:text-sky-500'}`}
+                            className={`rounded text-muted-foreground hover:bg-surface-elevated hover:text-primary ${index === providerOrder.length - 1 ? 'pointer-events-none opacity-0' : ''}`}
                             onClick={() => {
                               const newOrder = [...providerOrder];
                               [newOrder[index + 1], newOrder[index]] = [newOrder[index], newOrder[index + 1]];
                               updateProviderOrder(newOrder);
                             }}
                           >
-                            ▼
+                            <ChevronDown className="size-3" />
                           </button>
                         </div>
-                        <span className="truncate text-[11px] font-semibold text-slate-950 dark:text-slate-100">{providerLabel}</span>
+                        <span className="truncate text-[11px] font-semibold text-foreground">{providerLabel}</span>
                       </div>
-                      <button
-                        type="button"
-                        role="switch"
-                        aria-checked={conf.isEnabled}
+                      <Switch
+                        checked={conf.isEnabled}
                         aria-label={`${conf.isEnabled ? 'Disable' : 'Enable'} ${providerLabel}`}
-                        onClick={() => {
-                          updateProviderStatus({ ...providerStatus, [provider]: { ...providerStatus[provider], enabled: !conf.isEnabled } });
+                        onCheckedChange={(enabled) => {
+                          updateProviderStatus({ ...providerStatus, [provider]: { ...providerStatus[provider], enabled } });
                         }}
-                        className={`w-8 h-4 shrink-0 rounded-full flex items-center p-0.5 transition-colors ${conf.isEnabled ? 'bg-sky-500' : 'bg-slate-700'}`}
-                      >
-                        <div className={`w-3 h-3 bg-white rounded-full shadow-sm transition-transform ${conf.isEnabled ? 'translate-x-4' : 'translate-x-0'}`} />
-                      </button>
+                      />
                     </div>
                     <div className="flex items-center justify-between gap-2 pl-6">
                       <span className={`text-[9px] font-mono ${
                         conf.badge === 'Ready'
-                          ? 'text-green-700 dark:text-green-400'
-                          : 'text-slate-700 dark:text-slate-400'
+                          ? 'text-success'
+                          : 'text-muted-foreground'
                       }`}>
                         {conf.badge}
                       </span>
-                      <span className="text-[8px] uppercase tracking-wide text-sky-600 dark:text-sky-400">No API key</span>
+                      <span className="text-[8px] uppercase tracking-wide text-primary">No API key</span>
                     </div>
                   </div>
                 );
@@ -5399,35 +5811,38 @@ export default function App() {
             initial={{ opacity: 0, scale: 0.95 }}
             animate={{ opacity: 1, scale: 1 }}
             exit={{ opacity: 0, scale: 0.95 }}
-            className={`absolute pointer-events-auto border p-5 rounded-[24px] shadow-2xl w-80 text-sm font-sans z-[100000] flex flex-col ${theme === 'light' ? 'bg-white border-black/10 text-slate-800' : 'bg-[#1e1e24] border-white/10 text-slate-200'}`}
+            className="rf-panel absolute z-[100000] flex w-80 flex-col overflow-hidden rounded-3xl p-0 text-sm font-sans pointer-events-auto"
             data-pill-position-follower="true"
             style={{
               top: position.y,
               left: position.x + (isRetracted ? retractedPillSize : pillDimensions.width) + 16 + 280,
             }}
           >
-            <div className={`flex items-center justify-between mb-4 pb-2 border-b ${theme === 'light' ? 'border-black/10' : 'border-white/10'}`}>
-              <h3 className="font-bold uppercase tracking-widest text-[11px] text-slate-400">Search Diagnostics</h3>
-              <button onClick={() => setShowDiagnosticsModal(false)} className="text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white p-1 hover:bg-black/10 dark:hover:bg-white/10 rounded">
-                <X className="w-4 h-4" />
-              </button>
+            <div className="flex items-center justify-between border-b border-border px-4 py-4">
+              <div>
+                <h3 className="text-sm font-semibold text-foreground">Search diagnostics</h3>
+                <p className="mt-1 text-[9px] text-muted-foreground">Provider health and recent activity</p>
+              </div>
+              <ToolbarButton label="Close diagnostics" tooltipSide="bottom" onClick={() => setShowDiagnosticsModal(false)}>
+                <X className="size-4" />
+              </ToolbarButton>
             </div>
             
-            <div className="space-y-4 text-xs">
+            <div className="space-y-4 p-4 text-xs">
               <div>
                 <span className="text-[10px] uppercase text-slate-500 block mb-1">Active Providers</span>
-                <div className="space-y-1 text-slate-700 dark:text-slate-300 font-mono text-[10px]">
+                <div className="space-y-1 font-mono text-[10px] text-secondary">
                     {providerOrder.filter(p => getProviderConfig(p).isEnabled).map(p => (
                         <div key={p}>- {p}</div>
                     ))}
                 </div>
               </div>
               <div className="grid grid-cols-2 gap-2 text-center text-[10px] font-mono">
-                <div className="bg-black/5 dark:bg-white/5 p-2 rounded border border-black/5 dark:border-white/5">
+                <div className="rf-card p-2.5">
                     <div className="text-slate-500 mb-1">Total Req</div>
                     <div className="text-slate-800 dark:text-slate-200 text-sm">{searchDiagnostics.reqCount}</div>
                 </div>
-                <div className="bg-black/5 dark:bg-white/5 p-2 rounded border border-black/5 dark:border-white/5">
+                <div className="rf-card p-2.5">
                     <div className="text-slate-500 mb-1">Total Res</div>
                     <div className="text-slate-800 dark:text-slate-200 text-sm">{searchDiagnostics.resCount}</div>
                 </div>
@@ -5461,8 +5876,8 @@ export default function App() {
             initial={{ opacity: 0, x: -10, scale: 0.95 }}
             animate={{ opacity: 1, x: 0, scale: 1 }}
             exit={{ opacity: 0, x: -10, scale: 0.95 }}
-            transition={{ duration: 0.2 }}
-            className={`absolute pointer-events-auto border p-5 rounded-[24px] shadow-2xl w-[450px] text-sm font-sans z-[99999] overflow-hidden flex flex-col max-h-[85vh] ${theme === 'light' ? 'bg-white border-black/10 text-slate-800' : 'bg-[#1e1e24] border-white/10 text-slate-200'}`}
+            transition={{ duration: 0.2, ease: [0.22, 1, 0.36, 1] }}
+            className="rf-panel absolute z-[99999] flex max-h-[86vh] w-[520px] max-w-[calc(100vw-1rem)] flex-col overflow-hidden rounded-3xl p-0 text-sm font-sans pointer-events-auto"
             data-pill-position-follower="true"
             style={{
               top: position.y,
@@ -5470,14 +5885,17 @@ export default function App() {
             }}
             onClick={() => setSearchContextMenu(null)}
           >
-            <div className={`flex items-center justify-between mb-3 pb-2 border-b shrink-0 ${theme === 'light' ? 'border-black/10' : 'border-white/10'}`}>
-              <h3 className="font-bold uppercase tracking-widest text-[11px] text-slate-400 drag-handle cursor-move flex-1" onMouseDown={handlePillMouseDown}>Quick Reference Search</h3>
-              <button onClick={() => setShowSearchComponent(false)} className="text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white p-1 hover:bg-black/10 dark:hover:bg-white/10 rounded ml-2">
-                <X className="w-4 h-4" />
-              </button>
+            <div className="drag-handle flex shrink-0 cursor-move items-center justify-between border-b border-border px-5 py-4" onMouseDown={handlePillMouseDown}>
+              <div>
+                <div className="text-sm font-semibold tracking-[-0.015em] text-foreground">Reference search</div>
+                <div className="mt-1 text-[10px] text-muted-foreground">Discover and add visual inspiration.</div>
+              </div>
+              <ToolbarButton label="Close Search" tooltipSide="bottom" onClick={() => setShowSearchComponent(false)}>
+                <X className="size-4" />
+              </ToolbarButton>
             </div>
             
-            <div className="flex flex-col gap-3 flex-1 overflow-hidden">
+            <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-hidden p-4">
                 <div className="flex gap-2 w-full shrink-0">
                     <input 
                         type="text"
@@ -5485,19 +5903,22 @@ export default function App() {
                         onChange={(e) => setSearchQuery(e.target.value)}
                         onKeyDown={(e) => e.key === 'Enter' && performSearch()}
                         placeholder="Search images..."
-                        className="flex-1 bg-black/5 dark:bg-black/20 border border-black/10 dark:border-white/10 rounded-lg px-3 py-2 text-sm text-slate-800 dark:text-slate-200 placeholder:text-slate-500 outline-none focus:border-sky-500"
+                        className="h-10 min-w-0 flex-1 rounded-xl border border-border bg-background/55 px-3 text-sm text-foreground outline-none transition-colors placeholder:text-muted-foreground focus:border-primary"
                     />
-                    <button 
+                    <Button
+                        type="button"
+                        variant="primary"
+                        size="icon"
                         onClick={() => performSearch()}
-                        className="bg-sky-500 hover:bg-sky-600 text-white rounded-lg px-4 py-2 font-medium transition-colors flex items-center justify-center min-w-[40px]"
+                        aria-label="Search references"
                     >
                         {searchStatus === 'loading' ? <Loader2 className="w-4 h-4 animate-spin" /> : <Search className="w-4 h-4" />}
-                    </button>
+                    </Button>
                 </div>
 
                 {searchHistory.length > 0 && (
-                    <div className="flex flex-col gap-1 shrink-0 px-1 border-b border-white/5 pb-2">
-                        <span className="text-[8px] text-slate-400 uppercase tracking-widest font-bold">Recent Searches</span>
+                    <div className="flex shrink-0 flex-col gap-1.5 border-b border-border px-1 pb-3">
+                        <span className="rf-kicker">Recent searches</span>
                         <div className="flex flex-wrap gap-1">
                             {searchHistory.map((hist, i) => (
                                 <button
@@ -5508,7 +5929,7 @@ export default function App() {
                                           performSearch();
                                         }, 100);
                                     }}
-                                    className="px-2 py-0.5 rounded text-[10px] bg-black/5 dark:bg-white/5 text-slate-600 dark:text-slate-400 hover:bg-sky-500 hover:text-white transition-colors"
+                                    className="rounded-lg border border-border bg-surface-elevated/60 px-2 py-1 text-[10px] text-secondary transition-colors hover:border-primary/35 hover:bg-primary/10 hover:text-primary"
                                 >
                                     {hist}
                                 </button>
@@ -5519,7 +5940,7 @@ export default function App() {
 
                 <div className="flex flex-col gap-2 shrink-0">
                     <div>
-                        <span className="text-[9px] text-slate-500 uppercase tracking-widest font-bold mb-1 block">In-App Search (Native)</span>
+                        <span className="rf-kicker mb-1.5 block">In-app sources</span>
                         <div className="flex flex-wrap gap-1.5 shrink-0">
                             {NATIVE_PROVIDERS.map(p => {
                                 let statusLabel = '';
@@ -5532,7 +5953,7 @@ export default function App() {
                                 <button
                                     key={p}
                                     onClick={() => setSearchProvider(p)}
-                                    className={`px-2 py-1 rounded-md text-[10px] font-medium transition-colors flex items-center justify-center gap-1 ${searchProvider === p ? 'bg-sky-500 text-white' : 'bg-black/5 dark:bg-white/5 text-slate-500 dark:text-slate-400 hover:bg-black/10 dark:hover:bg-white/10 hover:text-slate-900 dark:hover:text-white'} ${statusLabel === '[off]' ? 'opacity-50' : ''}`}
+                                    className={`flex items-center justify-center gap-1 rounded-lg border px-2.5 py-1.5 text-[10px] font-medium transition-colors ${searchProvider === p ? 'border-primary bg-primary text-white' : 'border-border bg-surface-elevated/55 text-secondary hover:border-primary/30 hover:bg-primary/8 hover:text-primary'} ${statusLabel === '[off]' ? 'opacity-45' : ''}`}
                                     title={statusLabel === '[off]' ? 'Disabled in Settings' : 'Ready without an API key'}
                                     disabled={statusLabel === '[off]'}
                                 >
@@ -5543,13 +5964,13 @@ export default function App() {
                         </div>
                     </div>
                     <div>
-                        <span className="text-[9px] text-slate-500 uppercase tracking-widest font-bold mb-1 block">Open in Browser</span>
+                        <span className="rf-kicker mb-1.5 block">Open in default browser</span>
                         <div className="flex flex-wrap gap-1.5 shrink-0">
                             {BROWSER_PROVIDERS.map(p => (
                                 <button
                                     key={p}
                                     onClick={() => setSearchProvider(p)}
-                                    className={`px-2 py-1 rounded-md text-[10px] font-medium transition-colors ${searchProvider === p ? 'bg-amber-500 text-white' : 'bg-black/5 dark:bg-white/5 text-slate-500 dark:text-slate-400 hover:bg-black/10 dark:hover:bg-white/10 hover:text-slate-900 dark:hover:text-white'}`}
+                                    className={`rounded-lg border px-2.5 py-1.5 text-[10px] font-medium transition-colors ${searchProvider === p ? 'border-warning bg-warning text-white' : 'border-border bg-surface-elevated/55 text-secondary hover:border-warning/35 hover:bg-warning/10 hover:text-warning'}`}
                                 >
                                     {p}
                                 </button>
@@ -5558,31 +5979,31 @@ export default function App() {
                     </div>
                 </div>
                 
-                <div className="grid grid-cols-4 gap-1.5 shrink-0 bg-black/10 dark:bg-black/30 p-2 rounded-lg text-[9px] font-mono text-slate-500 border border-black/5 dark:border-white/5">
+                <div className="rf-card grid shrink-0 grid-cols-4 gap-1.5 p-2.5 font-mono text-[9px] text-muted-foreground">
                     <div className="flex flex-col">
-                        <span className="text-[8px] uppercase tracking-wider text-slate-400">Searching</span>
-                        <span className="font-semibold text-slate-800 dark:text-slate-300 truncate">{activeProviderSearching}</span>
+                        <span className="text-[8px] uppercase tracking-wider text-muted-foreground">Searching</span>
+                        <span className="truncate font-semibold text-secondary">{activeProviderSearching}</span>
                     </div>
                     <div className="flex flex-col">
-                        <span className="text-[8px] uppercase tracking-wider text-slate-400">Response</span>
-                        <span className="font-semibold text-slate-800 dark:text-slate-300">+{lastResultsCount} hits</span>
+                        <span className="text-[8px] uppercase tracking-wider text-muted-foreground">Response</span>
+                        <span className="font-semibold text-secondary">+{lastResultsCount} hits</span>
                     </div>
                     <div className="flex flex-col">
-                        <span className="text-[8px] uppercase tracking-wider text-slate-400">Page</span>
-                        <span className="font-semibold text-slate-800 dark:text-slate-300">#{searchPage}</span>
+                        <span className="text-[8px] uppercase tracking-wider text-muted-foreground">Page</span>
+                        <span className="font-semibold text-secondary">#{searchPage}</span>
                     </div>
                     <div className="flex flex-col">
-                        <span className="text-[8px] uppercase tracking-wider text-slate-400">Total Loaded</span>
-                        <span className="font-semibold text-slate-800 dark:text-slate-300">{searchResults.length} items</span>
+                        <span className="text-[8px] uppercase tracking-wider text-muted-foreground">Loaded</span>
+                        <span className="font-semibold text-secondary">{searchResults.length} items</span>
                     </div>
                 </div>
 
-                <div className="flex flex-wrap gap-1.5 shrink-0 py-1 mb-1 border-b border-white/5">
+                <div className="mb-1 flex shrink-0 flex-wrap gap-1.5 border-b border-border py-1 pb-3">
                     {FILTER_OPTIONS.map(f => (
                         <button
                             key={f}
                             onClick={() => setSearchFilters(prev => prev.includes(f) ? prev.filter(x => x !== f) : [...prev, f])}
-                            className={`px-2 py-0.5 rounded-full text-[9px] border transition-colors ${searchFilters.includes(f) ? 'border-sky-500 text-sky-400 bg-sky-500/10' : 'border-slate-700 text-slate-500 hover:border-slate-500'}`}
+                            className={`rounded-full border px-2.5 py-1 text-[9px] transition-colors ${searchFilters.includes(f) ? 'border-primary/55 bg-primary/12 text-primary' : 'border-border text-muted-foreground hover:border-border-strong hover:text-foreground'}`}
                         >
                             {f}
                         </button>
@@ -5594,65 +6015,69 @@ export default function App() {
                     onScroll={handleSearchScroll}
                 >
                     {searchStatus === 'loading' && (
-                        <div className="flex items-center justify-center h-40">
-                             <div className="flex flex-col items-center text-slate-500 gap-2">
-                                 <Loader2 className="w-6 h-6 animate-spin text-sky-500" />
-                                 <span className="text-xs">Searching...</span>
-                             </div>
+                        <div className="grid grid-cols-2 gap-2 pb-2" aria-label="Loading search results">
+                          {Array.from({ length: 6 }, (_, index) => (
+                            <Skeleton key={index} className="rf-skeleton aspect-square" />
+                          ))}
                         </div>
                     )}
                     
                     {searchStatus === 'no-results' && (
-                        <div className="flex items-center justify-center p-4 text-slate-500 text-xs text-center border border-white/5 rounded mx-2 my-4 bg-white/5">
-                             No usable results found.<br/>Check the logs panel below for source or network errors.
+                        <div className="mx-2 my-4 flex flex-col items-center justify-center rounded-2xl border border-dashed border-border bg-surface-elevated/30 p-6 text-center text-xs text-muted-foreground">
+                             <Search className="mb-2 size-5 text-primary" />
+                             <span className="font-medium text-secondary">No usable results found</span>
+                             <span className="mt-1 text-[10px]">Try a broader phrase or another source.</span>
                         </div>
                     )}
                     
                     {searchResults.length > 0 && (
                         <div className="grid grid-cols-2 gap-2 pb-2">
                             {searchResults.map((res, idx) => (
-                                <div key={idx} className="relative group rounded-lg overflow-hidden border border-white/5 bg-black/40 aspect-square">
+                                <div key={idx} className="rf-card rf-preview-card relative group aspect-square overflow-hidden">
                                     <img 
                                         src={res.thumbnail || res.url} 
                                         alt={res.title || "Search result"} 
-                                        className="w-full h-full object-cover"
+                                        className="h-full w-full scale-[1.01] object-cover opacity-0 transition-[opacity,transform] duration-200 group-hover:scale-105"
+                                        loading="lazy"
+                                        decoding="async"
+                                        onLoad={(event) => event.currentTarget.classList.add('opacity-100')}
                                         draggable="true"
                                         onDragStart={(e) => {
                                             e.dataTransfer.setData("text/plain", res.url);
                                             e.dataTransfer.setData("application/x-reference-url", "true");
                                         }}
-                                        onDoubleClick={() => fetchAndAddImage(res.url)}
+                                        onDoubleClick={() => fetchAndAddImage(res.url, res.title)}
                                         onContextMenu={(e) => {
                                             e.preventDefault();
                                             e.stopPropagation();
                                             setSearchContextMenu({ x: e.clientX, y: e.clientY, result: res });
                                         }}
                                     />
-                                    <div className="absolute inset-0 bg-black/60 opacity-0 group-hover:opacity-100 transition-opacity flex flex-col justify-between p-2">
-                                        <div className="text-[9px] font-mono text-slate-300 truncate w-full flex justify-between">
+                                    <div className="absolute inset-0 flex flex-col justify-between bg-gradient-to-b from-black/70 via-black/10 to-black/80 p-2.5 opacity-0 transition-opacity duration-200 group-hover:opacity-100">
+                                        <div className="flex w-full justify-between truncate font-mono text-[9px] text-white/80">
                                             <span>{res.provider}</span>
                                             {res.width && <span>{res.width}x{res.height}</span>}
                                         </div>
                                         <div className="flex flex-wrap gap-1 justify-end">
-                                            <button 
-                                                onClick={() => fetchAndAddImage(res.url)}
-                                                className="bg-sky-500 hover:bg-sky-600 text-white p-1.5 rounded"
+                                            <button
+                                                onClick={() => fetchAndAddImage(res.url, res.title)}
+                                                className="rounded-lg bg-primary p-2 text-white shadow-lg transition-all hover:-translate-y-px hover:bg-primary/90"
                                                 title="Add to Workspace"
                                             >
                                                 <Plus className="w-3 h-3" />
                                             </button>
-                                            <button 
+                                            <button
                                                 onClick={() => void openInWindowsDefaultBrowser(res.url)}
-                                                className="bg-slate-700 hover:bg-slate-600 text-white p-1.5 rounded"
+                                                className="rounded-lg border border-white/15 bg-black/55 p-2 text-white backdrop-blur transition-all hover:-translate-y-px hover:bg-white/15"
                                                 title="Open Original"
                                             >
                                                 <LinkIcon className="w-3 h-3" />
                                             </button>
-                                            <button 
+                                            <button
                                                 onClick={() => {
                                                     navigator.clipboard.writeText(res.url);
                                                 }}
-                                                className="bg-slate-700 hover:bg-slate-600 text-white p-1.5 rounded"
+                                                className="rounded-lg border border-white/15 bg-black/55 p-2 text-white backdrop-blur transition-all hover:-translate-y-px hover:bg-white/15"
                                                 title="Copy URL"
                                             >
                                                 <FileText className="w-3 h-3" />
@@ -5666,12 +6091,12 @@ export default function App() {
                     
                     {searchStatus === 'loading-more' && (
                         <div className="flex justify-center py-4">
-                            <Loader2 className="w-5 h-5 animate-spin text-sky-500" />
+                            <Loader2 className="w-5 h-5 animate-spin text-primary" />
                         </div>
                     )}
                 </div>
 
-                <div className="h-20 shrink-0 overflow-y-auto text-[9px] font-mono text-slate-500 bg-black/20 p-2 rounded border border-white/5 no-scrollbar">
+                <div className="h-20 shrink-0 overflow-y-auto rounded-xl border border-border bg-background/45 p-2 font-mono text-[9px] text-muted-foreground">
                     {searchLog.map((log, i) => (
                         <div key={i}>{log}</div>
                     ))}
@@ -5680,24 +6105,24 @@ export default function App() {
 
             {searchContextMenu && (
               <div 
-                  className={`fixed w-48 rounded-lg shadow-xl border overflow-hidden z-[100000] py-1 ${theme === 'light' ? 'bg-white border-black/10' : 'bg-slate-800 border-white/10'}`}
+                  className="rf-panel fixed z-[100000] w-52 overflow-hidden rounded-xl p-1.5"
                   style={{ top: searchContextMenu.y, left: searchContextMenu.x }}
                   onClick={(e) => e.stopPropagation()}
               >
                   <button 
-                      className="w-full text-left px-4 py-2 hover:bg-sky-500 hover:text-white transition-colors text-xs flex items-center gap-2"
-                      onClick={() => { fetchAndAddImage(searchContextMenu.result.url); setSearchContextMenu(null); }}
+                      className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-xs text-secondary transition-colors hover:bg-primary hover:text-white"
+                      onClick={() => { fetchAndAddImage(searchContextMenu.result.url, searchContextMenu.result.title); setSearchContextMenu(null); }}
                   >
                       <Plus className="w-3 h-3" /> Add Reference
                   </button>
                   <button 
-                      className="w-full text-left px-4 py-2 hover:bg-sky-500 hover:text-white transition-colors text-xs flex items-center gap-2"
+                      className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-xs text-secondary transition-colors hover:bg-primary hover:text-white"
                       onClick={() => { void openInWindowsDefaultBrowser(searchContextMenu.result.url); setSearchContextMenu(null); }}
                   >
                       <LinkIcon className="w-3 h-3" /> Open Original Page
                   </button>
                   <button 
-                      className="w-full text-left px-4 py-2 hover:bg-sky-500 hover:text-white transition-colors text-xs flex items-center gap-2"
+                      className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-xs text-secondary transition-colors hover:bg-primary hover:text-white"
                       onClick={() => {
                           const a = document.createElement('a');
                           a.href = searchContextMenu.result.url;
@@ -5710,7 +6135,7 @@ export default function App() {
                       <Download className="w-3 h-3" /> Download Original
                   </button>
                   <button 
-                      className="w-full text-left px-4 py-2 hover:bg-sky-500 hover:text-white transition-colors text-xs flex items-center gap-2"
+                      className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-xs text-secondary transition-colors hover:bg-primary hover:text-white"
                       onClick={() => { navigator.clipboard.writeText(searchContextMenu.result.url); setSearchContextMenu(null); }}
                   >
                       <FileText className="w-3 h-3" /> Copy Image URL
@@ -5731,7 +6156,7 @@ export default function App() {
                   initial={{ opacity: 0, scale: 0.95 }}
                   animate={{ opacity: 1, scale: 1 }}
                   exit={{ opacity: 0, scale: 0.95 }}
-                  className={`fixed w-56 rounded-lg shadow-xl border overflow-hidden z-[100000] py-1 pointer-events-auto ${theme === 'light' ? 'bg-white border-black/10 text-slate-800' : 'bg-slate-800 border-white/10 text-slate-200'}`}
+                  className="rf-panel fixed z-[100000] w-56 overflow-hidden rounded-xl p-1.5 pointer-events-auto"
                   style={{ top: floatingContextMenu.y, left: floatingContextMenu.x }}
                   onContextMenu={(e) => e.preventDefault()}
                   onPointerDownCapture={(e) => {
@@ -5882,10 +6307,11 @@ export default function App() {
               y: img.isCollapsed ? 10 : 0
             }}
             exit={{ opacity: 0, scale: 0.95, y: 10 }}
-            transition={(reduceLargeBoardEffects || draggingFloatingId === img.id || resizingFloatingId === img.id) ? { type: "tween", duration: 0 } : { type: "spring", damping: 25, stiffness: 300, mass: 0.5 }}
+            transition={(reduceLargeBoardEffects || draggingFloatingId === img.id || resizingFloatingId === img.id) ? { type: "tween", duration: 0 } : { type: "tween", duration: 0.2, ease: [0.22, 1, 0.36, 1] }}
             className={`absolute bg-transparent flex flex-col group pointer-events-auto floating-window`}
             data-id={img.id}
             data-window-kind="image"
+            data-active={topWindowId === img.id ? 'true' : 'false'}
             data-click-through={img.isLocked ? 'true' : 'false'}
             data-collapsed={img.isCollapsed ? 'true' : 'false'}
             onMouseDown={(e) => {
@@ -5916,7 +6342,7 @@ export default function App() {
           >
             {/* Drag Handle Overlay */}
             <div 
-               className={`absolute bottom-full left-0 w-full h-[34px] overflow-hidden min-w-0 ${theme === 'light' ? 'bg-white/95 text-slate-700 shadow-lg' : 'bg-slate-900/90 text-slate-300'} backdrop-blur-sm ${img.isCollapsed ? 'rounded-lg' : 'rounded-t-lg'} transition-all flex items-center justify-start px-1 cursor-move border ${theme === 'light' ? 'border-black/10' : 'border-white/10'} pointer-events-auto gap-1 ${img.isCollapsed ? 'opacity-100' : (img.isLocked ? 'opacity-40 hover:opacity-100' : 'opacity-70 hover:opacity-100 group-hover:opacity-100')} floating-drag-handle`}
+               className={`rf-window-toolbar absolute bottom-full left-0 flex h-[34px] w-full min-w-0 cursor-move items-center justify-start gap-1 overflow-hidden rounded-t-xl px-1.5 pointer-events-auto transition-[opacity,border-color,box-shadow] duration-200 ${img.isCollapsed ? 'opacity-100' : topWindowId === img.id ? 'border-primary/35 opacity-100' : (img.isLocked ? 'opacity-45 hover:opacity-100' : 'opacity-75 hover:opacity-100 group-hover:opacity-100')} floating-drag-handle`}
                onMouseDown={(e) => {
                  if (!img.isLocked) handleFloatingMouseDown(e, img.id);
                }}
@@ -6084,24 +6510,24 @@ export default function App() {
                 borderWidth: img.isCollapsed ? 0 : 1
               }}
               transition={(reduceLargeBoardEffects || resizingFloatingId === img.id) ? { duration: 0 } : { duration: 0.2, ease: "easeInOut" }}
-              className={`relative shadow-2xl rounded-b-lg rounded-t-none border-white/10 overflow-hidden bg-black/40 flex flex-col ${img.isLocked ? 'pointer-events-none' : 'pointer-events-auto'}`}
+              className={`relative flex flex-col overflow-hidden rounded-b-xl rounded-t-none border border-border bg-black/35 shadow-[var(--window-shadow)] transition-[box-shadow,border-color] duration-200 ${topWindowId === img.id ? 'border-primary/45 ring-1 ring-primary/35' : ''} ${img.isLocked ? 'pointer-events-none' : 'pointer-events-auto'}`}
               style={{ width: img.width, opacity: img.isCollapsed ? 0 : img.opacity }}
             >
               <div className="flex flex-col relative w-full h-full">
                   {img.searchStatus && (
-                    <div className="absolute inset-0 bg-black/60 backdrop-blur-sm z-50 flex flex-col items-center justify-center p-4">
-                      <div className="bg-slate-900 border border-white/10 rounded-lg shadow-2xl flex flex-col items-center justify-center p-6 text-center max-w-xs transition-opacity duration-300">
+                    <div className="absolute inset-0 z-50 flex flex-col items-center justify-center bg-black/60 p-4 backdrop-blur-sm">
+                      <div className="rf-panel flex max-w-xs flex-col items-center justify-center rounded-2xl p-6 text-center transition-opacity duration-200">
                         {img.isSearchInProgress ? (
                           <div className="relative">
-                            <Loader2 className="w-6 h-6 text-sky-400 mb-3 animate-spin" />
-                            <div className="absolute inset-0 bg-sky-400 blur-md opacity-20 animate-pulse"></div>
+                            <Loader2 className="mb-3 size-6 animate-spin text-primary" />
+                            <div className="absolute inset-0 animate-pulse bg-primary opacity-20 blur-md"></div>
                           </div>
                         ) : (
                           img.searchStatus.includes('failed') || img.searchStatus.includes('Missing') || img.searchStatus.includes('No better') ? 
                             <X className="w-6 h-6 text-red-400 mb-3" /> : 
                             <Check className="w-6 h-6 text-green-400 mb-3" />
                         )}
-                        <p className="text-sm font-medium text-white/90">{img.searchStatus}</p>
+                        <p className="text-sm font-medium text-foreground">{img.searchStatus}</p>
                       </div>
                     </div>
                   )}
@@ -6182,7 +6608,7 @@ export default function App() {
                       )}
                       {/* Page Controls */}
                       {(img.documentNumPages || 0) > 1 && (
-                        <div className="absolute bottom-4 left-1/2 -translate-x-1/2 bg-slate-900/80 backdrop-blur border border-white/10 rounded-full px-3 py-1 flex items-center space-x-3 shadow-xl z-50 pointer-events-auto">
+                        <div className="rf-panel pointer-events-auto absolute bottom-4 left-1/2 z-50 flex -translate-x-1/2 items-center gap-3 rounded-full px-2 py-1">
                           <button 
                             onClick={(e) => { e.stopPropagation(); setFloatingImages(prev => prev.map(f => f.id === img.id ? {...f, documentPage: Math.max(1, (f.documentPage || 1) - 1), panX: 0, panY: 0} : f)); }}
                             className="p-1 hover:bg-black/10 dark:hover:bg-white/10 rounded-full text-slate-500 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white"
@@ -6366,10 +6792,11 @@ export default function App() {
               y: note.isCollapsed ? 10 : 0
             }}
             exit={{ opacity: 0, scale: 0.95, y: 10 }}
-            transition={(reduceLargeBoardEffects || draggingNoteId === note.id || resizingNoteId === note.id) ? { type: "tween", duration: 0 } : { type: "spring", damping: 25, stiffness: 300, mass: 0.5 }}
-             className={`absolute bg-transparent flex flex-col group drop-shadow-2xl pointer-events-auto floating-window`}
+            transition={(reduceLargeBoardEffects || draggingNoteId === note.id || resizingNoteId === note.id) ? { type: "tween", duration: 0 } : { type: "tween", duration: 0.2, ease: [0.22, 1, 0.36, 1] }}
+             className="absolute flex flex-col bg-transparent group pointer-events-auto floating-window"
              data-id={note.id}
              data-window-kind="note"
+            data-active={topWindowId === note.id ? 'true' : 'false'}
             data-click-through={note.isLocked ? 'true' : 'false'}
             data-collapsed={note.isCollapsed ? 'true' : 'false'}
             onMouseDown={() => setTopWindowId(note.id)}
@@ -6382,7 +6809,7 @@ export default function App() {
           >
             {/* Note Drag Handle Overlay */}
             <div 
-               className={`note-toolbar absolute bottom-full left-0 w-full h-[32px] ${theme === 'light' ? 'bg-white/90' : 'bg-slate-900/90'} backdrop-blur-sm ${note.isCollapsed ? 'rounded-lg' : 'rounded-t-lg'} transition-opacity flex items-center px-1.5 ${!note.isLocked ? 'cursor-move' : 'cursor-default'} ${theme === 'light' ? 'border-black/10' : 'border-white/10'} ${noteControlsVisible ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'} floating-note-drag-handle z-10 gap-1 pointer-events-auto`}
+               className={`note-toolbar rf-window-toolbar absolute bottom-full left-0 z-10 flex h-[32px] w-full items-center gap-1 rounded-t-xl px-1.5 pointer-events-auto transition-opacity duration-200 ${!note.isLocked ? 'cursor-move' : 'cursor-default'} ${noteControlsVisible ? (topWindowId === note.id ? 'border-primary/35 opacity-100' : 'opacity-100') : 'opacity-0 group-hover:opacity-100'} floating-note-drag-handle`}
                onMouseDown={(e) => {
                  setTopWindowId(note.id);
                  if (!note.isLocked) handleNoteMouseDown(e, note.id);
@@ -6499,7 +6926,7 @@ export default function App() {
                 borderWidth: note.isCollapsed ? 0 : 1
               }}
               transition={resizingNoteId === note.id ? { duration: 0 } : { duration: 0.2, ease: "easeInOut" }}
-              className={`relative rounded-b-md rounded-t-none overflow-hidden shadow-xl border-black/10 flex flex-col ${note.isLocked ? 'pointer-events-none' : 'pointer-events-auto'}`}
+              className={`relative flex flex-col overflow-hidden rounded-b-xl rounded-t-none border border-black/10 shadow-[var(--window-shadow)] transition-[box-shadow,border-color] duration-200 ${topWindowId === note.id ? 'ring-1 ring-primary/45' : ''} ${note.isLocked ? 'pointer-events-none' : 'pointer-events-auto'}`}
               style={{ backgroundColor: note.color }}
             >
               <div className="w-full h-full relative" onMouseDown={(e) => { if (note.isLocked) e.stopPropagation(); }}>
@@ -6559,12 +6986,15 @@ export default function App() {
       </AnimatePresence>
 
       {needsPermission && (
-        <div className="absolute bottom-6 right-6 z-50 bg-red-500/90 text-white px-4 py-3 rounded-xl shadow-2xl flex items-center space-x-3 pointer-events-auto backdrop-blur-sm border border-red-400">
+        <div className="rf-panel absolute bottom-6 right-6 z-50 flex items-center gap-3 rounded-2xl border-danger/35 px-4 py-3 pointer-events-auto">
            <div className="flex-1">
-             <p className="font-bold text-sm">Auto-Save Paused</p>
-             <p className="text-xs text-red-100">Permission needed to write to folder.</p>
+             <p className="text-sm font-semibold text-danger">Auto-save paused</p>
+             <p className="mt-1 text-xs text-muted-foreground">Permission is needed to write to the board folder.</p>
            </div>
-           <button
+           <Button
+             type="button"
+             variant="danger"
+             size="sm"
              onClick={async () => {
                const p = projects.find(proj => proj.id === activeProjectId);
                if (p && p.directoryHandle) {
@@ -6579,10 +7009,9 @@ export default function App() {
                  }
                }
              }}
-             className="bg-white text-red-600 px-3 py-1.5 rounded-lg text-sm font-semibold hover:bg-red-50 transition-colors"
            >
              Resume
-           </button>
+           </Button>
         </div>
       )}
 
@@ -6593,7 +7022,7 @@ export default function App() {
             animate={{ opacity: 1, y: 0, scale: 1 }}
             exit={{ opacity: 0, y: 8, scale: 0.96 }}
             data-native-interactive="true"
-            className="absolute bottom-6 left-1/2 -translate-x-1/2 z-[100001] max-w-sm rounded-xl border border-amber-300/40 bg-slate-950/95 px-4 py-3 text-sm text-white shadow-2xl pointer-events-auto"
+            className="rf-panel absolute bottom-6 left-1/2 z-[100001] max-w-sm -translate-x-1/2 rounded-2xl border-warning/40 px-4 py-3 text-sm text-foreground pointer-events-auto"
           >
             {dragError}
           </motion.div>
@@ -6603,11 +7032,11 @@ export default function App() {
       <AnimatePresence>
       {showManager && (
         <motion.div 
-            initial={{ opacity: 0, scale: 0.95 }}
+            initial={{ opacity: 0, scale: 0.985 }}
             animate={{ opacity: 1, scale: 1 }}
-            exit={{ opacity: 0, scale: 0.95 }}
-            transition={{ duration: 0.2 }}
-            className={`light-contrast-panel absolute z-[999] pointer-events-auto flex flex-col items-center justify-start p-10 overflow-y-auto backdrop-blur-md ${managerBounds ? '' : 'inset-0'} ${theme === 'light' ? 'bg-slate-100/95' : 'bg-slate-900/95'}`}
+            exit={{ opacity: 0, scale: 0.985 }}
+            transition={{ duration: 0.2, ease: [0.22, 1, 0.36, 1] }}
+            className={`light-contrast-panel absolute z-[999] pointer-events-auto flex overflow-hidden bg-background/96 p-3 backdrop-blur-xl ${managerBounds ? '' : 'inset-0'}`}
             style={managerBounds ? {
               left: managerBounds.x,
               top: managerBounds.y,
@@ -6615,19 +7044,174 @@ export default function App() {
               height: managerBounds.height
             } : undefined}
         >
-          <div className="w-full max-w-5xl flex justify-between items-center mb-10 shrink-0">
-            <h1 className="text-3xl text-slate-900 dark:text-white font-bold tracking-tight">Project Boards</h1>
-            <button onClick={() => setShowManager(false)} className="text-slate-900 dark:text-white bg-black/5 dark:bg-white/10 hover:bg-black/10 dark:hover:bg-white/20 p-2 rounded-full transition-colors flex items-center space-x-2 px-4 font-medium backdrop-blur-md border border-black/10 dark:border-white/10">
-               <span>Close Manager</span> <X className="w-5 h-5"/>
-            </button>
+          <aside data-manager-sidebar className={`rf-panel mr-3 flex h-full shrink-0 flex-col overflow-hidden rounded-3xl transition-[width] duration-200 ${isManagerSidebarCollapsed ? 'w-[72px]' : 'w-64'}`}>
+            <div className={`flex h-[72px] shrink-0 items-center border-b border-border ${isManagerSidebarCollapsed ? 'justify-center px-2' : 'gap-3 px-4'}`}>
+              {isManagerSidebarCollapsed ? (
+                <ToolbarButton
+                  label="Expand sidebar"
+                  tooltipSide="right"
+                  onClick={() => setIsManagerSidebarCollapsed(false)}
+                  className="size-10 border-primary/25 bg-primary/12 text-primary hover:border-primary/40 hover:bg-primary/18 hover:text-primary"
+                  data-manager-sidebar-expand
+                >
+                  <PanelLeftOpen className="size-4" />
+                </ToolbarButton>
+              ) : (
+                <>
+                  <div className="flex size-9 shrink-0 items-center justify-center rounded-xl border border-primary/20 bg-primary/12 text-primary">
+                    <Sparkles className="size-4" />
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <div className="truncate text-sm font-semibold tracking-[-0.015em] text-foreground">RefFlow Studio</div>
+                    <div className="mt-1 text-[10px] text-muted-foreground">Visual workspace</div>
+                  </div>
+                  <ToolbarButton
+                    label="Collapse sidebar"
+                    tooltipSide="right"
+                    onClick={() => setIsManagerSidebarCollapsed(true)}
+                  >
+                    <PanelLeftClose className="size-4" />
+                  </ToolbarButton>
+                </>
+              )}
+            </div>
+
+            <nav className="min-h-0 flex-1 overflow-y-auto px-2.5 py-4">
+              {!isManagerSidebarCollapsed && <div className="rf-kicker mb-2 px-2">Workspace</div>}
+              <button
+                type="button"
+                onClick={() => setManagingProjectId(null)}
+                className={`flex h-10 w-full items-center gap-3 rounded-xl px-3 text-left text-xs font-medium transition-colors ${!managingProjectId ? 'bg-primary/14 text-primary' : 'text-muted-foreground hover:bg-surface-elevated hover:text-foreground'} ${isManagerSidebarCollapsed ? 'justify-center px-0' : ''}`}
+                title="All Boards"
+              >
+                <LayoutGrid className="size-4 shrink-0" />
+                {!isManagerSidebarCollapsed && <span className="truncate">All Boards</span>}
+              </button>
+
+              {!isManagerSidebarCollapsed && <div className="rf-kicker mb-2 mt-6 px-2">Boards</div>}
+              <div className={`${isManagerSidebarCollapsed ? 'mt-3' : ''} space-y-1`}>
+                {projects.map(project => {
+                  const projectLabel = project.name || 'Untitled Board';
+                  const isEditingSidebarName = editingProjectId === project.id && editingProjectSurface === 'sidebar' && !isManagerSidebarCollapsed;
+                  return (
+                    <div
+                      key={project.id}
+                      className={`group/sidebar flex min-h-10 w-full items-center rounded-xl text-xs transition-colors ${project.id === activeProjectId ? 'bg-surface-elevated text-foreground' : 'text-muted-foreground hover:bg-surface-elevated/70 hover:text-foreground'} ${isManagerSidebarCollapsed ? 'justify-center' : 'gap-1 px-1.5'}`}
+                      data-sidebar-board-row={project.id}
+                    >
+                      {isEditingSidebarName ? (
+                        <>
+                          <div className="flex size-7 shrink-0 items-center justify-center rounded-lg border border-primary/30 bg-primary/12 text-primary">
+                            <FolderOpen className="size-3.5" />
+                          </div>
+                          <input
+                            autoFocus
+                            type="text"
+                            value={editingProjectName}
+                            onChange={(event) => setEditingProjectName(event.target.value)}
+                            onBlur={() => { void commitProjectRename(project); }}
+                            onKeyDown={(event) => {
+                              event.stopPropagation();
+                              if (event.key === 'Enter') event.currentTarget.blur();
+                              if (event.key === 'Escape') {
+                                setEditingProjectId(null);
+                                setEditingProjectSurface(null);
+                                setEditingProjectName('');
+                              }
+                            }}
+                            className="h-7 min-w-0 flex-1 rounded-lg border border-primary/60 bg-background px-2 text-[10px] font-medium text-foreground outline-none focus:ring-2 focus:ring-primary/30"
+                            aria-label={`Rename ${projectLabel} from sidebar`}
+                            data-sidebar-board-name-input
+                          />
+                          <ToolbarButton
+                            label="Save board name"
+                            tooltipSide="right"
+                            onMouseDown={(event) => event.preventDefault()}
+                            onClick={() => { void commitProjectRename(project); }}
+                            className="size-7 text-primary hover:text-primary"
+                          >
+                            <Check className="size-3.5" />
+                          </ToolbarButton>
+                        </>
+                      ) : (
+                        <>
+                          <button
+                            type="button"
+                            onClick={async () => {
+                              if (project.id !== activeProjectId) await selectProjectOfId(project.id);
+                            }}
+                            onDoubleClick={() => setManagingProjectId(project.id)}
+                            className={`flex h-10 min-w-0 items-center gap-3 rounded-xl text-left ${isManagerSidebarCollapsed ? 'w-10 justify-center' : 'flex-1 px-1.5'}`}
+                            title={projectLabel}
+                            data-sidebar-board-name
+                          >
+                            <div className={`flex size-7 shrink-0 items-center justify-center rounded-lg border ${project.id === activeProjectId ? 'border-primary/30 bg-primary/12 text-primary' : 'border-border bg-card text-muted-foreground'}`}>
+                              <FolderOpen className="size-3.5" />
+                            </div>
+                            {!isManagerSidebarCollapsed && (
+                              <>
+                                <span className="min-w-0 flex-1 truncate font-medium">{projectLabel}</span>
+                                {project.id === activeProjectId && <span className="size-1.5 shrink-0 rounded-full bg-primary shadow-[0_0_8px_rgba(94,107,255,0.8)]" />}
+                              </>
+                            )}
+                          </button>
+                          {!isManagerSidebarCollapsed && (
+                            <ToolbarButton
+                              label={`Rename ${projectLabel} from sidebar`}
+                              tooltipSide="right"
+                              onClick={() => beginProjectRename(project, 'sidebar')}
+                              className="size-7 opacity-55 transition-opacity hover:text-primary group-hover/sidebar:opacity-100 focus-visible:opacity-100"
+                              data-sidebar-board-rename
+                            >
+                              <Edit2 className="size-3.5" />
+                            </ToolbarButton>
+                          )}
+                        </>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </nav>
+
+            <div className="shrink-0 border-t border-border p-3">
+              <Button
+                type="button"
+                variant="primary"
+                size={isManagerSidebarCollapsed ? 'icon' : 'md'}
+                onClick={() => { void createNewProjectBoard(); }}
+                className={isManagerSidebarCollapsed ? 'w-full' : 'w-full'}
+                title="New Board"
+              >
+                <Plus className="size-4" />
+                {!isManagerSidebarCollapsed && <span>New Board</span>}
+              </Button>
+            </div>
+          </aside>
+
+          <main data-manager-main className="rf-panel flex min-w-0 flex-1 flex-col overflow-hidden rounded-3xl">
+          <div className="flex shrink-0 items-center justify-between border-b border-border px-8 py-5">
+            <div className="min-w-0">
+              <div className="rf-kicker mb-1">Workspace / Boards</div>
+              <h1 className="truncate text-2xl font-semibold tracking-[-0.025em] text-foreground">
+                {managingProjectId ? (projects.find(project => project.id === managingProjectId)?.name || 'Board contents') : 'Project Boards'}
+              </h1>
+              <p className="mt-1 text-xs text-muted-foreground">
+                {managingProjectId ? 'Review and organize this board’s saved content.' : `${projects.length} ${projects.length === 1 ? 'board' : 'boards'} in your local workspace`}
+              </p>
+            </div>
+            <Button onClick={() => setShowManager(false)} variant="outline" size="sm" title="Close Manager">
+               <span>Close</span> <X className="size-4"/>
+            </Button>
           </div>
+          <div className="min-h-0 flex-1 overflow-y-auto px-8 py-7">
           
           {!managingProjectId ? (
-            <div className="w-full max-w-5xl grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6 pb-20">
+            <div className="mx-auto grid w-full max-w-6xl grid-cols-1 gap-5 pb-12 md:grid-cols-2 xl:grid-cols-3">
               {projects.map(p => (
                 <div 
                   key={p.id} 
-                  className={`flex flex-col bg-white/50 dark:bg-slate-800/50 p-5 rounded-2xl border transition-all ${p.id === activeProjectId ? 'border-sky-500 shadow-[0_0_20px_rgba(14,165,233,0.3)]' : 'border-black/10 hover:border-black/20 dark:border-white/10 dark:hover:border-white/20 cursor-pointer'}`}
+                  className={`rf-card group flex min-h-[220px] cursor-pointer flex-col p-5 ${p.id === activeProjectId ? 'border-primary/60 ring-1 ring-primary/25 shadow-[0_18px_44px_rgba(94,107,255,0.14)]' : ''}`}
                   onClick={async () => {
                     if (p.id !== activeProjectId) {
                        await selectProjectOfId(p.id);
@@ -6635,59 +7219,62 @@ export default function App() {
                   }}
                 >
                    <div className="flex justify-between items-start mb-4">
-                     {editingProjectId === p.id ? (
+                     {editingProjectId === p.id && editingProjectSurface === 'card' ? (
                        <div className="flex items-center flex-1 pr-2">
                          <input 
                            autoFocus
                            type="text" 
                            value={editingProjectName}
                            onChange={(e) => setEditingProjectName(e.target.value)}
-                           onKeyDown={async (e) => {
+                           aria-label={`Rename ${p.name || 'Untitled Board'}`}
+                           onBlur={() => { void commitProjectRename(p); }}
+                           onKeyDown={(e) => {
                              e.stopPropagation();
                              if (e.key === 'Enter') {
-                               const nextName = editingProjectName.trim() || 'Untitled Board';
-                               await updateProject(p.id, { name: nextName });
-                               if (p.directoryPath) {
-                                 await syncBoardToPath({ ...p, name: nextName }, p.directoryPath);
-                               }
-                               setProjects(await getProjects());
-                               setEditingProjectId(null);
+                               e.currentTarget.blur();
                              } else if (e.key === 'Escape') {
                                setEditingProjectId(null);
+                               setEditingProjectSurface(null);
+                               setEditingProjectName('');
                              }
                            }}
                            onMouseDown={(e) => e.stopPropagation()}
                            onClick={(e) => e.stopPropagation()}
-                           className="w-full bg-white dark:bg-slate-900 border border-sky-500 rounded px-2 py-1 text-slate-900 dark:text-white text-sm outline-none"
+                           className="h-9 w-full rounded-xl border border-primary bg-background px-3 text-sm text-foreground outline-none"
                          />
-                         <button 
-                           onClick={async (e) => {
+                         <button
+                           onMouseDown={(e) => e.preventDefault()}
+                           onClick={(e) => {
                              e.stopPropagation();
-                             const nextName = editingProjectName.trim() || 'Untitled Board';
-                             await updateProject(p.id, { name: nextName });
-                             if (p.directoryPath) {
-                               await syncBoardToPath({ ...p, name: nextName }, p.directoryPath);
-                             }
-                             setProjects(await getProjects());
-                             setEditingProjectId(null);
+                             void commitProjectRename(p);
                            }}
-                           className="ml-2 p-1.5 text-sky-400 hover:text-sky-300 hover:bg-sky-400/10 rounded-md transition-colors shrink-0"
+                           className="rf-icon-button ml-2 text-primary"
+                           title="Save board name"
                          >
                            <Check className="w-4 h-4"/>
                          </button>
                        </div>
                      ) : (
-                       <h2 className="text-xl text-slate-900 dark:text-white font-semibold flex-1 truncate pr-2 group-hover:text-sky-600 dark:group-hover:text-sky-100 transition-colors">{p.name || 'Untitled Board'}</h2>
+                       <button
+                         type="button"
+                         className="min-w-0 flex-1 truncate rounded-lg pr-2 text-left text-lg font-semibold tracking-[-0.02em] text-foreground transition-colors hover:text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/45"
+                         onClick={(event) => {
+                           event.stopPropagation();
+                           beginProjectRename(p);
+                         }}
+                         title="Click to rename board"
+                       >
+                         {p.name || 'Untitled Board'}
+                       </button>
                      )}
                      <div className="flex space-x-1 shrink-0">
                        {editingProjectId !== p.id && (
                          <button 
                            onClick={(e) => {
                              e.stopPropagation();
-                             setEditingProjectId(p.id);
-                             setEditingProjectName(p.name);
+                             beginProjectRename(p);
                            }}
-                           className="p-1.5 text-slate-400 hover:text-sky-400 hover:bg-sky-400/10 rounded-md transition-colors"
+                           className="rf-icon-button"
                            title="Rename Board"
                          >
                            <Edit2 className="w-4 h-4"/>
@@ -6700,7 +7287,7 @@ export default function App() {
                              await deleteProject(p.id); 
                              setProjects(await getProjects()); 
                            }} 
-                           className="p-1.5 text-slate-400 hover:text-red-400 hover:bg-red-400/10 rounded-md transition-colors"
+                           className="rf-icon-button hover:border-danger/20 hover:bg-danger/10 hover:text-danger"
                            title="Delete Board"
                          >
                            <Trash2 className="w-4 h-4"/>
@@ -6708,73 +7295,66 @@ export default function App() {
                        )}
                      </div>
                    </div>
-                   <div className="text-sm text-slate-400 mb-2 font-medium">
-                     {p.floatingImages?.length || 0} Images / {p.floatingNotes?.length || 0} Notes / {p.floatingSketches?.length || 0} Sketches
+                   <div className="mt-2 grid grid-cols-3 gap-2">
+                     {[
+                       { label: 'Media', value: p.floatingImages?.length || 0 },
+                       { label: 'Notes', value: p.floatingNotes?.length || 0 },
+                       { label: 'Sketches', value: p.floatingSketches?.length || 0 },
+                     ].map(stat => (
+                       <div key={stat.label} className="rounded-xl border border-border bg-surface-elevated/55 px-3 py-2.5">
+                         <div className="text-base font-semibold text-foreground">{stat.value}</div>
+                         <div className="mt-0.5 text-[9px] font-medium uppercase tracking-[0.08em] text-muted-foreground">{stat.label}</div>
+                       </div>
+                     ))}
                    </div>
-                   <div className="text-xs text-slate-500">
-                     Updated {new Date(p.updatedAt).toLocaleDateString()}
-                   </div>
+                   <div className="mt-3 text-xs text-muted-foreground">Updated {new Date(p.updatedAt).toLocaleDateString()}</div>
                    
-                   <div className="mt-4 flex items-center justify-between">
+                   <div className="mt-auto flex items-center justify-between pt-5">
                      {p.id === activeProjectId ? (
-                        <div className="text-[10px] font-bold text-sky-400 uppercase tracking-widest bg-sky-400/10 px-3 py-1 rounded-full border border-sky-400/20">
+                        <div className="rounded-full border border-primary/25 bg-primary/12 px-2.5 py-1 text-[9px] font-semibold uppercase tracking-[0.1em] text-primary">
                           Active
                         </div>
                      ) : <div />}
-                     <div className="flex space-x-2">
-                       <button
+                     <div className="flex gap-2">
+                       <Button
+                         type="button"
+                         variant="ghost"
+                         size="sm"
                          onClick={(e) => {
                            e.stopPropagation();
                            exportBoard(p);
                          }}
-                         className="p-2 bg-black/5 dark:bg-slate-700/50 hover:bg-black/10 dark:hover:bg-slate-700 text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white rounded text-xs font-semibold uppercase tracking-wider transition-colors flex items-center space-x-1"
                          title="Export to Folder"
                        >
-                         <Download className="w-3.5 h-3.5"/><span>Export</span>
-                       </button>
-                       <button
+                         <Download className="size-3.5"/><span>Export</span>
+                       </Button>
+                       <Button
+                         type="button"
+                         variant="secondary"
+                         size="sm"
                          onClick={(e) => {
                            e.stopPropagation();
                            setManagingProjectId(p.id);
                          }}
-                         className="p-2 bg-black/5 dark:bg-slate-700/50 hover:bg-black/10 dark:hover:bg-slate-700 text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white rounded text-xs font-semibold uppercase tracking-wider transition-colors"
                        >
                          Edit Content
-                       </button>
+                       </Button>
                      </div>
                    </div>
                 </div>
               ))}
               <div 
-                onClick={async () => {
-                  const p = await createProject(`Board ${projects.length + 1}`);
-                  let createdProject = p;
-                  const autosaveRoot = defaultAutosaveRoot || await getInstalledAutosaveRoot();
-                  if (autosaveRoot) {
-                    setDefaultAutosaveRoot(autosaveRoot);
-                    const nodeRequire = getNodeRequire();
-                    const path = nodeRequire ? nodeRequire('path') : null;
-                    const dirPath = path ? path.join(autosaveRoot, getProjectFolderName(p)) : "";
-                    if (dirPath) {
-                      createdProject = { ...p, directoryPath: dirPath };
-                      await updateProject(p.id, { directoryPath: dirPath });
-                      await syncBoardToPath(createdProject, dirPath);
-                    }
-                  }
-                  const all = await getProjects();
-                  setProjects(all);
-                  setActiveProjectIdState(p.id);
-                  await setActiveProjectId(p.id);
-                  setImages([]);
-                  setFloatingImages([]);
-                  setFloatingNotes([]);
-                  setFloatingSketches([]);
-                }}
-                className="flex items-center justify-center bg-black/5 dark:bg-white/5 hover:bg-black/10 dark:hover:bg-white/10 p-5 rounded-2xl border border-dashed border-black/20 dark:border-white/20 hover:border-black/40 dark:hover:border-white/40 cursor-pointer transition-all min-h-[160px] group"
+                onClick={() => { void createNewProjectBoard(); }}
+                className="group flex min-h-[220px] cursor-pointer items-center justify-center rounded-2xl border border-dashed border-border bg-surface-elevated/25 p-5 transition-all duration-200 hover:-translate-y-0.5 hover:border-primary/45 hover:bg-primary/5"
               >
-                <div className="flex flex-col items-center space-y-2 text-slate-500 dark:text-slate-400 group-hover:text-slate-900 dark:group-hover:text-white transition-colors">
-                  <Plus className="w-8 h-8 group-hover:scale-110 transition-transform" />
-                  <span className="font-medium tracking-tight">New Board</span>
+                <div className="flex flex-col items-center gap-3 text-muted-foreground transition-colors group-hover:text-primary">
+                  <div className="flex size-11 items-center justify-center rounded-2xl border border-border bg-card shadow-sm transition-transform duration-200 group-hover:scale-105 group-hover:border-primary/30">
+                    <Plus className="size-5" />
+                  </div>
+                  <div className="text-center">
+                    <div className="text-sm font-semibold tracking-tight text-foreground">New Board</div>
+                    <div className="mt-1 text-[10px] text-muted-foreground">Create a fresh visual workspace</div>
+                  </div>
                 </div>
               </div>
             </div>
@@ -6786,16 +7366,19 @@ export default function App() {
                 return null;
               }
               return (
-                <div className={`w-full max-w-5xl flex flex-col space-y-6 p-6 rounded-2xl border pb-20 ${theme === 'light' ? 'bg-white/80 border-black/10' : 'bg-slate-800/40 border-white/10'}`}>
+                <div className="rf-card mx-auto flex w-full max-w-6xl flex-col space-y-7 p-6 pb-12">
                   <div className="flex items-center justify-between">
                      <div className="flex items-center space-x-4">
-                       <button onClick={() => setManagingProjectId(null)} className="p-2 hover:bg-black/10 dark:hover:bg-white/10 rounded-full transition-colors text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white">
-                          <ChevronLeft className="w-6 h-6"/>
-                       </button>
-                       <h2 className="text-2xl font-semibold text-slate-900 dark:text-white">{p.name}</h2>
+                       <ToolbarButton label="Back to all boards" tooltipSide="bottom" onClick={() => setManagingProjectId(null)}>
+                          <ChevronLeft className="size-4"/>
+                       </ToolbarButton>
+                       <div>
+                         <h2 className="text-lg font-semibold tracking-[-0.02em] text-foreground">Board contents</h2>
+                         <p className="mt-1 text-xs text-muted-foreground">Manage the references saved in {p.name}.</p>
+                       </div>
                      </div>
                      <div className="flex space-x-3">
-                       <label className="flex items-center space-x-2 bg-sky-500/20 hover:bg-sky-500/30 text-sky-400 px-3 py-1.5 rounded cursor-pointer transition-colors">
+                       <label className="flex h-9 cursor-pointer items-center gap-2 rounded-xl border border-primary/70 bg-primary px-3 text-xs font-medium text-white shadow-[0_8px_24px_rgba(94,107,255,0.2)] transition-all hover:-translate-y-px hover:bg-primary/90">
                           <Plus className="w-4 h-4"/><span className="text-sm font-medium pr-1">Add Media</span>
                          <input 
                             type="file" 
@@ -6824,10 +7407,14 @@ export default function App() {
                             }} 
                          />
                        </label>
-                       <button 
+                       <Button
+                         type="button"
+                         variant="secondary"
+                         size="sm"
                          onClick={async () => {
                             const newNote: FloatingNote = {
                               id: Math.random().toString(36).substr(2, 9),
+                              name: `Note ${(p.floatingNotes?.length || 0) + 1}`,
                               text: 'New Note',
                               x: 100 + Math.random() * 50, 
                               y: 100 + Math.random() * 50, 
@@ -6842,65 +7429,236 @@ export default function App() {
                             setProjects(await getProjects());
                             if (p.id === activeProjectId) setFloatingNotes(updatedNotes);
                          }}
-                         className="flex items-center space-x-2 bg-yellow-500/20 hover:bg-yellow-500/30 text-yellow-500 px-3 py-1.5 rounded font-medium transition-colors"
                        >
                          <Plus className="w-4 h-4"/><span className="text-sm">Add Note</span>
-                       </button>
+                       </Button>
                      </div>
                   </div>
                   
                   <div>
-                    <h3 className="text-sm text-slate-400 uppercase tracking-widest font-bold mb-4 border-b border-white/10 pb-2">Images ({p.floatingImages?.length || 0})</h3>
+                    <h3 className="rf-kicker mb-4 border-b border-border pb-3">Media ({p.floatingImages?.length || 0})</h3>
                     {p.floatingImages?.length === 0 ? (
-                      <p className="text-slate-500 text-sm">No images in this board yet.</p>
+                      <p className="rounded-2xl border border-dashed border-border bg-surface-elevated/30 p-6 text-center text-sm text-muted-foreground">No media in this board yet.</p>
                     ) : (
-                      <div className="grid grid-cols-2 flex-wrap sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-4">
-                         {p.floatingImages?.map(img => (
-                           <div key={img.id} className="relative group aspect-square bg-slate-900 rounded-lg overflow-hidden border border-white/10">
-                              <img src={img.url} className="w-full h-full object-cover opacity-80 group-hover:opacity-100 transition-opacity" />
-                              <button 
-                                onClick={async (e) => {
-                                  e.stopPropagation();
-                                  const newImages = p.floatingImages.filter(f => f.id !== img.id);
-                                  await updateProject(p.id, { floatingImages: newImages });
-                                  setProjects(await getProjects());
-                                  if(p.id === activeProjectId) setFloatingImages(newImages);
-                                }}
-                                className="absolute top-2 right-2 bg-red-500/80 hover:bg-red-500 text-white p-1 rounded opacity-0 group-hover:opacity-100 transition-opacity"
-                                title="Remove Image"
-                              >
-                                <Trash2 className="w-4 h-4" />
-                              </button>
-                           </div>
-                         ))}
+                      <div className="grid grid-cols-2 flex-wrap gap-4 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5">
+                         {p.floatingImages?.map((img, mediaIndex) => {
+                           const mediaLabel = getMediaDisplayName(img, mediaIndex);
+                           return (
+                             <div key={img.id} className="rf-card rf-preview-card relative group aspect-square overflow-hidden" data-board-media-preview={img.id}>
+                                {img.type === 'pdf' ? (
+                                  <PillPdfPreview media={img} />
+                                ) : isOfficeDocument(img.type) ? (
+                                  <PillOfficePreview media={img} />
+                                ) : (
+                                  <img src={img.url} className="h-full w-full object-cover opacity-90 transition-opacity group-hover:opacity-100" alt={`${mediaLabel} preview`} />
+                                )}
+                                <div className="pill-preview-caption" onMouseDown={(event) => event.stopPropagation()}>
+                                  {editingMediaId === img.id && editingMediaProjectId === p.id ? (
+                                    <input
+                                      autoFocus
+                                      value={editingMediaName}
+                                      onChange={(event) => setEditingMediaName(event.target.value)}
+                                      onBlur={() => { void commitMediaRename(img, p); }}
+                                      onKeyDown={(event) => {
+                                        event.stopPropagation();
+                                        if (event.key === 'Enter') event.currentTarget.blur();
+                                        if (event.key === 'Escape') cancelMediaRename();
+                                      }}
+                                      className="h-6 w-full rounded-md border border-white/20 bg-black/25 px-2 text-center text-[9px] font-medium text-white outline-none focus:border-primary"
+                                      aria-label={`Rename ${mediaLabel}`}
+                                      data-board-media-name-input
+                                    />
+                                  ) : (
+                                    <button
+                                      type="button"
+                                      className="block w-full truncate rounded text-[9px] font-medium text-white/95 outline-none transition-colors hover:text-primary focus-visible:text-primary"
+                                      onClick={(event) => {
+                                        event.stopPropagation();
+                                        beginMediaRename(img, p.id);
+                                      }}
+                                      title="Click to rename reference"
+                                      data-board-media-name
+                                    >
+                                      {mediaLabel}
+                                    </button>
+                                  )}
+                                </div>
+                                <button
+                                  onClick={async (e) => {
+                                    e.stopPropagation();
+                                    const newImages = p.floatingImages.filter(f => f.id !== img.id);
+                                    await updateProject(p.id, { floatingImages: newImages });
+                                    setProjects(await getProjects());
+                                    if(p.id === activeProjectId) setFloatingImages(newImages);
+                                  }}
+                                  className="absolute right-2 top-2 z-30 rounded-lg border border-white/10 bg-black/45 p-1.5 text-white opacity-0 backdrop-blur-md transition-all hover:bg-danger group-hover:opacity-100"
+                                  title="Remove reference"
+                                >
+                                  <Trash2 className="w-4 h-4" />
+                                </button>
+                             </div>
+                           );
+                         })}
                       </div>
                     )}
                   </div>
 
                   <div>
-                    <h3 className="text-sm text-slate-400 uppercase tracking-widest font-bold mb-4 mt-6 border-b border-white/10 pb-2">Notes ({p.floatingNotes?.length || 0})</h3>
+                    <h3 className="rf-kicker mb-4 mt-6 border-b border-border pb-3">Notes ({p.floatingNotes?.length || 0})</h3>
                     {p.floatingNotes?.length === 0 ? (
-                      <p className="text-slate-500 text-sm">No notes in this board yet.</p>
+                      <p className="rounded-2xl border border-dashed border-border bg-surface-elevated/30 p-6 text-center text-sm text-muted-foreground">No notes in this board yet.</p>
                     ) : (
                       <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-4">
-                        {p.floatingNotes?.map(note => (
-                          <div key={note.id} className="relative group bg-slate-900 p-4 rounded-lg border border-white/10 h-32 overflow-hidden text-sm text-slate-800" style={{ backgroundColor: note.color }}>
-                             <p className="line-clamp-3 w-full h-full pr-6 whitespace-pre-wrap">{note.text || 'Empty note...'}</p>
-                             <button 
-                                onClick={async (e) => {
-                                  e.stopPropagation();
-                                  const newNotes = p.floatingNotes.filter(f => f.id !== note.id);
-                                  await updateProject(p.id, { floatingNotes: newNotes });
-                                  setProjects(await getProjects());
-                                  if(p.id === activeProjectId) setFloatingNotes(newNotes);
-                                }}
-                                className="absolute top-2 right-2 bg-red-500/80 hover:bg-red-500 text-white p-1 rounded opacity-0 group-hover:opacity-100 transition-opacity"
-                                title="Remove Note"
+                        {p.floatingNotes?.map((note, noteIndex) => {
+                          const noteLabel = getNoteDisplayName(note, noteIndex);
+                          return (
+                            <div
+                              key={note.id}
+                              className="rf-card rf-preview-card relative group h-32 overflow-hidden p-4 pb-10 text-sm text-slate-800"
+                              style={{ backgroundColor: note.color }}
+                              data-board-note-preview={note.id}
+                            >
+                               <p className="line-clamp-3 h-full w-full pr-6 whitespace-pre-wrap">{note.text || 'Empty note...'}</p>
+                               <div className="pill-preview-caption" onMouseDown={(event) => event.stopPropagation()}>
+                                 {editingCanvasItem?.kind === 'note' && editingCanvasItem.id === note.id && editingCanvasItem.projectId === p.id ? (
+                                   <input
+                                     autoFocus
+                                     value={editingCanvasItem.name}
+                                     onChange={(event) => setEditingCanvasItem(current => current ? { ...current, name: event.target.value } : current)}
+                                     onBlur={() => { void commitCanvasItemRename('note', note, p); }}
+                                     onKeyDown={(event) => {
+                                       event.stopPropagation();
+                                       if (event.key === 'Enter') event.currentTarget.blur();
+                                       if (event.key === 'Escape') cancelCanvasItemRename();
+                                     }}
+                                     className="h-6 w-full rounded-md border border-white/20 bg-black/25 px-2 text-center text-[9px] font-medium text-white outline-none focus:border-primary"
+                                     aria-label={`Rename ${noteLabel}`}
+                                     data-board-note-name-input
+                                   />
+                                 ) : (
+                                   <button
+                                     type="button"
+                                     className="block w-full truncate rounded text-[9px] font-medium text-white/95 outline-none transition-colors hover:text-primary focus-visible:text-primary"
+                                     onClick={(event) => {
+                                       event.stopPropagation();
+                                       beginCanvasItemRename('note', note.id, noteLabel, p.id);
+                                     }}
+                                     title="Click to rename note"
+                                     data-board-note-name
+                                   >
+                                     {noteLabel}
+                                   </button>
+                                 )}
+                               </div>
+                               <button
+                                  onClick={async (e) => {
+                                    e.stopPropagation();
+                                    const newNotes = p.floatingNotes.filter(f => f.id !== note.id);
+                                    await updateProject(p.id, { floatingNotes: newNotes });
+                                    setProjects(await getProjects());
+                                    if(p.id === activeProjectId) setFloatingNotes(newNotes);
+                                  }}
+                                  className="absolute right-2 top-2 z-30 rounded-lg border border-white/10 bg-black/60 p-1.5 text-white opacity-0 backdrop-blur transition-all hover:bg-danger group-hover:opacity-100"
+                                  title="Remove Note"
+                                >
+                                  <Trash2 className="w-4 h-4" />
+                                </button>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+
+                  <div>
+                    <h3 className="rf-kicker mb-4 mt-6 border-b border-border pb-3">Sketches ({p.floatingSketches?.length || 0})</h3>
+                    {!p.floatingSketches || p.floatingSketches.length === 0 ? (
+                      <p className="rounded-2xl border border-dashed border-border bg-surface-elevated/30 p-6 text-center text-sm text-muted-foreground">No sketches in this board yet.</p>
+                    ) : (
+                      <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-4">
+                        {p.floatingSketches.map((sketch, sketchIndex) => {
+                          const sketchLabel = getSketchDisplayName(sketch, sketchIndex);
+                          return (
+                            <div
+                              key={sketch.id}
+                              className="rf-card rf-preview-card group relative aspect-square overflow-hidden"
+                              style={{ backgroundColor: sketch.backgroundColor }}
+                              data-board-sketch-preview={sketch.id}
+                            >
+                              <svg
+                                viewBox={`0 0 ${Math.max(1, sketch.width)} ${Math.max(1, sketch.height)}`}
+                                preserveAspectRatio="xMidYMid meet"
+                                className="h-full w-full pb-7"
+                                aria-label={`${sketchLabel} preview`}
                               >
-                                <Trash2 className="w-4 h-4" />
+                                {sketch.lines.map((line, lineIndex) => line.points.length === 1 ? (
+                                  <circle
+                                    key={lineIndex}
+                                    cx={line.points[0].x}
+                                    cy={line.points[0].y}
+                                    r={line.width / 2}
+                                    fill={line.isEraser ? sketch.backgroundColor : line.color}
+                                  />
+                                ) : (
+                                  <path
+                                    key={lineIndex}
+                                    d={getSmoothStrokePath(line.points)}
+                                    fill="none"
+                                    stroke={line.isEraser ? sketch.backgroundColor : line.color}
+                                    strokeWidth={line.width}
+                                    strokeLinecap="round"
+                                    strokeLinejoin="round"
+                                  />
+                                ))}
+                              </svg>
+                              {sketch.lines.length === 0 && <PenTool className="absolute left-1/2 top-1/2 size-5 -translate-x-1/2 -translate-y-1/2 text-primary" />}
+                              <div className="pill-preview-caption" onMouseDown={(event) => event.stopPropagation()}>
+                                {editingCanvasItem?.kind === 'sketch' && editingCanvasItem.id === sketch.id && editingCanvasItem.projectId === p.id ? (
+                                  <input
+                                    autoFocus
+                                    value={editingCanvasItem.name}
+                                    onChange={(event) => setEditingCanvasItem(current => current ? { ...current, name: event.target.value } : current)}
+                                    onBlur={() => { void commitCanvasItemRename('sketch', sketch, p); }}
+                                    onKeyDown={(event) => {
+                                      event.stopPropagation();
+                                      if (event.key === 'Enter') event.currentTarget.blur();
+                                      if (event.key === 'Escape') cancelCanvasItemRename();
+                                    }}
+                                    className="h-6 w-full rounded-md border border-white/20 bg-black/25 px-2 text-center text-[9px] font-medium text-white outline-none focus:border-primary"
+                                    aria-label={`Rename ${sketchLabel}`}
+                                    data-board-sketch-name-input
+                                  />
+                                ) : (
+                                  <button
+                                    type="button"
+                                    className="block w-full truncate rounded text-[9px] font-medium text-white/95 outline-none transition-colors hover:text-primary focus-visible:text-primary"
+                                    onClick={(event) => {
+                                      event.stopPropagation();
+                                      beginCanvasItemRename('sketch', sketch.id, sketchLabel, p.id);
+                                    }}
+                                    title="Click to rename sketch"
+                                    data-board-sketch-name
+                                  >
+                                    {sketchLabel}
+                                  </button>
+                                )}
+                              </div>
+                              <button
+                                onClick={async (event) => {
+                                  event.stopPropagation();
+                                  const updatedSketches = (p.floatingSketches || []).filter(item => item.id !== sketch.id);
+                                  await updateProject(p.id, { floatingSketches: updatedSketches });
+                                  setProjects(await getProjects());
+                                  if (p.id === activeProjectId) setFloatingSketches(updatedSketches);
+                                }}
+                                className="absolute right-2 top-2 z-30 rounded-lg border border-white/10 bg-black/55 p-1.5 text-white opacity-0 backdrop-blur transition-all hover:bg-danger group-hover:opacity-100"
+                                title="Remove Sketch"
+                              >
+                                <Trash2 className="size-4" />
                               </button>
-                          </div>
-                        ))}
+                            </div>
+                          );
+                        })}
                       </div>
                     )}
                   </div>
@@ -6908,10 +7666,13 @@ export default function App() {
               );
             })()
           )}
+          </div>
+          </main>
         </motion.div>
       )}
       </AnimatePresence>
     </div>
+    </TooltipProvider>
   );
 }
 

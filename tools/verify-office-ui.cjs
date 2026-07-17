@@ -111,6 +111,15 @@ async function main() {
     await page.click('button[aria-label="Close start board menu"]');
     await page.waitForFunction(() => !document.querySelector('[data-empty-board-prompt]'));
     assert.ok(await page.$('.floating-pill'), 'Closing the welcome menu should leave the pill available.');
+    assert.strictEqual(await page.$$eval('[data-expanded-pill-brand] svg', elements => elements.length), 0, 'The expanded pill header should not show the stars icon.');
+    const pillMainActionColors = await page.$$eval('[data-pill-main-action]', buttons => buttons.map(button => getComputedStyle(button).color));
+    assert.strictEqual(pillMainActionColors.length, 4, 'The pill should keep its four primary workspace actions.');
+    assert.ok(pillMainActionColors.every(color => color === 'rgb(255, 255, 255)'), `Pill action icons should be white at rest: ${pillMainActionColors.join(', ')}.`);
+    await page.hover('[data-pill-main-action]');
+    await new Promise(resolve => setTimeout(resolve, 240));
+    const hoveredPillActionColor = await page.$eval('[data-pill-main-action]', button => getComputedStyle(button).color);
+    assert.strictEqual(hoveredPillActionColor, 'rgb(94, 107, 255)', 'Pill action icons should use the accent purple on hover.');
+    await page.mouse.move(1500, 950);
     consoleCounts.afterWelcomeDismiss = consoleErrorPromises.length;
 
     const dragWindowTo = async (windowElement, dragElement, targetX, targetY, options = {}) => {
@@ -169,6 +178,37 @@ async function main() {
     })));
     assert.deepStrictEqual(pillDocumentPreviews.map(preview => preview.label).sort(), ['sample.docx', 'sample.pdf', 'sample.xlsx']);
     assert.ok(pillDocumentPreviews.find(preview => preview.type === 'pdf')?.hasCanvas, 'PDF pill items should render a first-page preview.');
+    const pdfPillPreviewLayout = await page.$eval('[data-pill-preview-type="pdf"]', card => {
+      const cardRect = card.getBoundingClientRect();
+      const surface = card.querySelector('[data-pdf-preview-surface]');
+      const canvas = surface?.querySelector('canvas');
+      const canvasRect = canvas?.getBoundingClientRect();
+      return {
+        cardWidth: cardRect.width,
+        cardHeight: cardRect.height,
+        canvasWidth: canvasRect?.width || 0,
+        canvasHeight: canvasRect?.height || 0,
+        objectFit: canvas ? getComputedStyle(canvas).objectFit : ''
+      };
+    });
+    assert.ok(pdfPillPreviewLayout.canvasWidth >= pdfPillPreviewLayout.cardWidth * 0.95, 'PDF thumbnails should fill the tile width instead of rendering as a tiny stamp.');
+    assert.ok(pdfPillPreviewLayout.canvasHeight >= pdfPillPreviewLayout.cardHeight * 0.95, 'PDF thumbnails should fill the tile height instead of leaving a large gray field.');
+    assert.strictEqual(pdfPillPreviewLayout.objectFit, 'cover');
+
+    await page.click('[data-pill-preview-type="docx"] [data-pill-media-name]');
+    await page.waitForSelector('[data-pill-preview-type="docx"] [data-pill-media-name-input]');
+    await page.$eval('[data-pill-preview-type="docx"] [data-pill-media-name-input]', element => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+      setter.call(element, 'Renamed brief.docx');
+      element.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    await page.keyboard.press('Enter');
+    await page.waitForSelector('[data-pill-preview-type="docx"][data-pill-label="Renamed brief.docx"] [data-pill-media-name]');
+    assert.strictEqual(
+      await page.$eval('[data-pill-preview-type="docx"] [data-pill-media-name]', element => element.textContent.trim()),
+      'Renamed brief.docx',
+      'Pill previews should support inline media renaming.'
+    );
     consoleCounts.afterOfficeLoad = consoleErrorPromises.length;
 
     const initialDocxText = await page.$eval('textarea[aria-label="Editable Word document text"]', element => element.value);
@@ -246,7 +286,7 @@ async function main() {
 
     const docxSaveButton = await docxWindowHandle.asElement().$('button[title="Save edited .docx file"]');
     await docxSaveButton.evaluate(button => button.click());
-    const savedDocxPath = path.join(downloadDirectory, 'sample.docx');
+    const savedDocxPath = path.join(downloadDirectory, 'Renamed brief.docx');
     try {
       await waitForFile(savedDocxPath);
     } catch (error) {
@@ -372,9 +412,34 @@ async function main() {
 
     await page.click('button[title="Settings"]');
     await page.waitForSelector('button[title="Manage no-key search sources"]');
+    await page.$eval('input[aria-label="Glass translucency"]', element => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+      setter.call(element, '0.5');
+      element.dispatchEvent(new Event('input', { bubbles: true }));
+      element.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+    await page.waitForFunction(() => getComputedStyle(document.documentElement).getPropertyValue('--glass-panel-strength').trim() === '50%');
+    const glassSettingState = await page.evaluate(() => ({
+      saved: localStorage.getItem('ref-flow-glass-translucency'),
+      panelStrength: getComputedStyle(document.documentElement).getPropertyValue('--glass-panel-strength').trim(),
+      cardStrength: getComputedStyle(document.documentElement).getPropertyValue('--glass-card-strength').trim(),
+      previewBackground: getComputedStyle(document.querySelector('[data-pill-preview-card]')).backgroundColor,
+      previewOpacity: getComputedStyle(document.querySelector('[data-pill-preview-card]')).opacity,
+      hasPillOpacityControl: /Pill opacity/i.test(document.querySelector('.settings-panel')?.textContent || ''),
+      legacyPillOpacity: localStorage.getItem('ref-flow-pill-opacity')
+    }));
+    assert.deepStrictEqual(glassSettingState, {
+      saved: '0.5',
+      panelStrength: '50%',
+      cardStrength: '68%',
+      previewBackground: 'rgb(35, 38, 43)',
+      previewOpacity: '1',
+      hasPillOpacityControl: false,
+      legacyPillOpacity: null
+    });
     const mainSettingsProviderCards = await page.$$eval('.settings-panel [data-provider]', elements => elements.length);
     assert.strictEqual(mainSettingsProviderCards, 0, 'Provider cards should not lengthen the main Settings menu.');
-    await page.click('button[title="Manage no-key search sources"]');
+    await page.$eval('button[title="Manage no-key search sources"]', element => element.click());
     await page.waitForSelector('[data-settings-section="providers"]');
     const providerMenuState = await page.$eval('[data-settings-section="providers"]', element => ({
       providerCards: element.querySelectorAll('[data-provider]').length,
@@ -481,6 +546,15 @@ async function main() {
     await page.waitForFunction(() => document.querySelector('[data-pill-preview-type="note"]')?.textContent?.includes('Weekly layout note'));
     const notePillLabel = await page.$eval('[data-pill-preview-type="note"]', element => element.getAttribute('data-pill-label'));
     assert.strictEqual(notePillLabel, 'Note 1');
+    await page.$eval('[data-pill-preview-type="note"] [data-pill-note-name]', element => element.click());
+    await page.waitForSelector('[data-pill-preview-type="note"] [data-pill-note-name-input]');
+    await page.$eval('[data-pill-preview-type="note"] [data-pill-note-name-input]', element => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+      setter.call(element, 'Layout notes');
+      element.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    await page.keyboard.press('Enter');
+    await page.waitForSelector('[data-pill-preview-type="note"][data-pill-label="Layout notes"] [data-pill-note-name]');
     const previewNoteButton = await noteWindow.$('button[title="Preview Markdown"]');
     await previewNoteButton.click();
     const controlsAfterPreview = await noteWindow.$$eval('[data-note-format]', elements => elements.length);
@@ -564,6 +638,15 @@ async function main() {
     await page.waitForSelector('[data-pill-preview-type="sketch"] svg path');
     const sketchPillLabel = await page.$eval('[data-pill-preview-type="sketch"]', element => element.getAttribute('data-pill-label'));
     assert.strictEqual(sketchPillLabel, 'Sketch 1');
+    await page.$eval('[data-pill-preview-type="sketch"] [data-pill-sketch-name]', element => element.click());
+    await page.waitForSelector('[data-pill-preview-type="sketch"] [data-pill-sketch-name-input]');
+    await page.$eval('[data-pill-preview-type="sketch"] [data-pill-sketch-name-input]', element => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+      setter.call(element, 'Concept sketch');
+      element.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    await page.keyboard.press('Enter');
+    await page.waitForSelector('[data-pill-preview-type="sketch"][data-pill-label="Concept sketch"] [data-pill-sketch-name]');
 
     const sketchDragSpace = await sketchWindow.$('[data-sketch-drag-space]');
     const sketchDragSpaceBox = await sketchDragSpace.boundingBox();
@@ -682,7 +765,10 @@ async function main() {
       window.dispatchEvent(new DragEvent('drop', { dataTransfer: transfer, clientX: 760, clientY: 260, bubbles: true, cancelable: true }));
     }, { png: tinyPng });
     await page.waitForFunction(() => document.querySelectorAll('.floating-window[data-window-kind="image"]').length >= 39, { timeout: 20_000 });
-    const imageWindow = await page.$('.floating-window[data-window-kind="image"]:has(img[alt="Floating Reference"])');
+    const imageWindows = await page.$$('.floating-window[data-window-kind="image"]:has(img[alt="Floating Reference"])');
+    const imageWindow = imageWindows[0];
+    assert.ok(imageWindow, 'The many-window stress test should expose a visible image window.');
+    await imageWindow.evaluate(element => { element.style.zIndex = '999999'; });
     const imageDragSpace = await imageWindow.$('[data-media-drag-space]');
     const imageControlState = await page.$eval('.floating-window[data-window-kind="image"]:has(img[alt="Floating Reference"])', element => ({
       hasRotate: Boolean(element.querySelector('[data-control="rotate"]')),
@@ -692,6 +778,21 @@ async function main() {
     assert.strictEqual(imageControlState.resetLabel, 'Reset');
     const imageStartBox = await imageWindow.boundingBox();
     const imageHandleBox = await imageDragSpace.boundingBox();
+    const imageDragHitTest = await page.evaluate(({ x, y, selectedId }) => {
+      const hit = document.elementFromPoint(x, y);
+      const hitWindow = hit?.closest('.floating-window');
+      const pill = document.querySelector('.floating-pill')?.getBoundingClientRect();
+      return {
+        hitTag: hit?.tagName || '',
+        hitWindowId: hitWindow?.getAttribute('data-id') || '',
+        selectedId,
+        pill: pill ? { x: pill.x, y: pill.y, width: pill.width, height: pill.height } : null
+      };
+    }, {
+      x: imageHandleBox.x + (imageHandleBox.width / 2),
+      y: imageHandleBox.y + (imageHandleBox.height / 2),
+      selectedId: await imageWindow.evaluate(element => element.getAttribute('data-id'))
+    });
     const dragStartedAt = Date.now();
     await page.mouse.move(imageHandleBox.x + (imageHandleBox.width / 2), imageHandleBox.y + (imageHandleBox.height / 2));
     await page.mouse.down();
@@ -699,7 +800,10 @@ async function main() {
     await page.mouse.up();
     const dragDuration = Date.now() - dragStartedAt;
     const imageEndBox = await imageWindow.boundingBox();
-    assert.ok(Math.abs(imageEndBox.x - imageStartBox.x) > 80 || Math.abs(imageEndBox.y - imageStartBox.y) > 60, 'Empty media toolbar space should drag the window reliably.');
+    assert.ok(
+      Math.abs(imageEndBox.x - imageStartBox.x) > 80 || Math.abs(imageEndBox.y - imageStartBox.y) > 60,
+      `Empty media toolbar space should drag the window reliably: ${JSON.stringify({ imageStartBox, imageHandleBox, imageEndBox, imageDragHitTest })}`
+    );
     assert.ok(dragDuration < 4000, `Many-window drag took too long (${dragDuration} ms).`);
 
     const mediaResizeInventory = await page.$$eval('.floating-window[data-window-kind="image"]', windows => windows.map(windowElement => ({
@@ -720,7 +824,216 @@ async function main() {
     const imageResizeEnd = await imageWindow.boundingBox();
     assert.ok(imageResizeEnd.width - imageResizeStart.width > 60, 'Image windows should resize horizontally from a corner.');
     assert.ok(imageResizeEnd.height - imageResizeStart.height > 55, 'Image windows should resize vertically from a corner.');
+    await imageWindow.evaluate(element => { element.style.zIndex = '6500'; });
     consoleCounts.afterManyWindows = consoleErrorPromises.length;
+
+    await page.click('button[title="Full Screen Manager"]');
+    await page.waitForSelector('[data-manager-sidebar]');
+    const expandedManagerState = await page.evaluate(() => ({
+      sidebarWidth: document.querySelector('[data-manager-sidebar]')?.getBoundingClientRect().width || 0,
+      hasAllBoards: Boolean(document.querySelector('[data-manager-sidebar] button[title="All Boards"]')),
+      heading: document.querySelector('[data-manager-main] h1')?.textContent?.trim() || '',
+      boardCount: document.querySelectorAll('[data-manager-sidebar] nav button[title]').length
+    }));
+    assert.ok(expandedManagerState.sidebarWidth >= 240, 'The board manager should open with its full navigation sidebar.');
+    assert.strictEqual(expandedManagerState.hasAllBoards, true);
+    assert.strictEqual(expandedManagerState.heading, 'Project Boards');
+    assert.ok(expandedManagerState.boardCount >= 2, 'The sidebar should expose All Boards and the active project.');
+
+    await page.click('button[title="Click to rename board"]');
+    await page.waitForSelector('[data-manager-main] input[aria-label^="Rename "]');
+    await page.$eval('[data-manager-main] input[aria-label^="Rename "]', element => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+      setter.call(element, 'Premium Reference Board');
+      element.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => {
+      const title = document.querySelector('button[title="Click to rename board"]');
+      return title?.textContent?.trim() === 'Premium Reference Board';
+    });
+    assert.ok(await page.$('[data-manager-sidebar]'), 'Renaming a board from its title should keep the manager open.');
+    assert.ok(await page.$('[data-manager-sidebar] button[title="Premium Reference Board"]'), 'The sidebar should immediately reflect an inline board rename.');
+
+    await page.$$eval('button', buttons => {
+      const editButton = buttons.find(button => button.textContent?.trim() === 'Edit Content');
+      if (!editButton) throw new Error('Edit Content button was not found.');
+      editButton.click();
+    });
+    await page.waitForSelector('[data-board-media-name]');
+    await page.waitForFunction(() => Array.from(document.querySelectorAll('[data-board-media-name]')).some(element => element.textContent?.trim() === 'Renamed brief.docx'));
+    await page.$$eval('[data-board-media-name]', buttons => {
+      const target = buttons.find(button => button.textContent?.trim() === 'Renamed brief.docx');
+      if (!target) throw new Error('Renamed DOCX preview was not found in the board editor.');
+      target.click();
+    });
+    await page.waitForSelector('[data-board-media-name-input]');
+    await page.$eval('[data-board-media-name-input]', element => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+      setter.call(element, 'Board brief.docx');
+      element.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => Array.from(document.querySelectorAll('[data-board-media-name]')).some(element => element.textContent?.trim() === 'Board brief.docx'));
+
+    await page.waitForFunction(() => Array.from(document.querySelectorAll('[data-board-note-name]')).some(element => element.textContent?.trim() === 'Layout notes'));
+    await page.$$eval('[data-board-note-name]', buttons => {
+      const target = buttons.find(button => button.textContent?.trim() === 'Layout notes');
+      if (!target) throw new Error('Named note preview was not found in the board editor.');
+      target.click();
+    });
+    await page.waitForSelector('[data-board-note-name-input]');
+    await page.$eval('[data-board-note-name-input]', element => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+      setter.call(element, 'Client notes');
+      element.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => Array.from(document.querySelectorAll('[data-board-note-name]')).some(element => element.textContent?.trim() === 'Client notes'));
+
+    await page.waitForFunction(() => Array.from(document.querySelectorAll('[data-board-sketch-name]')).some(element => element.textContent?.trim() === 'Concept sketch'));
+    await page.$$eval('[data-board-sketch-name]', buttons => {
+      const target = buttons.find(button => button.textContent?.trim() === 'Concept sketch');
+      if (!target) throw new Error('Named sketch preview was not found in the board editor.');
+      target.click();
+    });
+    await page.waitForSelector('[data-board-sketch-name-input]');
+    await page.$eval('[data-board-sketch-name-input]', element => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+      setter.call(element, 'Hero sketch');
+      element.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => Array.from(document.querySelectorAll('[data-board-sketch-name]')).some(element => element.textContent?.trim() === 'Hero sketch'));
+
+    assert.strictEqual(await page.$eval('[data-manager-main] h1', element => element.textContent.trim()), 'Premium Reference Board');
+    assert.ok(await page.$('[data-board-media-preview]'), 'Renaming media in board contents should keep the content editor open.');
+    assert.ok(await page.$('[data-board-note-preview]'), 'The board editor should keep named note previews available.');
+    assert.ok(await page.$('[data-board-sketch-preview]'), 'The board editor should expose sketch previews and names.');
+    await page.click('button[aria-label="Back to all boards"]');
+    await page.waitForSelector('button[title="Click to rename board"]');
+
+    await page.click('button[title="Collapse sidebar"]');
+    await page.waitForFunction(() => (document.querySelector('[data-manager-sidebar]')?.getBoundingClientRect().width || 999) < 100);
+    assert.ok(await page.$('button[title="Expand sidebar"]'), 'The collapsed sidebar should expose a clear expand action.');
+    const collapsedSidebarControl = await page.evaluate(() => {
+      const sidebarRect = document.querySelector('[data-manager-sidebar]')?.getBoundingClientRect();
+      const controlRect = document.querySelector('[data-manager-sidebar-expand]')?.getBoundingClientRect();
+      return sidebarRect && controlRect ? {
+        fullyVisible: controlRect.left >= sidebarRect.left && controlRect.right <= sidebarRect.right && controlRect.top >= sidebarRect.top && controlRect.bottom <= sidebarRect.bottom,
+        controlWidth: controlRect.width,
+        controlHeight: controlRect.height
+      } : null;
+    });
+    assert.deepStrictEqual(collapsedSidebarControl, { fullyVisible: true, controlWidth: 40, controlHeight: 40 }, 'The collapsed rail should show one large, unclipped expand control.');
+    await page.click('button[title="Expand sidebar"]');
+    await page.waitForFunction(() => (document.querySelector('[data-manager-sidebar]')?.getBoundingClientRect().width || 0) >= 240);
+
+    await page.click('[data-sidebar-board-rename]');
+    await page.waitForSelector('[data-sidebar-board-name-input]');
+    await page.$eval('[data-sidebar-board-name-input]', element => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+      setter.call(element, 'Sidebar Reference Board');
+      element.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => document.querySelector('[data-sidebar-board-name]')?.getAttribute('title') === 'Sidebar Reference Board');
+    assert.strictEqual(await page.$eval('button[title="Click to rename board"]', element => element.textContent.trim()), 'Sidebar Reference Board', 'Renaming from the sidebar should update the board card immediately.');
+    assert.ok(await page.$('[data-manager-sidebar]'), 'Sidebar renaming should keep the board manager open.');
+    await page.click('button[title="Close Manager"]');
+    await page.waitForFunction(() => !document.querySelector('[data-manager-sidebar]'));
+    const retractedPill = await page.$('.floating-pill');
+    const retractedExpandButton = await page.$('button[title="Expand Pill"]');
+    const retractedPillStart = await retractedPill.boundingBox();
+    const retractedExpandBox = await retractedExpandButton.boundingBox();
+    const retractedDragX = retractedPillStart.x + retractedPillStart.width + 130 < 1600 ? 105 : -105;
+    const retractedDragY = retractedPillStart.y + retractedPillStart.height + 100 < 1000 ? 75 : -75;
+    await page.mouse.move(retractedExpandBox.x + (retractedExpandBox.width / 2), retractedExpandBox.y + (retractedExpandBox.height / 2));
+    await page.mouse.down();
+    await new Promise(resolve => setTimeout(resolve, 120));
+    await page.mouse.move(
+      retractedExpandBox.x + (retractedExpandBox.width / 2) + retractedDragX,
+      retractedExpandBox.y + (retractedExpandBox.height / 2) + retractedDragY,
+      { steps: 8 }
+    );
+    await page.mouse.up();
+    await new Promise(resolve => setTimeout(resolve, 180));
+    const retractedPillEnd = await retractedPill.boundingBox();
+    assert.ok(
+      Math.abs(retractedPillEnd.x - retractedPillStart.x) > 70 && Math.abs(retractedPillEnd.y - retractedPillStart.y) > 45,
+      'Pressing and dragging from the center of the round retracted pill should move it.'
+    );
+    assert.ok(await page.$('button[title="Expand Pill"]'), 'Dragging the round pill should not accidentally expand it.');
+    await page.click('button[title="Expand Pill"]');
+    await page.waitForSelector('[data-pill-preview-type="docx"][data-pill-label="Board brief.docx"]');
+    await page.waitForSelector('[data-pill-preview-type="note"][data-pill-label="Client notes"]');
+    await page.waitForSelector('[data-pill-preview-type="sketch"][data-pill-label="Hero sketch"]');
+
+    const pillWindow = await page.$('.floating-pill');
+    const pillDragHandle = await pillWindow.$('.drag-handle');
+    await dragWindowTo(pillWindow, pillDragHandle, 80, 80, { alt: true });
+    const pillResizeInventory = await pillWindow.evaluate(element => ({
+      frameCount: element.querySelectorAll('[data-invisible-resize-frame="pill"]').length,
+      edges: Array.from(element.querySelectorAll('[data-invisible-resize-frame="pill"] [data-resize-edge]')).map(handle => handle.getAttribute('data-resize-edge')).sort(),
+      visibleGripCount: element.querySelectorAll('[data-visible-resize-grip]').length
+    }));
+    assert.strictEqual(pillResizeInventory.frameCount, 1, 'The pill should use one invisible resize frame.');
+    assert.deepStrictEqual(pillResizeInventory.edges, expectedResizeEdges, 'The pill should resize from every edge and corner.');
+    assert.strictEqual(pillResizeInventory.visibleGripCount, 0, 'The pill resize frame should stay invisible.');
+
+    const pillTopLeftResize = await pillWindow.$('[data-invisible-resize-frame="pill"] [data-resize-edge="top-left"]');
+    const pillTopLeftResizeBox = await pillTopLeftResize.boundingBox();
+    const pillResizeStart = await pillWindow.boundingBox();
+    await page.mouse.move(pillTopLeftResizeBox.x + 6, pillTopLeftResizeBox.y + 6);
+    await page.mouse.down();
+    await page.mouse.move(pillTopLeftResizeBox.x - 42, pillTopLeftResizeBox.y - 32, { steps: 6 });
+    await page.mouse.up();
+    await new Promise(resolve => setTimeout(resolve, 180));
+    const pillTopLeftResizeEnd = await pillWindow.boundingBox();
+    assert.ok(pillTopLeftResizeEnd.x < pillResizeStart.x - 30 && pillTopLeftResizeEnd.y < pillResizeStart.y - 20, 'The pill should resize outward from its top and left sides.');
+    assert.ok(pillTopLeftResizeEnd.width > pillResizeStart.width + 30 && pillTopLeftResizeEnd.height > pillResizeStart.height + 20, 'Top-left pill resizing should update both dimensions.');
+
+    const pillRightResize = await pillWindow.$('[data-invisible-resize-frame="pill"] [data-resize-edge="right"]');
+    const pillRightResizeBox = await pillRightResize.boundingBox();
+    const pillBeforeExpansion = await pillWindow.boundingBox();
+    const targetPillWidth = 580;
+    await page.mouse.move(pillRightResizeBox.x + 4, pillRightResizeBox.y + (pillRightResizeBox.height / 2));
+    await page.mouse.down();
+    await page.mouse.move(pillRightResizeBox.x + Math.max(0, targetPillWidth - pillBeforeExpansion.width), pillRightResizeBox.y + (pillRightResizeBox.height / 2), { steps: 10 });
+    await page.mouse.up();
+    await page.waitForFunction(() => Number(document.querySelector('[data-pill-preview-columns]')?.getAttribute('data-pill-preview-columns')) === 4);
+    const expandedPillGrid = await page.evaluate(() => {
+      const cards = Array.from(document.querySelectorAll('[data-pill-preview-card]')).map(card => {
+        const rect = card.getBoundingClientRect();
+        return { left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom, width: rect.width, height: rect.height, opacity: getComputedStyle(card).opacity };
+      });
+      const overlaps = [];
+      cards.forEach((card, index) => {
+        cards.slice(index + 1).forEach((other, offset) => {
+          const intersects = card.left < other.right - 0.5 && card.right > other.left + 0.5 && card.top < other.bottom - 0.5 && card.bottom > other.top + 0.5;
+          if (intersects) overlaps.push([index, index + offset + 1]);
+        });
+      });
+      const firstCard = document.querySelector('[data-pill-preview-card]');
+      const caption = firstCard?.querySelector('.pill-preview-caption');
+      const firstCardRect = firstCard?.getBoundingClientRect();
+      const captionRect = caption?.getBoundingClientRect();
+      const captionStyle = caption ? getComputedStyle(caption) : null;
+      return {
+        cardCount: cards.length,
+        overlaps,
+        opaqueCards: cards.every(card => card.opacity === '1'),
+        columns: Number(document.querySelector('[data-pill-preview-columns]')?.getAttribute('data-pill-preview-columns')),
+        captionInset: firstCardRect && captionRect ? Math.min(captionRect.left - firstCardRect.left, firstCardRect.right - captionRect.right) : 0,
+        captionBackdrop: captionStyle?.backdropFilter || captionStyle?.webkitBackdropFilter || ''
+      };
+    });
+    assert.strictEqual(expandedPillGrid.columns, 4, 'A wide pill should use four preview columns.');
+    assert.ok(expandedPillGrid.cardCount >= 4, 'The enlarged-pill layout check should cover multiple preview rows.');
+    assert.deepStrictEqual(expandedPillGrid.overlaps, [], 'Preview cards should never overlap when the pill is enlarged.');
+    assert.strictEqual(expandedPillGrid.opaqueCards, true, 'Preview cards should remain fully opaque even when their floating windows are hidden.');
+    assert.ok(expandedPillGrid.captionInset >= 5, 'Preview labels should render as inset glass chips instead of edge-to-edge black gradients.');
+    assert.match(expandedPillGrid.captionBackdrop, /blur\(/, 'Preview labels should use the refined glass treatment.');
 
     assert.deepStrictEqual(pageErrors, [], `Page errors: ${pageErrors.join('; ')}`);
     const consoleErrors = await Promise.all(consoleErrorPromises);
@@ -736,11 +1049,14 @@ async function main() {
     assert.deepStrictEqual(relevantConsoleErrors, [], `Console errors: ${JSON.stringify({ consoleCounts, keyDiagnostics, uniqueErrors: [...new Map(relevantConsoleErrors.map(values => [JSON.stringify(values), values])).values()] }, null, 2)}`);
 
     const startupPage = await browser.newPage();
+    await startupPage.setViewport({ width: 3200, height: 1000, deviceScaleFactor: 1 });
     await startupPage.evaluateOnNewDocument(() => {
       window.__startupEnabled = true;
       window.__startupInvokeCalls = [];
       localStorage.setItem('ref-flow-api-keys', JSON.stringify({ SerpAPI: 'legacy-key' }));
+      localStorage.setItem('ref-flow-pill-opacity', '0.2');
       localStorage.setItem('ref-flow-provider-order', JSON.stringify(['SerpAPI', 'Openverse', 'Pixabay', 'Wikimedia Commons']));
+      localStorage.setItem('ref-flow-pill-position', JSON.stringify({ x: 2200, y: 120 }));
       const ipcRenderer = {
         invoke: async (channel, ...args) => {
           window.__startupInvokeCalls.push([channel, ...args]);
@@ -765,7 +1081,16 @@ async function main() {
           }
           if (channel === 'get-default-data-directory') return '';
           if (channel === 'get-update-status') return { phase: 'development', message: 'Test mode' };
-          if (channel === 'get-display-layout') return null;
+          if (channel === 'get-display-layout') {
+            return {
+              virtual: { x: 0, y: 0, width: 3200, height: 1000 },
+              primary: { x: 0, y: 0, width: 1600, height: 1000 },
+              displays: [
+                { id: 'primary', label: 'Primary', bounds: { x: 0, y: 0, width: 1600, height: 1000 }, workArea: { x: 0, y: 0, width: 1600, height: 960 }, scaleFactor: 1, isPrimary: true },
+                { id: 'secondary', label: 'Secondary', bounds: { x: 1600, y: 0, width: 1600, height: 1000 }, workArea: { x: 1600, y: 0, width: 1600, height: 960 }, scaleFactor: 1, isPrimary: false }
+              ]
+            };
+          }
           if (channel === 'get-launch-context') return { shouldRevealPill: true };
           if (channel === 'open-external-url') return true;
           return null;
@@ -780,6 +1105,10 @@ async function main() {
       });
     });
     await startupPage.goto(ORIGIN, { waitUntil: 'networkidle0' });
+    await startupPage.waitForFunction(() => {
+      const rect = document.querySelector('.floating-pill')?.getBoundingClientRect();
+      return Boolean(rect && rect.left >= 1600 && rect.right <= 3200 && rect.top >= 0 && rect.bottom <= 1000);
+    });
     await startupPage.click('button[title="Settings"]');
     await startupPage.waitForSelector('input[aria-label="Start on Boot"]:checked');
     const startupStatusBefore = await startupPage.$eval('[data-start-on-boot-status]', element => element.textContent.trim());
@@ -788,7 +1117,8 @@ async function main() {
     await startupPage.waitForFunction(() => !document.querySelector('input[aria-label="Start on Boot"]')?.checked);
     const startupCalls = await startupPage.evaluate(() => window.__startupInvokeCalls);
     assert.ok(startupCalls.some(call => call[0] === 'set-start-on-boot' && call[1] === false), 'Start on Boot should wait for confirmed IPC registration changes.');
-    assert.strictEqual(await startupPage.evaluate(() => localStorage.getItem('ref-flow-api-keys')), null, 'The 1.0.6 migration should remove saved API keys.');
+    assert.strictEqual(await startupPage.evaluate(() => localStorage.getItem('ref-flow-api-keys')), null, 'The 1.0.7 migration should remove saved API keys.');
+    assert.strictEqual(await startupPage.evaluate(() => localStorage.getItem('ref-flow-pill-opacity')), null, 'The glass-control migration should remove the redundant legacy pill opacity value.');
     const migratedProviders = await startupPage.evaluate(() => JSON.parse(localStorage.getItem('ref-flow-provider-order') || '[]').sort());
     assert.deepStrictEqual(migratedProviders, ['Openverse', 'Wikimedia Commons']);
 
@@ -825,9 +1155,19 @@ async function main() {
       sketches: 'drawn pill preview, movement, neighboring-window snapping, and all invisible resize edges/corners passed',
       documentControls: 'Reset label and rotate visibility passed',
       providerSettings: 'no-key provider migration and API-setting removal passed',
+      boardManager: 'unclipped collapsed expand control, sidebar and card renaming, content editor, and close flow passed',
+      mediaNames: 'original filenames plus pill and board-editor inline renaming passed',
+      noteAndSketchNames: 'pill and board-editor rename persistence passed',
+      pdfPreviewLayout: 'tile-filling first-page crop passed',
+      glassTranslucency: 'global persisted appearance slider with opaque previews and legacy pill-opacity removal passed',
+      pillActionIcons: 'white rest state and purple hover state passed',
+      pillResize: 'single invisible eight-zone resize frame and top-left interaction passed',
+      pillPreviewGrid: 'four-column expansion, overlap protection, and inset glass captions passed',
+      multiMonitorLayout: 'pill placement and connected-display clamping passed across two synthetic monitors',
       externalBrowserSearch: 'browser providers route through Windows external URL IPC',
       startOnBoot: 'verified IPC status and confirmed toggle passed',
       pill: 'lost-release recovery and single-commit fast dragging passed',
+      retractedPillDrag: 'center press-and-hold movement with click-to-expand passed',
       fastPillDragMs: fastPillDragDuration,
       mediaToolbarDrag: 'empty toolbar drag surface passed',
       manyWindowDragMs: dragDuration

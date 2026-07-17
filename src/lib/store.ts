@@ -50,6 +50,7 @@ export interface FloatingImage {
 
 export interface FloatingNote {
   id: string;
+  name?: string;
   text: string;
   x: number;
   y: number;
@@ -71,6 +72,7 @@ export interface FloatingSketchLine {
 
 export interface FloatingSketch {
   id: string;
+  name?: string;
   lines: FloatingSketchLine[];
   x: number;
   y: number;

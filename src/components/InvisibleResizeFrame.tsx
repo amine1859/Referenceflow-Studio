@@ -1,7 +1,7 @@
 import type { CSSProperties, MouseEvent } from 'react';
 import type { WindowResizeEdge } from '../lib/windowGeometry';
 
-type ResizeFrameKind = 'media' | 'note' | 'sketch';
+type ResizeFrameKind = 'media' | 'note' | 'sketch' | 'pill';
 
 type ResizeZone = {
   edge: WindowResizeEdge;

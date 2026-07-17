@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { AlertCircle, Check, ChevronLeft, ChevronRight, Clipboard, FileText, Loader2, Move, Save, Table2 } from 'lucide-react';
 import type { FloatingImage, OfficeDocumentEdits } from '../lib/store';
+import { Button } from './ui/button';
 
 const ROWS_PER_PAGE = 30;
 const COLUMNS_PER_PAGE = 12;
@@ -325,15 +326,13 @@ function OfficeDocumentWindowComponent({ media, theme, onUpdate, onMoveMouseDown
     }
   };
 
-  const panelClass = theme === 'light' ? 'bg-white text-slate-900' : 'bg-slate-950 text-slate-100';
-  const controlClass = theme === 'light'
-    ? 'border-slate-300 bg-white text-slate-800'
-    : 'border-white/10 bg-white/5 text-slate-100';
+  const panelClass = 'bg-background text-foreground';
+  const controlClass = 'border-border bg-card text-foreground hover:border-border-strong hover:bg-surface-elevated';
 
   return (
     <div className={`relative flex h-full min-h-0 w-full flex-col overflow-hidden ${panelClass} no-window-drag`}>
       <div
-        className={`floating-office-drag-handle flex shrink-0 cursor-move items-center justify-between gap-2 border-b px-2.5 py-2 ${theme === 'light' ? 'border-slate-200 bg-slate-50' : 'border-white/10 bg-slate-900'}`}
+        className="floating-office-drag-handle flex shrink-0 cursor-move items-center justify-between gap-2 border-b border-border bg-surface-elevated px-2.5 py-2"
         onMouseDown={(event) => onMoveMouseDown(event, media.id)}
         data-office-drag-handle
         data-native-interactive="true"
@@ -345,18 +344,18 @@ function OfficeDocumentWindowComponent({ media, theme, onUpdate, onMoveMouseDown
           <span className="truncate text-[11px] font-semibold">{media.fileName || (isDocx ? 'Word document' : 'Excel workbook')}</span>
         </div>
         <div className="flex shrink-0 items-center gap-1">
-          <button type="button" onClick={() => void handleCopy()} className={`rounded border px-2 py-1 text-[10px] hover:border-sky-500 ${controlClass}`} title={isDocx ? 'Copy all document text' : 'Copy the current sheet as tab-separated text'}>
+          <Button type="button" variant="ghost" size="sm" onClick={() => void handleCopy()} className="h-7 px-2 text-[10px]" title={isDocx ? 'Copy all document text' : 'Copy the current sheet as tab-separated text'}>
             <Clipboard className="mr-1 inline h-3 w-3" /> Copy
-          </button>
-          <button type="button" onClick={() => void handleSave()} disabled={status === 'loading' || status === 'saving'} className="rounded border border-sky-500/40 bg-sky-500/15 px-2 py-1 text-[10px] text-sky-500 hover:bg-sky-500 hover:text-white disabled:opacity-50" title={`Save edited .${extension} file`}>
+          </Button>
+          <Button type="button" variant="primary" size="sm" onClick={() => void handleSave()} disabled={status === 'loading' || status === 'saving'} className="h-7 px-2 text-[10px]" title={`Save edited .${extension} file`}>
             {status === 'saving' ? <Loader2 className="mr-1 inline h-3 w-3 animate-spin" /> : status === 'saved' ? <Check className="mr-1 inline h-3 w-3" /> : <Save className="mr-1 inline h-3 w-3" />} Save
-          </button>
+          </Button>
         </div>
       </div>
 
       {status === 'loading' ? (
         <div className="flex min-h-64 flex-1 items-center justify-center gap-2 text-xs text-slate-400">
-          <Loader2 className="h-4 w-4 animate-spin" /> Opening {isDocx ? 'document' : 'workbook'}…
+          <Loader2 className="h-4 w-4 animate-spin text-primary" /> Opening {isDocx ? 'document' : 'workbook'}…
         </div>
       ) : status === 'error' && !workbookRef.current && !isDocx ? (
         <div className="flex min-h-64 flex-1 items-center justify-center gap-2 p-6 text-center text-xs text-rose-400">
@@ -367,21 +366,21 @@ function OfficeDocumentWindowComponent({ media, theme, onUpdate, onMoveMouseDown
           value={docxText}
           onChange={event => setDocxText(event.target.value)}
           spellCheck
-          className={`min-h-0 flex-1 resize-none overflow-auto p-4 font-sans text-sm leading-6 outline-none ${theme === 'light' ? 'bg-white text-slate-900' : 'bg-slate-950 text-slate-100'}`}
+          className="min-h-0 flex-1 resize-none overflow-auto bg-background p-5 font-sans text-sm leading-6 text-foreground outline-none"
           aria-label="Editable Word document text"
           title="Select, copy, and edit the document text here"
         />
       ) : (
         <>
-          <div className={`flex shrink-0 items-center gap-2 border-b px-2 py-1.5 ${theme === 'light' ? 'border-slate-200' : 'border-white/10'}`}>
-            <select value={activeSheet} onChange={event => setActiveSheet(event.target.value)} className={`min-w-0 flex-1 rounded border px-2 py-1 text-[10px] outline-none ${controlClass}`} aria-label="Worksheet">
+          <div className="flex shrink-0 items-center gap-2 border-b border-border bg-surface-elevated/60 px-2 py-1.5">
+            <select value={activeSheet} onChange={event => setActiveSheet(event.target.value)} className={`min-w-0 flex-1 rounded-lg border px-2 py-1 text-[10px] outline-none ${controlClass}`} aria-label="Worksheet">
               {sheetNames.map(name => <option key={name} value={name}>{name}</option>)}
             </select>
             <button type="button" onClick={() => setRowOffset(value => Math.max(0, value - ROWS_PER_PAGE))} disabled={rowOffset === 0} className={`rounded border p-1 disabled:opacity-30 ${controlClass}`} title="Previous rows"><ChevronLeft className="h-3 w-3" /></button>
-            <span className="whitespace-nowrap text-[9px] text-slate-400">Rows {rowOffset + 1}–{rowOffset + ROWS_PER_PAGE}</span>
+            <span className="whitespace-nowrap text-[9px] text-muted-foreground">Rows {rowOffset + 1}–{rowOffset + ROWS_PER_PAGE}</span>
             <button type="button" onClick={() => setRowOffset(value => value + ROWS_PER_PAGE)} disabled={rowOffset + ROWS_PER_PAGE >= usedRows} className={`rounded border p-1 disabled:opacity-30 ${controlClass}`} title="Next rows"><ChevronRight className="h-3 w-3" /></button>
             <button type="button" onClick={() => setColumnOffset(value => Math.max(0, value - COLUMNS_PER_PAGE))} disabled={columnOffset === 0} className={`rounded border p-1 disabled:opacity-30 ${controlClass}`} title="Previous columns"><ChevronLeft className="h-3 w-3" /></button>
-            <span className="whitespace-nowrap text-[9px] text-slate-400">{columnLabel(columnOffset + 1)}–{columnLabel(columnOffset + COLUMNS_PER_PAGE)}</span>
+            <span className="whitespace-nowrap text-[9px] text-muted-foreground">{columnLabel(columnOffset + 1)}–{columnLabel(columnOffset + COLUMNS_PER_PAGE)}</span>
             <button type="button" onClick={() => setColumnOffset(value => value + COLUMNS_PER_PAGE)} disabled={columnOffset + COLUMNS_PER_PAGE >= usedColumns} className={`rounded border p-1 disabled:opacity-30 ${controlClass}`} title="Next columns"><ChevronRight className="h-3 w-3" /></button>
           </div>
           <div className="flex-1 overflow-auto">
@@ -405,7 +404,7 @@ function OfficeDocumentWindowComponent({ media, theme, onUpdate, onMoveMouseDown
                           <input
                             value={readEditedCell(activeSheet, address)}
                             onChange={event => setCellEdit(activeSheet, address, event.target.value)}
-                            className="h-7 w-24 bg-transparent px-1.5 font-mono outline-none focus:ring-2 focus:ring-inset focus:ring-sky-500"
+                            className="h-7 w-24 bg-transparent px-1.5 font-mono outline-none focus:ring-2 focus:ring-inset focus:ring-primary"
                             aria-label={`${activeSheet} cell ${address}`}
                           />
                         </td>
@@ -419,7 +418,7 @@ function OfficeDocumentWindowComponent({ media, theme, onUpdate, onMoveMouseDown
         </>
       )}
 
-      <div className={`min-h-6 shrink-0 border-t px-2.5 py-1 text-[9px] ${theme === 'light' ? 'border-slate-200 bg-slate-50 text-slate-500' : 'border-white/10 bg-slate-900 text-slate-400'}`}>
+      <div className="min-h-6 shrink-0 border-t border-border bg-surface-elevated px-2.5 py-1 text-[9px] text-muted-foreground">
         {message || (isDocx
           ? 'Text-focused editor: complex Word layout may be simplified when saved.'
           : 'Cells, formulas, sheets, and untouched workbook formatting are preserved; edited cells take the value shown.')}

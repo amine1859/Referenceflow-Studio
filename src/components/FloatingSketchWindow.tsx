@@ -1,6 +1,6 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { motion } from 'motion/react';
-import { Move, Lock, Unlock, X, PenTool, Brush, Eraser, ChevronDown, ChevronUp } from 'lucide-react';
+import { Move, Lock, Unlock, X, PenTool, Brush, Eraser, ChevronDown, ChevronUp, Trash2 } from 'lucide-react';
 import { FloatingSketch, FloatingSketchLine } from '../lib/store';
 import type { WindowResizeEdge } from '../lib/windowGeometry';
 import { InvisibleResizeFrame } from './InvisibleResizeFrame';
@@ -206,10 +206,11 @@ export function FloatingSketchWindow({
         y: sketch.isCollapsed ? 10 : 0
       }}
       exit={{ opacity: 0, scale: 0.95, y: 10 }}
-      transition={(isDragging || isResizing) ? { type: "tween", duration: 0 } : { type: "spring", damping: 25, stiffness: 300, mass: 0.5 }}
+      transition={(isDragging || isResizing) ? { type: "tween", duration: 0 } : { type: "tween", duration: 0.2, ease: [0.22, 1, 0.36, 1] }}
       className={`absolute bg-transparent flex flex-col group drop-shadow-2xl pointer-events-auto floating-window`}
       data-id={sketch.id}
       data-window-kind="sketch"
+      data-active={isActive ? 'true' : 'false'}
       data-click-through={sketch.isLocked ? 'true' : 'false'}
       data-collapsed={sketch.isCollapsed ? 'true' : 'false'}
       onMouseDown={onInteraction}
@@ -221,7 +222,7 @@ export function FloatingSketchWindow({
       }}
     >
       <div 
-         className={`absolute bottom-full left-0 w-full h-[32px] dark:bg-slate-900/80 bg-white/80 backdrop-blur-sm ${sketch.isCollapsed ? 'rounded-lg' : 'rounded-t-lg'} transition-all flex items-center justify-between px-2 ${!sketch.isLocked ? 'cursor-move' : 'cursor-default'} border dark:border-white/10 border-black/10 ${sketch.isCollapsed ? 'opacity-100' : (sketch.isLocked ? 'opacity-20 hover:opacity-100' : 'opacity-0 group-hover:opacity-100')} floating-sketch-drag-handle z-10 gap-2 pointer-events-auto`}
+         className={`rf-window-toolbar absolute bottom-full left-0 z-10 flex h-[32px] w-full items-center justify-between gap-2 rounded-t-xl px-2 pointer-events-auto transition-opacity duration-200 ${!sketch.isLocked ? 'cursor-move' : 'cursor-default'} ${sketch.isCollapsed || isActive ? 'border-primary/35 opacity-100' : (sketch.isLocked ? 'opacity-35 hover:opacity-100' : 'opacity-0 group-hover:opacity-100')} floating-sketch-drag-handle`}
          onMouseDown={(e) => {
            if (!sketch.isLocked) onMouseDown(e, sketch.id);
          }}
@@ -278,10 +279,10 @@ export function FloatingSketchWindow({
               )}
               <button 
                 onClick={() => updateSketch(sketch.id, { lines: [] })}
-                className="text-xs font-mono px-1.5 text-slate-400 hover:text-white transition-colors"
+                className="p-1 text-slate-400 transition-colors hover:text-white"
                 title="Clear Sketch"
               >
-                CLEAR
+                <Trash2 className="size-3" />
               </button>
             </div>
           )}
@@ -323,7 +324,7 @@ export function FloatingSketchWindow({
           borderWidth: sketch.isCollapsed ? 0 : 1
         }}
         transition={isResizing ? { duration: 0 } : { duration: 0.2, ease: "easeInOut" }}
-        className={`relative rounded-b-md rounded-t-none overflow-hidden shadow-xl border-black/10 flex flex-col ${sketch.isLocked ? 'pointer-events-none' : 'pointer-events-auto'}`}
+        className={`relative flex flex-col overflow-hidden rounded-b-xl rounded-t-none border border-black/10 shadow-[var(--window-shadow)] transition-[box-shadow,border-color] duration-200 ${isActive ? 'ring-1 ring-primary/45' : ''} ${sketch.isLocked ? 'pointer-events-none' : 'pointer-events-auto'}`}
         style={{ backgroundColor: sketch.backgroundColor }}
       >
           <div className="w-full h-full relative" onMouseDown={(e) => { if (sketch.isLocked) e.stopPropagation(); }}>
