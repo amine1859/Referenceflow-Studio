@@ -1,7 +1,7 @@
 ﻿import React, { useState, useCallback, useRef, useEffect } from 'react';
 import { 
   Settings, Plus, X, Trash2, Maximize2, Minimize2, Move, Lock, Unlock, SlidersHorizontal, ChevronLeft, ChevronRight, RotateCw, Palette, FileText, Monitor, Check, Edit2, Download,
-  Pin, PinOff, Eye, EyeOff, Edit3, ChevronDown, ChevronUp, PenTool, Eraser, ZoomIn, ZoomOut, Maximize, Bold, Italic, List, Search, Loader2, Heart, Link as LinkIcon
+  Pin, PinOff, Eye, EyeOff, Edit3, ChevronDown, ChevronUp, PenTool, Eraser, ZoomIn, ZoomOut, Maximize, Bold, Italic, List, Search, Loader2, Heart, Link as LinkIcon, Table2, Copy
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import Markdown from 'react-markdown';
@@ -92,6 +92,85 @@ const getPdfFileSource = (url: string) => {
     return { data: dataUrlToUint8Array(url) };
   }
   return { url };
+};
+
+const mediaSourceToArrayBuffer = async (source: string): Promise<ArrayBuffer> => {
+  if (source.startsWith('data:')) {
+    const comma = source.indexOf(',');
+    if (comma < 0) throw new Error('The file data is malformed.');
+    const metadata = source.slice(0, comma);
+    const payload = source.slice(comma + 1);
+    if (/;base64/i.test(metadata)) {
+      const binary = atob(payload);
+      const bytes = new Uint8Array(binary.length);
+      for (let index = 0; index < binary.length; index++) bytes[index] = binary.charCodeAt(index);
+      return bytes.buffer;
+    }
+    return new TextEncoder().encode(decodeURIComponent(payload)).buffer;
+  }
+
+  const nodeRequire = getNodeRequire();
+  if (nodeRequire) {
+    const fs = nodeRequire('fs');
+    const { fileURLToPath } = nodeRequire('url');
+    const filePath = source.startsWith('file://') ? fileURLToPath(source) : source;
+    if (fs.existsSync(filePath)) {
+      const fileBuffer = fs.readFileSync(filePath);
+      return fileBuffer.buffer.slice(fileBuffer.byteOffset, fileBuffer.byteOffset + fileBuffer.byteLength);
+    }
+  }
+
+  const response = await fetch(source);
+  if (!response.ok) throw new Error(`The file could not be read (HTTP ${response.status}).`);
+  return await response.arrayBuffer();
+};
+
+const openInWindowsDefaultBrowser = async (targetUrl: string) => {
+  try {
+    const parsedUrl = new URL(targetUrl);
+    if (parsedUrl.protocol !== 'https:' && parsedUrl.protocol !== 'http:') return false;
+    const nodeRequire = getNodeRequire();
+    const electron = nodeRequire ? nodeRequire('electron') : null;
+    if (electron?.ipcRenderer) {
+      const opened = await electron.ipcRenderer.invoke('open-external-url', parsedUrl.toString());
+      if (opened) return true;
+    }
+    window.open(parsedUrl.toString(), '_blank', 'noopener,noreferrer');
+    return true;
+  } catch (error) {
+    console.warn('Could not open the link in the default browser:', error);
+    return false;
+  }
+};
+
+const writeTextToSystemClipboard = async (text: string) => {
+  const nodeRequire = getNodeRequire();
+  const electron = nodeRequire ? nodeRequire('electron') : null;
+  if (electron?.clipboard) {
+    electron.clipboard.writeText(text);
+    return;
+  }
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+  const textarea = document.createElement('textarea');
+  textarea.value = text;
+  textarea.style.position = 'fixed';
+  textarea.style.opacity = '0';
+  document.body.appendChild(textarea);
+  textarea.select();
+  document.execCommand('copy');
+  textarea.remove();
+};
+
+const getSelectedDocumentText = (target: EventTarget | null) => {
+  if (target instanceof HTMLTextAreaElement || target instanceof HTMLInputElement) {
+    const start = target.selectionStart ?? 0;
+    const end = target.selectionEnd ?? start;
+    return target.value.slice(Math.min(start, end), Math.max(start, end));
+  }
+  return window.getSelection()?.toString() || '';
 };
 
 const MAX_REFERENCE_PREVIEW_DIMENSION = 2048;
@@ -425,6 +504,201 @@ function PdfCanvas({
       <canvas ref={canvasRef} className="block max-w-none" />
       <div ref={textLayerRef} className="pdf-text-layer textLayer no-window-drag" aria-label="Selectable PDF text" />
       {children}
+    </div>
+  );
+}
+
+type OfficePillPreviewData = {
+  source: string;
+  type: 'docx' | 'xlsx';
+  lines?: string[];
+  cells?: string[][];
+};
+
+const officePillPreviewCache = new Map<string, OfficePillPreviewData>();
+const MAX_OFFICE_PILL_PREVIEWS = 64;
+
+const rememberOfficePillPreview = (id: string, preview: OfficePillPreviewData) => {
+  officePillPreviewCache.delete(id);
+  officePillPreviewCache.set(id, preview);
+  while (officePillPreviewCache.size > MAX_OFFICE_PILL_PREVIEWS) {
+    const oldestKey = officePillPreviewCache.keys().next().value;
+    if (typeof oldestKey !== 'string') break;
+    officePillPreviewCache.delete(oldestKey);
+  }
+};
+
+const getCompactCellText = (cell: any) => {
+  const value = cell?.value;
+  if (value == null) return '';
+  if (value instanceof Date) return value.toISOString().slice(0, 10);
+  if (typeof value === 'object') {
+    if (typeof value.formula === 'string') return `=${value.formula}`;
+    if (Array.isArray(value.richText)) return value.richText.map((part: any) => part.text || '').join('');
+    if (typeof value.text === 'string') return value.text;
+    if (value.result != null) return String(value.result);
+  }
+  return String(value);
+};
+
+const getEditedOfficePillPreview = (media: FloatingImage): OfficePillPreviewData | null => {
+  if (media.type === 'docx' && media.officeEdits?.docxText !== undefined) {
+    return {
+      source: media.url,
+      type: 'docx',
+      lines: media.officeEdits.docxText.split(/\r?\n/).map(line => line.trim()).filter(Boolean).slice(0, 5)
+    };
+  }
+
+  if (media.type === 'xlsx' && media.officeEdits?.xlsxCells) {
+    const sheetEdits = Object.values(media.officeEdits.xlsxCells).find(cells => Object.keys(cells).length > 0);
+    if (sheetEdits) {
+      return {
+        source: media.url,
+        type: 'xlsx',
+        cells: [Object.values(sheetEdits).slice(0, 9)].map(row => row.map(value => String(value)))
+      };
+    }
+  }
+  return null;
+};
+
+function PillPdfPreview({ media }: { media: FloatingImage }) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const [status, setStatus] = useState<'loading' | 'ready' | 'error'>('loading');
+
+  useEffect(() => {
+    let cancelled = false;
+    let loadingTask: any = null;
+    let renderTask: any = null;
+    setStatus('loading');
+
+    void withReferencePreviewSlot(async () => {
+      if (cancelled) return;
+      loadingTask = pdfjs.getDocument(getPdfFileSource(media.url) as any);
+      const document = await loadingTask.promise;
+      if (cancelled) return;
+      const page = await document.getPage(1);
+      if (cancelled) return;
+      const baseViewport = page.getViewport({ scale: 1 });
+      const scale = Math.min(76 / baseViewport.width, 58 / baseViewport.height);
+      const viewport = page.getViewport({ scale });
+      const canvas = canvasRef.current;
+      const context = canvas?.getContext('2d');
+      if (!canvas || !context) throw new Error('The PDF preview canvas is unavailable.');
+      const deviceScale = Math.min(2, window.devicePixelRatio || 1);
+      canvas.width = Math.max(1, Math.floor(viewport.width * deviceScale));
+      canvas.height = Math.max(1, Math.floor(viewport.height * deviceScale));
+      canvas.style.width = `${viewport.width}px`;
+      canvas.style.height = `${viewport.height}px`;
+      context.setTransform(deviceScale, 0, 0, deviceScale, 0, 0);
+      renderTask = page.render({ canvas, canvasContext: context, viewport });
+      await renderTask.promise;
+      if (!cancelled) setStatus('ready');
+    }).catch(error => {
+      if (cancelled || error?.name === 'RenderingCancelledException') return;
+      console.warn('Could not create the compact PDF preview:', error);
+      setStatus('error');
+    });
+
+    return () => {
+      cancelled = true;
+      try { renderTask?.cancel?.(); } catch { /* Ignore preview cancellation. */ }
+      void loadingTask?.destroy?.();
+    };
+  }, [media.url]);
+
+  return (
+    <div className="relative flex h-full w-full items-center justify-center overflow-hidden bg-slate-200" data-preview-status={status}>
+      {status !== 'ready' && <FileText className="absolute h-5 w-5 text-rose-400" />}
+      <canvas ref={canvasRef} className={`max-h-full max-w-full object-contain transition-opacity ${status === 'ready' ? 'opacity-100' : 'opacity-0'}`} />
+    </div>
+  );
+}
+
+function PillOfficePreview({ media }: { media: FloatingImage }) {
+  const editedPreview = getEditedOfficePillPreview(media);
+  const cachedPreview = officePillPreviewCache.get(media.id);
+  const [preview, setPreview] = useState<OfficePillPreviewData | null>(() => (
+    editedPreview || (cachedPreview?.source === media.url && cachedPreview.type === media.type ? cachedPreview : null)
+  ));
+  const [status, setStatus] = useState<'loading' | 'ready' | 'error'>(preview ? 'ready' : 'loading');
+
+  useEffect(() => {
+    const immediatePreview = getEditedOfficePillPreview(media);
+    if (immediatePreview) {
+      rememberOfficePillPreview(media.id, immediatePreview);
+      setPreview(immediatePreview);
+      setStatus('ready');
+      return;
+    }
+
+    const cached = officePillPreviewCache.get(media.id);
+    if (cached?.source === media.url && cached.type === media.type) {
+      setPreview(cached);
+      setStatus('ready');
+      return;
+    }
+
+    let cancelled = false;
+    setStatus('loading');
+    void withReferencePreviewSlot(async () => {
+      const arrayBuffer = await mediaSourceToArrayBuffer(media.url);
+      if (media.type === 'docx') {
+        const mammothModule = await import('mammoth');
+        const mammoth = (mammothModule as any).default || mammothModule;
+        const result = await mammoth.extractRawText({ arrayBuffer });
+        return {
+          source: media.url,
+          type: 'docx' as const,
+          lines: String(result.value || '').split(/\r?\n/).map(line => line.trim()).filter(Boolean).slice(0, 5)
+        };
+      }
+
+      const ExcelJS = await import('exceljs');
+      const workbook = new ExcelJS.Workbook();
+      await workbook.xlsx.load(arrayBuffer);
+      const worksheet = workbook.worksheets[0];
+      const cells = Array.from({ length: 3 }, (_, rowIndex) => (
+        Array.from({ length: 3 }, (_, columnIndex) => getCompactCellText(worksheet?.getCell(rowIndex + 1, columnIndex + 1)))
+      ));
+      return { source: media.url, type: 'xlsx' as const, cells };
+    }).then(nextPreview => {
+      if (cancelled) return;
+      rememberOfficePillPreview(media.id, nextPreview);
+      setPreview(nextPreview);
+      setStatus('ready');
+    }).catch(error => {
+      if (cancelled) return;
+      console.warn('Could not create the compact Office preview:', error);
+      setStatus('error');
+    });
+
+    return () => { cancelled = true; };
+  }, [media.id, media.officeEdits, media.type, media.url]);
+
+  if (media.type === 'docx') {
+    return (
+      <div className="relative h-full w-full overflow-hidden bg-white px-1.5 pb-5 pt-1.5 text-left text-[6px] leading-[8px] text-slate-700" data-preview-status={status}>
+        <div className="mb-1 h-px w-8 bg-blue-300" />
+        {preview?.lines?.length ? preview.lines.map((line, index) => (
+          <div key={`${line}-${index}`} className="max-h-4 overflow-hidden border-b border-slate-100 py-px">{line}</div>
+        )) : (
+          <div className="flex h-full items-center justify-center"><FileText className="h-5 w-5 text-blue-500" /></div>
+        )}
+      </div>
+    );
+  }
+
+  const cells = preview?.cells?.length ? preview.cells : Array.from({ length: 3 }, () => ['', '', '']);
+  return (
+    <div className="relative grid h-full w-full grid-cols-3 content-start overflow-hidden bg-emerald-50 pb-5 text-[5px] leading-3 text-emerald-950" data-preview-status={status}>
+      {cells.flatMap((row, rowIndex) => Array.from({ length: 3 }, (_, columnIndex) => (
+        <div key={`${rowIndex}-${columnIndex}`} className="h-4 overflow-hidden border-b border-r border-emerald-200 px-0.5">
+          {row[columnIndex] || ''}
+        </div>
+      )))}
+      {status !== 'ready' && <Table2 className="absolute left-1/2 top-1/2 h-5 w-5 -translate-x-1/2 -translate-y-1/2 text-emerald-500" />}
     </div>
   );
 }
@@ -1044,10 +1318,10 @@ export default function App() {
   const [searchLog, setSearchLog] = useState<string[]>([]);
   const [searchPage, setSearchPage] = useState(1);
   const [searchContextMenu, setSearchContextMenu] = useState<{x: number, y: number, result: any} | null>(null);
-  const [floatingContextMenu, setFloatingContextMenu] = useState<{x: number, y: number, id: string, url: string, type?: FloatingMediaType, fileName?: string} | null>(null);
+  const [floatingContextMenu, setFloatingContextMenu] = useState<{x: number, y: number, id: string, url: string, type?: FloatingMediaType, fileName?: string, selectedText?: string} | null>(null);
   const [contextMenuTempPath, setContextMenuTempPath] = useState<string>('');
   const dragFilePathsRef = useRef<Map<string, string>>(new Map());
-  const NATIVE_PROVIDERS = ['All Native', 'Wikimedia Commons', 'Openverse', 'Pixabay', 'Pexels', 'Unsplash', 'SerpAPI'];
+  const NATIVE_PROVIDERS = ['All Native', 'Wikimedia Commons', 'Openverse'];
   const BROWSER_PROVIDERS = ['Google Images', 'Pinterest', 'DuckDuckGo Images', 'Bing Images', 'ArtStation', 'Behance'];
   const FILTER_OPTIONS = ['Portrait', 'Landscape', 'Square', 'Black & White', 'Transparent', 'High Resolution'];
   const [isRetracted, setIsRetracted] = useState(false);
@@ -1072,6 +1346,7 @@ export default function App() {
   const [activeProjectId, setActiveProjectIdState] = useState<string | null>(null);
   const [showManager, setShowManager] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
+  const [isEmptyBoardPromptDismissed, setIsEmptyBoardPromptDismissed] = useState(false);
   const [managingProjectId, setManagingProjectId] = useState<string | null>(null);
   const [editingProjectId, setEditingProjectId] = useState<string | null>(null);
   const [editingProjectName, setEditingProjectName] = useState("");
@@ -1104,6 +1379,15 @@ export default function App() {
   const [updateActionPending, setUpdateActionPending] = useState(false);
 
   const [floatingSketches, setFloatingSketches] = useState<FloatingSketch[]>([]);
+  const hasAnyWorkspaceContent = floatingImages.length > 0 || floatingNotes.length > 0 || floatingSketches.length > 0;
+
+  useEffect(() => {
+    if (hasAnyWorkspaceContent) setIsEmptyBoardPromptDismissed(false);
+  }, [hasAnyWorkspaceContent]);
+
+  useEffect(() => {
+    setIsEmptyBoardPromptDismissed(false);
+  }, [activeProjectId]);
 
   useEffect(() => {
     if (!isPillVisible || isRetracted) {
@@ -1380,9 +1664,7 @@ export default function App() {
         if (f === 'Transparent') {
           const isPng = item.url.toLowerCase().split('?')[0].endsWith('.png');
           const transparentMeta = (item.title || "").toLowerCase().includes("transparent") || (item.title || "").toLowerCase().includes("png") || (item.url || "").toLowerCase().includes("transparent");
-          if (!isPng && !transparentMeta && item.provider !== 'SerpAPI') {
-            return false;
-          }
+          if (!isPng && !transparentMeta) return false;
         }
         if (f === 'High Resolution') {
           if (item.width && item.height) {
@@ -1392,9 +1674,7 @@ export default function App() {
         if (f === 'Black & White') {
           const titleLower = (item.title || "").toLowerCase();
           const bwMeta = titleLower.includes("black and white") || titleLower.includes("grayscale") || titleLower.includes("monochrome") || titleLower.includes("b&w");
-          if (!bwMeta && item.provider !== 'SerpAPI' && item.provider !== 'Unsplash' && item.provider !== 'Pixabay') {
-            return false;
-          }
+          if (!bwMeta) return false;
         }
       }
       return true;
@@ -1415,8 +1695,8 @@ export default function App() {
         };
         const url = BrowserSearchURLs[searchProvider];
         if (url) {
-            window.open(url, '_blank');
-            setSearchLog(prev => [...prev, `[Search] Opened ${searchProvider} in a new tab.`]);
+            void openInWindowsDefaultBrowser(url);
+            setSearchLog(prev => [...prev, `[Search] Opened ${searchProvider} in the Windows default browser.`]);
         }
         return;
     }
@@ -1441,7 +1721,7 @@ export default function App() {
 
     let newResults: any[] = [];
     const providersToTry = searchProvider === "All Native" 
-      ? providerOrder.filter(p => !['Google Images', 'Pinterest', 'DuckDuckGo Images', 'Bing Images', 'ArtStation', 'Behance'].includes(p) && (providerStatus[p]?.enabled ?? true))
+      ? providerOrder.filter(p => providerStatus[p]?.enabled ?? true)
       : [searchProvider];
     
     for (const p of providersToTry) {
@@ -1450,11 +1730,6 @@ export default function App() {
             if (!isLoadMore) setSearchLog(prev => [...prev, `[Search] Skipped ${p}: Disabled.`]);
             continue;
         }
-        if (pConfig.badge === 'API Key Required') {
-            if (!isLoadMore) setSearchLog(prev => [...prev, `[Search] Skipped ${p}: Requires API Key.`]);
-            continue;
-        }
-
         setActiveProviderSearching(p);
         setSearchLog(prev => [...prev, `[Search] Querying ${p}...`]);
         const startTime = Date.now();
@@ -1486,11 +1761,8 @@ export default function App() {
                     }));
                 }
             } else if (p === 'Openverse') {
-                const ok = apiKeys['Openverse'];
                 reqUrl = `https://api.openverse.org/v1/images/?q=${encodeURIComponent(searchQuery)}&page=${nextPage}`;
-                const headers: any = {};
-                if (ok) headers['Authorization'] = `Bearer ${ok}`;
-                const res = await fetch(reqUrl, { headers });
+                const res = await fetch(reqUrl);
                 if (!res.ok) throw new Error(`HTTP Error ${res.status}: ${res.statusText}`);
                 const data = await res.json();
                 if (data.results && data.results.length > 0) {
@@ -1501,152 +1773,6 @@ export default function App() {
                         title: item.title,
                         width: 0, 
                         height: 0
-                    }));
-                }
-            } else if (p === 'Pixabay') {
-                const pk = apiKeys['Pixabay'];
-                sortOrder = 'latest'; 
-                let extraParams = `&order=${sortOrder}`;
-
-                if (searchFilters.includes('Portrait')) {
-                  extraParams += `&orientation=vertical`;
-                  pFiltersApplied.push('Portrait (vertical)');
-                } else if (searchFilters.includes('Landscape')) {
-                  extraParams += `&orientation=horizontal`;
-                  pFiltersApplied.push('Landscape (horizontal)');
-                }
-                
-                if (searchFilters.includes('Black & White')) {
-                  extraParams += `&colors=grayscale`;
-                  pFiltersApplied.push('Black & White (grayscale)');
-                }
-                if (searchFilters.includes('Transparent')) {
-                  extraParams += `&colors=transparent`;
-                  pFiltersApplied.push('Transparent');
-                }
-
-                reqUrl = `https://pixabay.com/api/?key=${pk}&image_type=photo&q=${encodeURIComponent(searchQuery)}&page=${nextPage}${extraParams}`;
-                const res = await fetch(reqUrl);
-                if (!res.ok) throw new Error(`HTTP Error ${res.status}: ${res.statusText}`);
-                const data = await res.json();
-                if (data.hits && data.hits.length > 0) {
-                    providerHits = data.hits.map((item: any) => ({
-                        url: item.largeImageURL,
-                        thumbnail: item.webformatURL,
-                        provider: 'Pixabay',
-                        title: item.tags,
-                        width: item.imageWidth,
-                        height: item.imageHeight
-                    }));
-                }
-            } else if (p === 'Unsplash') {
-                const uk = apiKeys['Unsplash'];
-                sortOrder = 'latest'; 
-                let extraParams = `&order_by=${sortOrder}`;
-
-                if (searchFilters.includes('Portrait')) {
-                  extraParams += `&orientation=portrait`;
-                  pFiltersApplied.push('Portrait');
-                } else if (searchFilters.includes('Landscape')) {
-                  extraParams += `&orientation=landscape`;
-                  pFiltersApplied.push('Landscape');
-                } else if (searchFilters.includes('Square')) {
-                  extraParams += `&orientation=squarish`;
-                  pFiltersApplied.push('Square');
-                }
-
-                if (searchFilters.includes('Black & White')) {
-                  extraParams += `&color=black_and_white`;
-                  pFiltersApplied.push('Black & White');
-                }
-
-                reqUrl = `https://api.unsplash.com/search/photos?query=${encodeURIComponent(searchQuery)}&page=${nextPage}&per_page=20${extraParams}`;
-                const res = await fetch(reqUrl, { headers: { 'Authorization': `Client-ID ${uk}` } });
-                if (!res.ok) throw new Error(`HTTP Error ${res.status}: ${res.statusText}`);
-                const data = await res.json();
-                if (data.results && data.results.length > 0) {
-                    providerHits = data.results.map((item: any) => ({
-                        url: item.urls.full,
-                        thumbnail: item.urls.small,
-                        provider: 'Unsplash',
-                        title: item.alt_description || "Unsplash Image",
-                        width: item.width,
-                        height: item.height
-                    }));
-                }
-            } else if (p === 'Pexels') {
-                const pxk = apiKeys['Pexels'];
-                let extraParams = '';
-
-                if (searchFilters.includes('Portrait')) {
-                  extraParams += `&orientation=portrait`;
-                  pFiltersApplied.push('Portrait');
-                } else if (searchFilters.includes('Landscape')) {
-                  extraParams += `&orientation=landscape`;
-                  pFiltersApplied.push('Landscape');
-                } else if (searchFilters.includes('Square')) {
-                  extraParams += `&orientation=square`;
-                  pFiltersApplied.push('Square');
-                }
-
-                reqUrl = `https://api.pexels.com/v1/search?query=${encodeURIComponent(searchQuery)}&page=${nextPage}&per_page=20${extraParams}`;
-                const res = await fetch(reqUrl, { headers: { 'Authorization': pxk } });
-                if (!res.ok) throw new Error(`HTTP Error ${res.status}: ${res.statusText}`);
-                const data = await res.json();
-                if (data.photos && data.photos.length > 0) {
-                    providerHits = data.photos.map((item: any) => ({
-                        url: item.src.original,
-                        thumbnail: item.src.medium,
-                        provider: 'Pexels',
-                        title: item.alt || "Pexels Image",
-                        width: item.width,
-                        height: item.height
-                    }));
-                }
-            } else if (p === 'SerpAPI') {
-                const sk = apiKeys['SerpAPI'];
-                let extraParams = '';
-                
-                let tbsParts: string[] = [];
-                if (searchFilters.includes('High Resolution')) {
-                  tbsParts.push('isz:l');
-                  pFiltersApplied.push('High Resolution');
-                }
-                if (searchFilters.includes('Black & White')) {
-                  tbsParts.push('ic:gray');
-                  pFiltersApplied.push('Black & White (gray)');
-                }
-                if (searchFilters.includes('Transparent')) {
-                  tbsParts.push('ic:trans');
-                  pFiltersApplied.push('Transparent');
-                }
-                if (searchFilters.includes('Portrait')) {
-                  tbsParts.push('iar:p');
-                  pFiltersApplied.push('Portrait');
-                } else if (searchFilters.includes('Landscape')) {
-                  tbsParts.push('iar:l');
-                  pFiltersApplied.push('Landscape');
-                } else if (searchFilters.includes('Square')) {
-                  tbsParts.push('iar:s');
-                  pFiltersApplied.push('Square');
-                }
-
-                if (tbsParts.length > 0) {
-                  extraParams += `&tbs=${tbsParts.join(',')}`;
-                }
-
-                reqUrl = `https://serpapi.com/search.json?engine=google_images&q=${encodeURIComponent(searchQuery)}&ijn=${nextPage - 1}&api_key=${sk}${extraParams}`;
-                const res = await fetch(reqUrl);
-                if (!res.ok) throw new Error(`HTTP Error ${res.status}: ${res.statusText}`);
-                const data = await res.json();
-                if (data.images_results && data.images_results.length > 0) {
-                    providerHits = data.images_results.map((item: any) => ({
-                        url: item.original,
-                        thumbnail: item.thumbnail,
-                        provider: 'SerpAPI',
-                        title: item.title,
-                        width: item.original_width || 0,
-                        height: item.original_height || 0
                     }));
                 }
             }
@@ -1662,7 +1788,7 @@ export default function App() {
               `[Diagnostics - ${p}]`,
               `- Request URL: ${reqUrl || 'N/A'}`,
               `- Query: "${providerQueryTerms}"`,
-              `- Filters: ${searchFilters.length > 0 ? searchFilters.join(', ') : 'None'} (API mapped: ${pFiltersApplied.join(', ') || 'None'})`,
+              `- Filters: ${searchFilters.length > 0 ? searchFilters.join(', ') : 'None'} (source-mapped: ${pFiltersApplied.join(', ') || 'None'})`,
               `- Sort order: ${sortOrder}`,
               `- Response count: ${providerHits.length} (Locally filtered: ${locallyFiltered.length})`,
               `- Page number: ${nextPage}`,
@@ -1771,18 +1897,8 @@ export default function App() {
 
     // STAGE 2: Reverse Image Search
     const candidates: Array<{ url: string; provider: string }> = [];
-    const providersAttempted: string[] = [];
-    const providerErrors: string[] = [];
 
-    // Keys checks
-    const serpKey = apiKeys['SerpAPI'] || (import.meta as any).env?.VITE_SERPAPI_KEY;
-    const bingKey = apiKeys['BingVisualSearch'];
-    const tineyeKey = apiKeys['TinEye'];
-    const yandexKey = apiKeys['YandexImages'];
-
-    const isAnyReverseProviderConfigured = !!(serpKey || bingKey || tineyeKey || yandexKey);
-
-    // Direct pattern checks as "Other supported reverse-image providers"
+    // Direct URL patterns provide a no-key upgrade path for known image hosts.
     let hasMatchedDirectResolver = false;
     let directResolverName = "";
     let directResolvedUrl = "";
@@ -1810,120 +1926,7 @@ export default function App() {
       directResolvedUrl = newUrl;
     }
 
-    // 1. Google Lens (if available through configured provider)
-    providersAttempted.push("Google Lens");
-    if (serpKey) {
-      setFloatingImages(prev => prev.map(f => f.id === img.id ? { ...f, searchStatus: "Searching provider (Google Lens)..." } : f));
-      console.log("[Auto High-Res Search] Querying Google Lens (via SerpAPI)...");
-      try {
-        const url = `https://serpapi.com/search.json?engine=google_lens&url=${encodeURIComponent(img.url)}&api_key=${serpKey}`;
-        const res = await fetch(url);
-        if (!res.ok) throw new Error(`HTTP Error ${res.status}: ${res.statusText}`);
-        const data = await res.json();
-        if (data.error) throw new Error(data.error);
-
-        const visualMatches = data.visual_matches || [];
-        visualMatches.forEach((match: any) => {
-          if (match.thumbnail) candidates.push({ url: match.thumbnail, provider: "Google Lens" });
-          if (match.images && match.images[0] && match.images[0].url) {
-            candidates.push({ url: match.images[0].url, provider: "Google Lens" });
-          }
-        });
-        console.log(`[Auto High-Res Search] Google Lens returned ${visualMatches.length} visual matches.`);
-        setSearchLog(prev => [...prev, `[Google Lens] Found ${visualMatches.length} raw matches.`]);
-      } catch (err: any) {
-        console.error(`[Auto High-Res Search] Google Lens failed:`, err);
-        providerErrors.push(`Google Lens failed: ${err.message || err}`);
-        setSearchLog(prev => [...prev, `[Google Lens] Error: ${err.message || err}`]);
-      }
-    } else {
-      console.warn("[Auto High-Res Search] Google Lens skipped. SerpAPI key is not configured.");
-      setSearchLog(prev => [...prev, `[Google Lens] Skip: API key is not configured in settings.`]);
-    }
-
-    // 2. Bing Visual Search
-    providersAttempted.push("Bing Visual Search");
-    if (bingKey) {
-      setFloatingImages(prev => prev.map(f => f.id === img.id ? { ...f, searchStatus: "Searching provider (Bing)..." } : f));
-      console.log("[Auto High-Res Search] Querying Bing Visual Search...");
-      try {
-        const url = `https://api.bing.microsoft.com/v7.0/images/visualsearch`;
-        const res = await fetch(url, {
-          method: 'POST',
-          headers: {
-            'Ocp-Apim-Subscription-Key': bingKey,
-            'Content-Type': 'application/json'
-          },
-          body: JSON.stringify({
-            imageInfo: { url: img.url }
-          })
-        });
-        if (!res.ok) throw new Error(`HTTP Error ${res.status}`);
-        const data = await res.json();
-        const tags = data.tags || [];
-        let rCount = 0;
-        tags.forEach((tag: any) => {
-          if (tag.actions) {
-            tag.actions.forEach((action: any) => {
-              if (action.actionType === 'VisualSearch' && action.data && action.data.value) {
-                action.data.value.forEach((itm: any) => {
-                  if (itm.contentUrl) {
-                    candidates.push({ url: itm.contentUrl, provider: "Bing Visual Search" });
-                    rCount++;
-                  }
-                });
-              }
-            });
-          }
-        });
-        console.log(`[Auto High-Res Search] Bing Visual Search returned ${rCount} candidates.`);
-        setSearchLog(prev => [...prev, `[Bing Visual Search] Found ${rCount} raw matches.`]);
-      } catch (err: any) {
-        console.error(`[Auto High-Res Search] Bing Visual Search failed:`, err);
-        providerErrors.push(`Bing Visual Search failed: ${err.message || err}`);
-        setSearchLog(prev => [...prev, `[Bing Visual Search] Error: ${err.message || err}`]);
-      }
-    } else {
-      console.warn("[Auto High-Res Search] Bing Visual Search skipped. Key is not configured.");
-      setSearchLog(prev => [...prev, `[Bing Visual Search] Skip: API key is not configured.`]);
-    }
-
-    // 3. TinEye
-    providersAttempted.push("TinEye");
-    if (tineyeKey) {
-      setFloatingImages(prev => prev.map(f => f.id === img.id ? { ...f, searchStatus: "Searching provider (TinEye)..." } : f));
-      console.log("[Auto High-Res Search] Querying TinEye...");
-      try {
-        throw new Error("TinEye API configuration requires active commercial account credentials.");
-      } catch (err: any) {
-        console.error(`[Auto High-Res Search] TinEye failed:`, err);
-        providerErrors.push(`TinEye failed: ${err.message || err}`);
-        setSearchLog(prev => [...prev, `[TinEye] Error: ${err.message || err}`]);
-      }
-    } else {
-      console.warn("[Auto High-Res Search] TinEye skipped. Key is not configured.");
-      setSearchLog(prev => [...prev, `[TinEye] Skip: API key is not configured.`]);
-    }
-
-    // 4. Yandex Images
-    providersAttempted.push("Yandex Images");
-    if (yandexKey) {
-      setFloatingImages(prev => prev.map(f => f.id === img.id ? { ...f, searchStatus: "Searching provider (Yandex)..." } : f));
-      console.log("[Auto High-Res Search] Querying Yandex Images...");
-      try {
-        throw new Error("Yandex Images API key requires custom translator proxy.");
-      } catch (err: any) {
-        console.error(`[Auto High-Res Search] Yandex Images failed:`, err);
-        providerErrors.push(`Yandex Images failed: ${err.message || err}`);
-        setSearchLog(prev => [...prev, `[Yandex Images] Error: ${err.message || err}`]);
-      }
-    } else {
-      console.warn("[Auto High-Res Search] Yandex Images skipped. Key is not configured.");
-      setSearchLog(prev => [...prev, `[Yandex Images] Skip: API key is not configured.`]);
-    }
-
-    // 5. Direct Pattern Resolvers (Other supported reverse-image providers)
-    providersAttempted.push("Direct Pattern Resolvers");
+    // Direct Pattern Resolvers
     if (hasMatchedDirectResolver && directResolvedUrl) {
       setFloatingImages(prev => prev.map(f => f.id === img.id ? { ...f, searchStatus: `Searching provider (${directResolverName})...` } : f));
       candidates.push({ url: directResolvedUrl, provider: `${directResolverName} Direct Resolver` });
@@ -1933,21 +1936,17 @@ export default function App() {
       console.log("[Auto High-Res Search] Direct pattern skipped. Base image URL does not match partner structures.");
     }
 
-    // If reverse image search cannot be performed because no provider is configured/enabled and no direct pattern matches:
-    if (!isAnyReverseProviderConfigured && !hasMatchedDirectResolver) {
-      const whyExplanation = "To perform reverse search, please configure a Google Lens (SerpAPI) or Bing Visual Search key.";
-      console.warn(`[Auto High-Res Search] Failed: ${whyExplanation}`);
-      setSearchLog(prev => [...prev, `[Auto High-Res] No reverse search providers configured/enabled.`]);
-      
+    if (!hasMatchedDirectResolver) {
+      setSearchLog(prev => [...prev, `[Auto High-Res] No no-key direct upgrade was available for this image host.`]);
       setFloatingImages(prev => prev.map(f => f.id === img.id ? {
-        ...f, 
+        ...f,
         isSearchInProgress: false,
-        searchStatus: `Missing keys. ${whyExplanation}`
+        searchStatus: 'No direct higher-resolution source found'
       } : f));
-      
+
       setTimeout(() => {
         setFloatingImages(prev => prev.map(f => f.id === img.id ? { ...f, searchStatus: undefined } : f));
-      }, 6000);
+      }, 3500);
       return;
     }
 
@@ -2115,10 +2114,12 @@ export default function App() {
   });
   
   // Search Configuration State
-  const defaultProvidersOrder = ['Wikimedia Commons', 'Openverse', 'Pixabay', 'Pexels', 'Unsplash', 'SerpAPI', 'BingVisualSearch', 'TinEye', 'YandexImages'];
+  const defaultProvidersOrder = ['Wikimedia Commons', 'Openverse'];
   const [providerOrder, setProviderOrder] = useState<string[]>(() => {
     const saved = localStorage.getItem('ref-flow-provider-order');
-    let orderList = saved ? JSON.parse(saved) : [...defaultProvidersOrder];
+    let orderList = saved
+      ? JSON.parse(saved).filter((provider: string) => defaultProvidersOrder.includes(provider))
+      : [...defaultProvidersOrder];
     defaultProvidersOrder.forEach(p => {
       if (!orderList.includes(p)) {
         orderList.push(p);
@@ -2128,22 +2129,12 @@ export default function App() {
   });
   const [providerStatus, setProviderStatus] = useState<Record<string, { enabled: boolean, testStatus?: string }>>(() => {
     const saved = localStorage.getItem('ref-flow-provider-status');
-    return saved ? JSON.parse(saved) : {};
-  });
-  const [apiKeys, setApiKeys] = useState<Record<string, string>>(() => {
-    const saved = localStorage.getItem('ref-flow-api-keys');
     const parsed = saved ? JSON.parse(saved) : {};
-    
-    // Auto-inject provided Bing Visual Search key
-    if (parsed['BingVisualSearch'] !== '134fc9b5a245e7125195f046a3487eb79445080f7512f3fd9f814e921650b9be') {
-      parsed['BingVisualSearch'] = '134fc9b5a245e7125195f046a3487eb79445080f7512f3fd9f814e921650b9be';
-      localStorage.setItem('ref-flow-api-keys', JSON.stringify(parsed));
-    }
-    return parsed;
+    return Object.fromEntries(defaultProvidersOrder
+      .filter(provider => parsed[provider])
+      .map(provider => [provider, parsed[provider]]));
   });
-  const [configModalProvider, setConfigModalProvider] = useState<string | null>(null);
   const [showDiagnosticsModal, setShowDiagnosticsModal] = useState<boolean>(false);
-  const [configTestStatus, setConfigTestStatus] = useState<'idle' | 'testing' | 'success' | 'failed'>('idle');
   const [searchDiagnostics, setSearchDiagnostics] = useState<{lastSearch: Date | null, reqCount: number, resCount: number, errors: string[]}>({
     lastSearch: null,
     reqCount: 0,
@@ -2152,9 +2143,14 @@ export default function App() {
   });
 
   useEffect(() => {
+    localStorage.removeItem('ref-flow-api-keys');
+    localStorage.setItem('ref-flow-provider-order', JSON.stringify(providerOrder));
+    localStorage.setItem('ref-flow-provider-status', JSON.stringify(providerStatus));
+  }, []);
+
+  useEffect(() => {
     if (!showSettings) setShowProviderSettings(false);
     if (!showSettings || !showProviderSettings) {
-      setConfigModalProvider(null);
       setShowDiagnosticsModal(false);
     }
   }, [showProviderSettings, showSettings]);
@@ -2217,10 +2213,6 @@ export default function App() {
     }
   };
 
-  const updateApiKeys = (newKeys: Record<string, string>) => {
-    setApiKeys(newKeys);
-    localStorage.setItem('ref-flow-api-keys', JSON.stringify(newKeys));
-  };
   const updateProviderStatus = (newStatus: Record<string, { enabled: boolean, testStatus?: string }>) => {
     setProviderStatus(newStatus);
     localStorage.setItem('ref-flow-provider-status', JSON.stringify(newStatus));
@@ -2231,32 +2223,8 @@ export default function App() {
   };
 
   const getProviderConfig = (provider: string) => {
-    const isFree = provider === 'Wikimedia Commons' || provider === 'Openverse';
-    const isReady = isFree || (apiKeys[provider] && (providerStatus[provider]?.testStatus === 'success' || providerStatus[provider]?.testStatus === undefined));
-    const isFailed = providerStatus[provider]?.testStatus === 'failed';
     const isEnabled = providerStatus[provider]?.enabled ?? true;
-    const needsKey = (!isFree && !apiKeys[provider]) || (provider === 'Openverse' && false);
-
-    let badge = 'Ready';
-    if (!isEnabled) badge = 'Disabled';
-    else if (isFailed) badge = 'Connection Failed';
-    else if (needsKey) badge = 'API Key Required';
-
-    const getUrl = () => {
-      switch (provider) {
-        case 'Pixabay': return 'https://pixabay.com/api/docs/';
-        case 'Pexels': return 'https://www.pexels.com/api/';
-        case 'Unsplash': return 'https://unsplash.com/developers';
-        case 'SerpAPI': return 'https://serpapi.com';
-        case 'Openverse': return 'https://docs.openverse.org/api/reference.html';
-        case 'BingVisualSearch': return 'https://learn.microsoft.com/en-us/bing/search-apis/bing-visual-search/';
-        case 'TinEye': return 'https://tineye.com/developers';
-        case 'YandexImages': return 'https://yandex.com/dev/xml/';
-        default: return '';
-      }
-    };
-
-    return { isEnabled, badge, url: getUrl() };
+    return { isEnabled, badge: isEnabled ? 'Ready' : 'Disabled' };
   };
 
   const [shortcuts, setShortcuts] = useState(() => {
@@ -2401,17 +2369,7 @@ export default function App() {
   }, []);
 
   const openSupportPage = async () => {
-    const electron = getElectron();
-    if (electron?.ipcRenderer) {
-      try {
-        const opened = await electron.ipcRenderer.invoke('open-external-url', PATREON_URL);
-        if (opened) return;
-      } catch (error) {
-        console.warn('Could not open the support page in the default browser:', error);
-      }
-    }
-
-    window.open(PATREON_URL, '_blank', 'noopener,noreferrer');
+    await openInWindowsDefaultBrowser(PATREON_URL);
   };
 
   const requestUpdateCheck = async () => {
@@ -3132,6 +3090,27 @@ export default function App() {
   const hadSavedPillPositionRef = useRef(localStorage.getItem('ref-flow-pill-position') !== null);
   const [isDraggingPill, setIsDraggingPill] = useState(false);
   const dragStartPos = useRef({ x: 0, y: 0 });
+  const pillElementRef = useRef<HTMLDivElement>(null);
+  const pillDragActiveRef = useRef(false);
+  const pillDragOriginRef = useRef({ x: 0, y: 0 });
+  const pillDragPositionRef = useRef<{ x: number; y: number } | null>(null);
+  const pillFollowerOriginsRef = useRef<Array<{ element: HTMLElement; left: number; top: number }>>([]);
+
+  const previewImperativePillMove = useCallback((candidate: { x: number; y: number }) => {
+    pillDragPositionRef.current = candidate;
+    const pillElement = pillElementRef.current;
+    if (pillElement) {
+      pillElement.style.left = `${candidate.x}px`;
+      pillElement.style.top = `${candidate.y}px`;
+    }
+
+    const deltaX = candidate.x - pillDragOriginRef.current.x;
+    const deltaY = candidate.y - pillDragOriginRef.current.y;
+    for (const follower of pillFollowerOriginsRef.current) {
+      follower.element.style.left = `${follower.left + deltaX}px`;
+      follower.element.style.top = `${follower.top + deltaY}px`;
+    }
+  }, []);
 
   // Resizing the pill
   const [pillDimensions, setPillDimensions] = useState(() => {
@@ -3614,8 +3593,7 @@ export default function App() {
     const panels = {
       "Quick Reference Search": !!showSearchComponent,
       "Settings": !!showSettings,
-      "Search Providers": !!configModalProvider,
-      "API Configuration": !!configModalProvider,
+      "Search Providers": !!showProviderSettings,
       "Project Manager": !!showManager,
       "Diagnostics Modal": !!showDiagnosticsModal,
       "Search Context Menu": !!searchContextMenu,
@@ -3637,7 +3615,7 @@ export default function App() {
   }, [
     showSearchComponent,
     showSettings,
-    configModalProvider,
+    showProviderSettings,
     showManager,
     showDiagnosticsModal,
     searchContextMenu,
@@ -3751,7 +3729,7 @@ export default function App() {
     isRetracted,
     showSearchComponent,
     showSettings,
-    configModalProvider,
+    showProviderSettings,
     showManager,
     showDiagnosticsModal,
     searchContextMenu,
@@ -3775,10 +3753,26 @@ export default function App() {
   };
 
   const handlePillMouseDown = (e: React.MouseEvent) => {
+    if (e.button !== 0) return;
     if ((e.target as HTMLElement).closest('button')) {
       return;
     }
     if ((e.target as HTMLElement).closest('.drag-handle')) {
+      e.preventDefault();
+      e.stopPropagation();
+      pillDragActiveRef.current = true;
+      pillDragOriginRef.current = { ...position };
+      pillDragPositionRef.current = { ...position };
+      pillFollowerOriginsRef.current = Array.from(document.querySelectorAll<HTMLElement>('[data-pill-position-follower="true"]')).map(element => {
+        const rect = element.getBoundingClientRect();
+        const inlineLeft = Number.parseFloat(element.style.left);
+        const inlineTop = Number.parseFloat(element.style.top);
+        return {
+          element,
+          left: Number.isFinite(inlineLeft) ? inlineLeft : rect.left,
+          top: Number.isFinite(inlineTop) ? inlineTop : rect.top
+        };
+      });
       setIsDraggingPill(true);
       dragStartPos.current = {
         x: e.clientX - position.x,
@@ -3978,12 +3972,23 @@ export default function App() {
   };
 
   useEffect(() => {
+    let latestMouseEvent: MouseEvent | null = null;
+    let interactionFinished = false;
+
     const finishGlobalInteraction = () => {
+      interactionFinished = true;
       // Save pill dimensions if they were changed.
       if (isResizingPill) {
         localStorage.setItem('ref-flow-pill-dim-vert', JSON.stringify(pillDimensions));
       }
-      if (isDraggingPill || isResizingPill) {
+      if (pillDragActiveRef.current) {
+        pillDragActiveRef.current = false;
+        const nextPosition = clampPillToConnectedDisplay(pillDragPositionRef.current || pillDragOriginRef.current);
+        previewImperativePillMove(nextPosition);
+        setPosition(nextPosition);
+        pillDragPositionRef.current = null;
+        pillFollowerOriginsRef.current = [];
+      } else if (isResizingPill) {
         setPosition(current => clampPillToConnectedDisplay(current));
       }
 
@@ -3997,6 +4002,7 @@ export default function App() {
       setResizingNoteId(null);
       setDraggingSketchId(null);
       setResizingSketchId(null);
+      latestMouseEvent = null;
       ticking.current = false;
     };
 
@@ -4008,15 +4014,19 @@ export default function App() {
         finishGlobalInteraction();
         return;
       }
+      latestMouseEvent = e;
       if (ticking.current) return;
       ticking.current = true;
 
       requestAnimationFrame(() => {
         ticking.current = false;
+        if (interactionFinished) return;
+        const moveEvent = latestMouseEvent || e;
+        latestMouseEvent = null;
 
         if (isResizingPill) {
-          let diffX = e.clientX - resizePillStart.current.x;
-          let diffY = e.clientY - resizePillStart.current.y;
+          const diffX = moveEvent.clientX - resizePillStart.current.x;
+          const diffY = moveEvent.clientY - resizePillStart.current.y;
 
           if (isRetracted) {
             const sizeDelta = (diffX + diffY) / 2;
@@ -4029,11 +4039,10 @@ export default function App() {
           }
         }
 
-        if (isDraggingPill) {
-          let newX = e.clientX - dragStartPos.current.x;
-          let newY = e.clientY - dragStartPos.current.y;
-          
-          setPosition({ x: newX, y: newY });
+        if (isDraggingPill && pillDragActiveRef.current) {
+          const newX = moveEvent.clientX - dragStartPos.current.x;
+          const newY = moveEvent.clientY - dragStartPos.current.y;
+          previewImperativePillMove({ x: newX, y: newY });
         }
 
         const previewSnappedWindowMove = (rawX: number, rawY: number) => {
@@ -4044,7 +4053,7 @@ export default function App() {
             width: geometry.width,
             height: geometry.height
           };
-          const snapped = e.altKey
+          const snapped = moveEvent.altKey
             ? { ...movingRect, guideX: undefined, guideY: undefined }
             : snapWindowRect(
                 movingRect,
@@ -4063,20 +4072,20 @@ export default function App() {
         };
 
         if (draggingFloatingId) {
-          const rawX = e.clientX - dragFloatingOffset.current.x;
-          const rawY = e.clientY - dragFloatingOffset.current.y;
+          const rawX = moveEvent.clientX - dragFloatingOffset.current.x;
+          const rawY = moveEvent.clientY - dragFloatingOffset.current.y;
           previewSnappedWindowMove(rawX, rawY);
         }
 
         if (draggingNoteId) {
-          const rawX = e.clientX - dragNoteOffset.current.x;
-          const rawY = e.clientY - dragNoteOffset.current.y;
+          const rawX = moveEvent.clientX - dragNoteOffset.current.x;
+          const rawY = moveEvent.clientY - dragNoteOffset.current.y;
           previewSnappedWindowMove(rawX, rawY);
         }
 
         if (draggingSketchId) {
-          const rawX = e.clientX - dragSketchOffset.current.x;
-          const rawY = e.clientY - dragSketchOffset.current.y;
+          const rawX = moveEvent.clientX - dragSketchOffset.current.x;
+          const rawY = moveEvent.clientY - dragSketchOffset.current.y;
           previewSnappedWindowMove(rawX, rawY);
         }
 
@@ -4087,7 +4096,7 @@ export default function App() {
               const minimumHeight = isOfficeDocument(img.type) ? OFFICE_DOCUMENT_MIN_HEIGHT : FLOATING_MEDIA_MIN_HEIGHT;
               return {
                 ...img,
-                ...resizeWindowFromEdge(resizeStart.current, e.clientX, e.clientY, minimumWidth, minimumHeight)
+                ...resizeWindowFromEdge(resizeStart.current, moveEvent.clientX, moveEvent.clientY, minimumWidth, minimumHeight)
               };
             }
             return img;
@@ -4099,12 +4108,12 @@ export default function App() {
             if (note.id === resizingNoteId) {
               // Shift temporarily switches the saved resize mode, so both
               // free and proportional sizing are always available.
-              const keepAspectRatio = resizeNoteStart.current.lockAspectRatio !== e.shiftKey;
+              const keepAspectRatio = resizeNoteStart.current.lockAspectRatio !== moveEvent.shiftKey;
               return {
                 ...note,
                 ...(keepAspectRatio
-                  ? resizeWindowWithAspectRatio(resizeNoteStart.current, e.clientX, e.clientY, FLOATING_NOTE_MIN_WIDTH, FLOATING_NOTE_MIN_HEIGHT)
-                  : resizeWindowFromEdge(resizeNoteStart.current, e.clientX, e.clientY, FLOATING_NOTE_MIN_WIDTH, FLOATING_NOTE_MIN_HEIGHT))
+                  ? resizeWindowWithAspectRatio(resizeNoteStart.current, moveEvent.clientX, moveEvent.clientY, FLOATING_NOTE_MIN_WIDTH, FLOATING_NOTE_MIN_HEIGHT)
+                  : resizeWindowFromEdge(resizeNoteStart.current, moveEvent.clientX, moveEvent.clientY, FLOATING_NOTE_MIN_WIDTH, FLOATING_NOTE_MIN_HEIGHT))
               };
             }
             return note;
@@ -4116,7 +4125,7 @@ export default function App() {
             if (sketch.id === resizingSketchId) {
               return {
                 ...sketch,
-                ...resizeWindowFromEdge(resizeSketchStart.current, e.clientX, e.clientY, 200, 200)
+                ...resizeWindowFromEdge(resizeSketchStart.current, moveEvent.clientX, moveEvent.clientY, 200, 200)
               };
             }
             return sketch;
@@ -4139,13 +4148,14 @@ export default function App() {
       document.addEventListener('visibilitychange', handleVisibilityChange);
     }
     return () => {
+      interactionFinished = true;
       window.removeEventListener('mousemove', handleGlobalMouseMove);
       window.removeEventListener('mouseup', finishGlobalInteraction);
       window.removeEventListener('blur', finishGlobalInteraction);
       window.removeEventListener('mouseleave', handleWindowMouseLeave);
       document.removeEventListener('visibilitychange', handleVisibilityChange);
     };
-  }, [isResizingPill, isDraggingPill, draggingFloatingId, resizingFloatingId, draggingNoteId, resizingNoteId, draggingSketchId, resizingSketchId, pillDimensions, clampPillToConnectedDisplay, isRetracted, commitImperativeWindowMove, previewImperativeWindowMove]);
+  }, [isResizingPill, isDraggingPill, draggingFloatingId, resizingFloatingId, draggingNoteId, resizingNoteId, draggingSketchId, resizingSketchId, pillDimensions, clampPillToConnectedDisplay, isRetracted, commitImperativeWindowMove, previewImperativeWindowMove, previewImperativePillMove]);
 
   // Handle Drag & Drop of Images
   const [isDragOver, setIsDragOver] = useState(false);
@@ -4579,7 +4589,7 @@ export default function App() {
         }`} />
       )}
 
-      {!isLoading && floatingImages.length === 0 && floatingNotes.length === 0 && floatingSketches.length === 0 && !showManager && !showSearchComponent && !showSettings && (
+      {!isLoading && !hasAnyWorkspaceContent && !isEmptyBoardPromptDismissed && !showManager && !showSearchComponent && !showSettings && (
         <motion.div
           initial={{ opacity: 0, y: 8 }}
           animate={{ opacity: 1, y: 0 }}
@@ -4591,7 +4601,19 @@ export default function App() {
             height: emptyBoardBounds.height
           } : undefined}
         >
-          <div className={`pointer-events-auto w-full max-w-xl border rounded-2xl p-6 shadow-2xl backdrop-blur-xl ${theme === 'light' ? 'bg-white/85 border-black/10 text-slate-800' : 'bg-slate-950/75 border-white/10 text-slate-100'}`}>
+          <div
+            className={`pointer-events-auto relative w-full max-w-xl border rounded-2xl p-6 shadow-2xl backdrop-blur-xl ${theme === 'light' ? 'bg-white/85 border-black/10 text-slate-800' : 'bg-slate-950/75 border-white/10 text-slate-100'}`}
+            data-empty-board-prompt
+          >
+            <button
+              type="button"
+              onClick={() => setIsEmptyBoardPromptDismissed(true)}
+              className="absolute right-3 top-3 rounded-lg p-1.5 text-slate-400 transition-colors hover:bg-black/10 hover:text-slate-900 dark:hover:bg-white/10 dark:hover:text-white"
+              title="Close start board menu"
+              aria-label="Close start board menu"
+            >
+              <X className="h-4 w-4" />
+            </button>
             <div className="flex items-start gap-4">
               <div className="w-11 h-11 rounded-xl bg-sky-500/15 text-sky-400 flex items-center justify-center shrink-0">
                 <Palette className="w-5 h-5" />
@@ -4626,6 +4648,7 @@ export default function App() {
       <AnimatePresence initial={false}>
       {isPillVisible && (
         <motion.div 
+          ref={pillElementRef}
           initial={{ opacity: 0, scale: 0.92, y: 10 }}
           animate={{
             width: isRetracted ? retractedPillSize : pillDimensions.width,
@@ -4638,6 +4661,7 @@ export default function App() {
           transition={isResizingPill ? { duration: 0 } : { type: "tween", duration: 0.18, ease: [0.22, 1, 0.36, 1] }}
           className="absolute floating-window floating-pill pill-shell pointer-events-auto"
           data-id="pill"
+          data-pill-drag-rendering="imperative"
           style={{
             left: position.x,
             top: position.y,
@@ -4728,119 +4752,157 @@ export default function App() {
                      </div>
                    ) : (
                      <>
-                       {floatingImages.map((img) => (
-                         <div 
-                           key={img.id} 
-                           className={`relative group rounded-xl overflow-hidden border-2 transition-all cursor-pointer shrink-0 w-20 h-20 bg-black/20 flex items-center justify-center ${img.isCollapsed ? 'border-dashed border-slate-500/50 opacity-60' : 'border-transparent hover:border-sky-400'}`}
-                         >
-                           {img.type === 'pdf' || isOfficeDocument(img.type) ? (
-                              <div
-                               className="text-[10px] text-slate-400 font-mono text-center w-full h-full flex flex-col items-center justify-center" 
-                               onClick={() => {
-                                 setFloatingImages(prev => prev.map(f => f.id === img.id ? {...f, isCollapsed: false} : f));
-                                 setTopWindowId(img.id);
-                               }}
-                             >
-                                <FileText className={`w-5 h-5 mb-1 ${img.type === 'xlsx' ? 'text-emerald-400' : 'text-sky-400'}`} />
-                                <span className="text-[9px] truncate max-w-[70px]">{(img.type || 'file').toUpperCase()}</span>
-                             </div>
-                           ) : (
-                              <img
-                                src={img.url}
-                                className="w-full h-full object-cover"
-                                alt="Thumbnail"
-                                loading="lazy"
-                                decoding="async"
-                                draggable={false}
-                               onClick={() => {
-                                 setFloatingImages(prev => prev.map(f => f.id === img.id ? {...f, isCollapsed: false} : f));
-                                 setTopWindowId(img.id);
-                               }}
-                             />
-                           )}
-                           <div className="absolute top-1 right-1 opacity-0 group-hover:opacity-100 transition-opacity flex space-x-1">
-                             <button 
-                               onClick={(e) => { e.stopPropagation(); setFloatingImages(prev => prev.filter(f => f.id !== img.id)); }}
-                               className="bg-red-500 hover:bg-red-600 text-white p-1 rounded-md shadow-lg"
-                               title="Delete Permanently"
-                             >
-                               <Trash2 className="w-3 h-3" />
-                             </button>
-                           </div>
-                           {img.isCollapsed && (
-                             <div className="absolute inset-x-0 bottom-0 bg-slate-950/80 py-0.5 text-center pointer-events-none">
-                               <span className="text-[8px] text-sky-400 font-mono uppercase tracking-wider">minimized</span>
-                             </div>
-                           )}
-                         </div>
-                       ))}
-
-                       {floatingNotes.map((note) => (
-                         <div 
-                           key={note.id} 
-                           className={`relative group rounded-xl overflow-hidden border-2 transition-all cursor-pointer shrink-0 w-20 h-20 flex flex-col items-center justify-center p-2 ${note.isCollapsed ? 'border-dashed border-slate-500/50 bg-black/10 opacity-60' : 'border-transparent hover:border-sky-400'}`}
-                           style={{ backgroundColor: note.isCollapsed ? undefined : note.color || '#fef3c7' }}
-                         >
-                           <div 
-                             className="text-center w-full h-full flex flex-col items-center justify-center" 
+                       {floatingImages.map((img, mediaIndex) => {
+                         const previewType = img.type || 'image';
+                         const mediaLabel = img.fileName || `${previewType === 'image' ? 'Image' : previewType.toUpperCase()} ${mediaIndex + 1}`;
+                         return (
+                           <div
+                             key={img.id}
+                             className={`relative group rounded-xl overflow-hidden border-2 transition-all cursor-pointer shrink-0 w-20 h-20 bg-black/20 flex items-center justify-center ${img.isCollapsed ? 'border-dashed border-slate-500/50 opacity-60' : 'border-transparent hover:border-sky-400'}`}
+                             data-pill-preview-type={previewType}
+                             data-pill-label={mediaLabel}
+                             title={mediaLabel}
                              onClick={() => {
-                               setFloatingNotes(prev => prev.map(f => f.id === note.id ? {...f, isCollapsed: false} : f));
+                               setFloatingImages(prev => prev.map(f => f.id === img.id ? { ...f, isCollapsed: false } : f));
+                               setTopWindowId(img.id);
+                             }}
+                           >
+                             {img.type === 'pdf' ? (
+                               <PillPdfPreview media={img} />
+                             ) : isOfficeDocument(img.type) ? (
+                               <PillOfficePreview media={img} />
+                             ) : (
+                               <img
+                                 src={img.url}
+                                 className="w-full h-full object-cover"
+                                 alt={`${mediaLabel} preview`}
+                                 loading="lazy"
+                                 decoding="async"
+                                 draggable={false}
+                               />
+                             )}
+                             <div className="absolute inset-x-0 bottom-0 z-10 bg-slate-950/85 px-1 py-1 text-center pointer-events-none">
+                               <span className="block truncate text-[8px] font-medium text-white">{mediaLabel}</span>
+                             </div>
+                             {img.isCollapsed && (
+                               <div className="absolute left-1 top-1 z-20 rounded bg-sky-500/90 px-1 py-0.5 text-[6px] font-bold uppercase tracking-wide text-white pointer-events-none">min</div>
+                             )}
+                             <div className="absolute top-1 right-1 z-30 opacity-0 group-hover:opacity-100 transition-opacity flex space-x-1">
+                               <button
+                                 onClick={(e) => { e.stopPropagation(); setFloatingImages(prev => prev.filter(f => f.id !== img.id)); }}
+                                 className="bg-red-500 hover:bg-red-600 text-white p-1 rounded-md shadow-lg"
+                                 title="Delete Permanently"
+                               >
+                                 <Trash2 className="w-3 h-3" />
+                               </button>
+                             </div>
+                           </div>
+                         );
+                       })}
+
+                       {floatingNotes.map((note, noteIndex) => {
+                         const noteLabel = `Note ${noteIndex + 1}`;
+                         const notePreview = note.text.replace(/\s+/g, ' ').trim();
+                         return (
+                           <div
+                             key={note.id}
+                             className={`relative group rounded-xl overflow-hidden border-2 transition-all cursor-pointer shrink-0 w-20 h-20 ${note.isCollapsed ? 'border-dashed border-slate-500/50 opacity-60' : 'border-transparent hover:border-sky-400'}`}
+                             style={{ backgroundColor: note.color || '#fef3c7' }}
+                             data-pill-preview-type="note"
+                             data-pill-label={noteLabel}
+                             title={notePreview ? `${noteLabel}: ${notePreview}` : noteLabel}
+                             onClick={() => {
+                               setFloatingNotes(prev => prev.map(f => f.id === note.id ? { ...f, isCollapsed: false } : f));
                                setTopWindowId(note.id);
                              }}
                            >
-                             <FileText className={`w-5 h-5 mb-1 ${note.isCollapsed ? 'text-yellow-600/60' : 'text-slate-800'}`} />
-                             <span className={`text-[9px] font-medium truncate max-w-[70px] ${note.isCollapsed ? 'text-slate-400' : 'text-slate-800'}`}>
-                               {note.text || 'Note'}
-                             </span>
-                           </div>
-                           <div className="absolute top-1 right-1 opacity-0 group-hover:opacity-100 transition-opacity flex space-x-1">
-                             <button 
-                               onClick={(e) => { e.stopPropagation(); setFloatingNotes(prev => prev.filter(f => f.id !== note.id)); }}
-                               className="bg-red-500 hover:bg-red-600 text-white p-1 rounded-md shadow-lg"
-                               title="Delete Permanently"
-                             >
-                               <Trash2 className="w-3 h-3" />
-                             </button>
-                           </div>
-                           {note.isCollapsed && (
-                             <div className="absolute inset-x-0 bottom-0 bg-slate-950/80 py-0.5 text-center pointer-events-none">
-                               <span className="text-[8px] text-sky-400 font-mono uppercase tracking-wider">minimized</span>
+                             <div className="h-full w-full overflow-hidden px-2 pb-6 pt-2 text-left text-[7px] font-medium leading-[9px] text-slate-800">
+                               {notePreview || (
+                                 <div className="flex h-full flex-col items-center justify-center gap-1 text-slate-500">
+                                   <FileText className="h-5 w-5" />
+                                   <span>Empty note</span>
+                                 </div>
+                               )}
                              </div>
-                           )}
-                         </div>
-                       ))}
+                             <div className="absolute inset-x-0 bottom-0 z-10 bg-slate-950/85 px-1 py-1 text-center pointer-events-none">
+                               <span className="block truncate text-[8px] font-medium text-white">{noteLabel}</span>
+                             </div>
+                             {note.isCollapsed && (
+                               <div className="absolute left-1 top-1 z-20 rounded bg-sky-500/90 px-1 py-0.5 text-[6px] font-bold uppercase tracking-wide text-white pointer-events-none">min</div>
+                             )}
+                             <div className="absolute top-1 right-1 z-30 opacity-0 group-hover:opacity-100 transition-opacity flex space-x-1">
+                               <button
+                                 onClick={(e) => { e.stopPropagation(); setFloatingNotes(prev => prev.filter(f => f.id !== note.id)); }}
+                                 className="bg-red-500 hover:bg-red-600 text-white p-1 rounded-md shadow-lg"
+                                 title="Delete Permanently"
+                               >
+                                 <Trash2 className="w-3 h-3" />
+                               </button>
+                             </div>
+                           </div>
+                         );
+                       })}
 
-                       {floatingSketches.map((sketch) => (
-                         <div 
-                           key={sketch.id} 
-                           className={`relative group rounded-xl overflow-hidden border-2 transition-all cursor-pointer shrink-0 w-20 h-20 bg-black/20 flex items-center justify-center ${sketch.isCollapsed ? 'border-dashed border-slate-500/50 opacity-60' : 'border-transparent hover:border-sky-400'}`}
-                         >
-                           <div 
-                             className="text-center w-full h-full flex flex-col items-center justify-center" 
+                       {floatingSketches.map((sketch, sketchIndex) => {
+                         const sketchLabel = `Sketch ${sketchIndex + 1}`;
+                         return (
+                           <div
+                             key={sketch.id}
+                             className={`relative group rounded-xl overflow-hidden border-2 transition-all cursor-pointer shrink-0 w-20 h-20 bg-black/20 flex items-center justify-center ${sketch.isCollapsed ? 'border-dashed border-slate-500/50 opacity-60' : 'border-transparent hover:border-sky-400'}`}
+                             data-pill-preview-type="sketch"
+                             data-pill-label={sketchLabel}
+                             title={sketchLabel}
                              onClick={() => {
-                               setFloatingSketches(prev => prev.map(f => f.id === sketch.id ? {...f, isCollapsed: false} : f));
+                               setFloatingSketches(prev => prev.map(f => f.id === sketch.id ? { ...f, isCollapsed: false } : f));
                                setTopWindowId(sketch.id);
                              }}
                            >
-                             <PenTool className="w-5 h-5 mb-1 text-purple-400" />
-                             <span className="text-[9px] font-medium truncate max-w-[70px] text-slate-400">Sketch</span>
-                           </div>
-                           <div className="absolute top-1 right-1 opacity-0 group-hover:opacity-100 transition-opacity flex space-x-1">
-                             <button 
-                               onClick={(e) => { e.stopPropagation(); setFloatingSketches(prev => prev.filter(f => f.id !== sketch.id)); }}
-                               className="bg-red-500 hover:bg-red-600 text-white p-1 rounded-md shadow-lg"
-                               title="Delete Permanently"
+                             <svg
+                               viewBox={`0 0 ${Math.max(1, sketch.width)} ${Math.max(1, sketch.height)}`}
+                               preserveAspectRatio="xMidYMid meet"
+                               className="h-full w-full pb-5"
+                               style={{ backgroundColor: sketch.backgroundColor }}
+                               aria-label={`${sketchLabel} preview`}
                              >
-                               <Trash2 className="w-3 h-3" />
-                             </button>
-                           </div>
-                           {sketch.isCollapsed && (
-                             <div className="absolute inset-x-0 bottom-0 bg-slate-950/80 py-0.5 text-center pointer-events-none">
-                               <span className="text-[8px] text-sky-400 font-mono uppercase tracking-wider">minimized</span>
+                               {sketch.lines.map((line, lineIndex) => line.points.length === 1 ? (
+                                 <circle
+                                   key={lineIndex}
+                                   cx={line.points[0].x}
+                                   cy={line.points[0].y}
+                                   r={line.width / 2}
+                                   fill={line.isEraser ? sketch.backgroundColor : line.color}
+                                 />
+                               ) : (
+                                 <path
+                                   key={lineIndex}
+                                   d={getSmoothStrokePath(line.points)}
+                                   fill="none"
+                                   stroke={line.isEraser ? sketch.backgroundColor : line.color}
+                                   strokeWidth={line.width}
+                                   strokeLinecap="round"
+                                   strokeLinejoin="round"
+                                 />
+                               ))}
+                             </svg>
+                             {sketch.lines.length === 0 && <PenTool className="absolute h-5 w-5 text-purple-400" />}
+                             <div className="absolute inset-x-0 bottom-0 z-10 bg-slate-950/85 px-1 py-1 text-center pointer-events-none">
+                               <span className="block truncate text-[8px] font-medium text-white">{sketchLabel}</span>
                              </div>
-                           )}
-                         </div>
-                       ))}
+                             {sketch.isCollapsed && (
+                               <div className="absolute left-1 top-1 z-20 rounded bg-sky-500/90 px-1 py-0.5 text-[6px] font-bold uppercase tracking-wide text-white pointer-events-none">min</div>
+                             )}
+                             <div className="absolute top-1 right-1 z-30 opacity-0 group-hover:opacity-100 transition-opacity flex space-x-1">
+                               <button
+                                 onClick={(e) => { e.stopPropagation(); setFloatingSketches(prev => prev.filter(f => f.id !== sketch.id)); }}
+                                 className="bg-red-500 hover:bg-red-600 text-white p-1 rounded-md shadow-lg"
+                                 title="Delete Permanently"
+                               >
+                                 <Trash2 className="w-3 h-3" />
+                               </button>
+                             </div>
+                           </div>
+                         );
+                       })}
                      </>
                    )}
                  </div>
@@ -4949,6 +5011,7 @@ export default function App() {
             exit={{ opacity: 0, x: -10, scale: 0.95 }}
             transition={{ duration: 0.2 }}
                   className={`settings-panel light-contrast-panel absolute pointer-events-auto border p-5 rounded-[24px] shadow-2xl w-80 max-w-[calc(100vw-1rem)] text-sm font-sans z-[99999] ${theme === 'light' ? 'bg-white border-black/10 text-slate-900' : 'bg-[#1e1e24] border-white/10 text-slate-200'}`}
+            data-pill-position-follower="true"
             style={{
               top: position.y,
               left: position.x + (isRetracted ? retractedPillSize : pillDimensions.width) + 16,
@@ -5099,14 +5162,14 @@ export default function App() {
                 type="button"
                 onClick={() => setShowProviderSettings(true)}
                 className={`w-full flex items-center gap-3 rounded-xl border p-3 text-left transition-colors ${theme === 'light' ? 'border-black/10 bg-black/[0.03] hover:bg-black/[0.07]' : 'border-white/10 bg-white/[0.04] hover:bg-white/[0.08]'}`}
-                title="Manage Search Providers and API keys"
+                title="Manage no-key search sources"
               >
                 <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-sky-500/15 text-sky-500">
                   <Search className="h-4 w-4" />
                 </div>
                 <div className="min-w-0 flex-1">
                   <span className="block text-[11px] font-semibold text-slate-900 dark:text-slate-100">Search Providers</span>
-                  <span className="block text-[9px] leading-4 text-slate-500 dark:text-slate-400">API keys, order, connection tests, and diagnostics</span>
+                  <span className="block text-[9px] leading-4 text-slate-500 dark:text-slate-400">No-key sources, fallback order, and diagnostics</span>
                 </div>
                 <ChevronRight className="h-4 w-4 shrink-0 text-slate-400" />
               </button>
@@ -5223,6 +5286,7 @@ export default function App() {
             exit={{ opacity: 0, x: 10, scale: 0.96 }}
             transition={{ duration: 0.18 }}
             className={`settings-panel provider-settings-panel light-contrast-panel absolute pointer-events-auto border p-5 rounded-[24px] shadow-2xl w-72 text-sm font-sans z-[99999] ${theme === 'light' ? 'bg-white border-black/10 text-slate-900' : 'bg-[#1e1e24] border-white/10 text-slate-200'}`}
+            data-pill-position-follower="true"
             style={{
               top: position.y,
               left: position.x + (isRetracted ? retractedPillSize : pillDimensions.width) + 16,
@@ -5258,17 +5322,13 @@ export default function App() {
             </div>
 
             <p className="mb-3 text-[10px] leading-4 text-slate-500 dark:text-slate-400">
-              Enable providers, change fallback order, and configure API access without crowding the main settings menu.
+              RefFlow now uses only no-key in-app sources. Enable them or change their fallback order here.
             </p>
 
             <div className="space-y-2 max-h-[75vh] overflow-y-auto no-scrollbar pr-0.5">
               {providerOrder.map((provider, index) => {
                 const conf = getProviderConfig(provider);
-                const providerLabel = provider === 'BingVisualSearch'
-                  ? 'Bing Visual Search'
-                  : provider === 'YandexImages'
-                    ? 'Yandex Images'
-                    : provider;
+                const providerLabel = provider;
                 return (
                   <div key={provider} className="flex flex-col gap-1.5 bg-slate-100 dark:bg-black/10 border border-slate-300 dark:border-white/5 p-2 rounded-lg" data-provider={provider}>
                     <div className="flex items-center justify-between gap-2">
@@ -5318,24 +5378,11 @@ export default function App() {
                       <span className={`text-[9px] font-mono ${
                         conf.badge === 'Ready'
                           ? 'text-green-700 dark:text-green-400'
-                          : conf.badge === 'API Key Required'
-                            ? 'text-amber-700 dark:text-amber-400'
-                            : conf.badge === 'Disabled'
-                              ? 'text-slate-700 dark:text-slate-400'
-                              : 'text-red-700 dark:text-red-400'
+                          : 'text-slate-700 dark:text-slate-400'
                       }`}>
                         {conf.badge}
                       </span>
-                      {provider !== 'Wikimedia Commons' && (
-                        <button
-                          type="button"
-                          onClick={() => { setConfigModalProvider(provider); setConfigTestStatus('idle'); }}
-                          className="text-[9px] text-slate-800 dark:text-slate-300 hover:text-slate-950 dark:hover:text-white px-2 py-0.5 bg-white dark:bg-white/5 hover:bg-slate-200 dark:hover:bg-white/10 border border-slate-300 dark:border-white/10 rounded transition-colors"
-                          title={`Configure ${providerLabel} API access`}
-                        >
-                          Configure
-                        </button>
-                      )}
+                      <span className="text-[8px] uppercase tracking-wide text-sky-600 dark:text-sky-400">No API key</span>
                     </div>
                   </div>
                 );
@@ -5345,137 +5392,6 @@ export default function App() {
         )}
       </AnimatePresence>
 
-      <AnimatePresence>
-        {configModalProvider && showSettings && showProviderSettings && (
-          <motion.div 
-            initial={{ opacity: 0, scale: 0.95 }}
-            animate={{ opacity: 1, scale: 1 }}
-            exit={{ opacity: 0, scale: 0.95 }}
-            className={`absolute pointer-events-auto border p-5 rounded-[24px] shadow-2xl w-72 text-sm font-sans z-[100000] flex flex-col ${theme === 'light' ? 'bg-white border-black/10 text-slate-800' : 'bg-[#1e1e24] border-white/10 text-slate-200'}`}
-            style={{
-              top: position.y,
-              left: position.x + (isRetracted ? retractedPillSize : pillDimensions.width) + 16 + 280,
-            }}
-          >
-            <div className={`flex items-center justify-between mb-4 pb-2 border-b ${theme === 'light' ? 'border-black/10' : 'border-white/10'}`}>
-              <h3 className="font-bold uppercase tracking-widest text-[11px] text-slate-400">
-                Configure {configModalProvider === 'BingVisualSearch' ? 'Bing Visual Search' : configModalProvider === 'YandexImages' ? 'Yandex Images' : configModalProvider}
-              </h3>
-              <button onClick={() => setConfigModalProvider(null)} className="text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white p-1 hover:bg-black/10 dark:hover:bg-white/10 rounded">
-                <X className="w-4 h-4" />
-              </button>
-            </div>
-            
-            <div className="space-y-4">
-              <div className="space-y-1">
-                <label className="text-[10px] text-slate-400 uppercase tracking-widest">API Key</label>
-                <div className="relative">
-                  <input
-                    type="password"
-                    id="provider-api-key-input"
-                    defaultValue={apiKeys[configModalProvider] || ''}
-                    className="w-full bg-black/5 dark:bg-black/20 border border-black/10 dark:border-white/10 text-sm p-2 rounded-lg text-slate-800 dark:text-slate-200 pr-8 outline-none focus:border-sky-500 font-mono"
-                    placeholder="Enter API Key..."
-                  />
-                  <button 
-                    onClick={() => {
-                        const el = document.getElementById('provider-api-key-input') as HTMLInputElement;
-                        if (el) el.type = el.type === 'password' ? 'text' : 'password';
-                    }}
-                    className="absolute right-2 top-2 text-slate-500 hover:text-slate-300"
-                  >
-                    <Eye className="w-4 h-4" />
-                  </button>
-                </div>
-              </div>
-
-              <div className="flex flex-col gap-2 pt-2">
-                <button 
-                    onClick={async () => {
-                        const el = document.getElementById('provider-api-key-input') as HTMLInputElement;
-                        if (!el || !configModalProvider) return;
-                        const key = el.value.trim();
-                        setConfigTestStatus('testing');
-                        try {
-                            let url = '';
-                            let headers = {};
-                            if (configModalProvider === 'Pixabay') url = `https://pixabay.com/api/?key=${key}&q=test&per_page=3`;
-                            else if (configModalProvider === 'Unsplash') { url = `https://api.unsplash.com/search/photos?query=test&per_page=1`; headers = { 'Authorization': `Client-ID ${key}` }; }
-                            else if (configModalProvider === 'Pexels') { url = `https://api.pexels.com/v1/search?query=test&per_page=1`; headers = { 'Authorization': key }; }
-                            else if (configModalProvider === 'SerpAPI') { url = `https://serpapi.com/search.json?engine=google_images&q=test&api_key=${key}`; }
-                            else if (configModalProvider === 'Openverse') { url = `https://api.openverse.org/v1/images/?q=test`; headers = { 'Authorization': `Bearer ${key}` }; }
-                            else if (configModalProvider === 'BingVisualSearch' || configModalProvider === 'TinEye' || configModalProvider === 'YandexImages') {
-                                // Direct browser testing to these APIs is blocked by CORS, so we perform high-confidence structural key validation
-                                if (key.length >= 10) {
-                                    setConfigTestStatus('success');
-                                    updateProviderStatus({ ...providerStatus, [configModalProvider]: { enabled: true, testStatus: 'success' }});
-                                } else {
-                                    setConfigTestStatus('failed');
-                                }
-                                return;
-                            }
-                            
-                            if (url) {
-                                const res = await fetch(url, { headers });
-                                if (res.ok) {
-                                    setConfigTestStatus('success');
-                                    updateProviderStatus({ ...providerStatus, [configModalProvider]: { enabled: true, testStatus: 'success' }});
-                                } else setConfigTestStatus('failed');
-                            } else {
-                                setConfigTestStatus('success');
-                                updateProviderStatus({ ...providerStatus, [configModalProvider]: { enabled: true, testStatus: 'success' }});
-                            }
-                        } catch (e) {
-                            setConfigTestStatus('failed');
-                        }
-                    }}
-                    className={`text-white py-1.5 rounded-lg text-xs font-semibold transition-colors flex items-center justify-center gap-2 ${configTestStatus === 'success' ? 'bg-green-500 hover:bg-green-600' : configTestStatus === 'failed' ? 'bg-red-500 hover:bg-red-600' : 'bg-slate-700 hover:bg-slate-600'}`}
-                >
-                  {configTestStatus === 'testing' ? <Loader2 className="w-4 h-4 animate-spin" /> : 
-                   configTestStatus === 'success' ? <><span>Connection OK</span></> : 
-                   configTestStatus === 'failed' ? <><span>Connection Failed</span></> : 
-                   'Test Connection'}
-                </button>
-                <button 
-                    onClick={() => {
-                        const el = document.getElementById('provider-api-key-input') as HTMLInputElement;
-                        if (el) {
-                            updateApiKeys({ ...apiKeys, [configModalProvider]: el.value.trim() });
-                            setConfigModalProvider(null);
-                        }
-                    }}
-                    className="bg-sky-500 hover:bg-sky-600 text-white py-1.5 rounded-lg text-xs font-semibold transition-colors"
-                >
-                  Save Config
-                </button>
-                <div className="flex gap-2">
-                    <button 
-                        onClick={() => {
-                            const conf = getProviderConfig(configModalProvider);
-                            if (conf.url) window.open(conf.url, '_blank');
-                        }}
-                        className="flex-1 bg-black/5 dark:bg-white/5 hover:bg-black/10 dark:hover:bg-white/10 text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white py-1.5 rounded-lg text-[10px] transition-colors"
-                    >
-                      Developer Portal
-                    </button>
-                    <button 
-                        onClick={() => {
-                            const newKeys = { ...apiKeys };
-                            delete newKeys[configModalProvider];
-                            updateApiKeys(newKeys);
-                            const el = document.getElementById('provider-api-key-input') as HTMLInputElement;
-                            if (el) el.value = '';
-                        }}
-                        className="flex-1 bg-red-500/10 hover:bg-red-500/20 text-red-400 py-1.5 rounded-lg text-[10px] transition-colors"
-                    >
-                      Clear
-                    </button>
-                </div>
-              </div>
-            </div>
-          </motion.div>
-        )}
-      </AnimatePresence>
 
       <AnimatePresence>
         {showDiagnosticsModal && showSettings && showProviderSettings && (
@@ -5484,6 +5400,7 @@ export default function App() {
             animate={{ opacity: 1, scale: 1 }}
             exit={{ opacity: 0, scale: 0.95 }}
             className={`absolute pointer-events-auto border p-5 rounded-[24px] shadow-2xl w-80 text-sm font-sans z-[100000] flex flex-col ${theme === 'light' ? 'bg-white border-black/10 text-slate-800' : 'bg-[#1e1e24] border-white/10 text-slate-200'}`}
+            data-pill-position-follower="true"
             style={{
               top: position.y,
               left: position.x + (isRetracted ? retractedPillSize : pillDimensions.width) + 16 + 280,
@@ -5501,7 +5418,7 @@ export default function App() {
                 <span className="text-[10px] uppercase text-slate-500 block mb-1">Active Providers</span>
                 <div className="space-y-1 text-slate-700 dark:text-slate-300 font-mono text-[10px]">
                     {providerOrder.filter(p => getProviderConfig(p).isEnabled).map(p => (
-                        <div key={p}>- {p} {getProviderConfig(p).badge === 'API Key Required' ? '(Missing Key)' : ''}</div>
+                        <div key={p}>- {p}</div>
                     ))}
                 </div>
               </div>
@@ -5546,6 +5463,7 @@ export default function App() {
             exit={{ opacity: 0, x: -10, scale: 0.95 }}
             transition={{ duration: 0.2 }}
             className={`absolute pointer-events-auto border p-5 rounded-[24px] shadow-2xl w-[450px] text-sm font-sans z-[99999] overflow-hidden flex flex-col max-h-[85vh] ${theme === 'light' ? 'bg-white border-black/10 text-slate-800' : 'bg-[#1e1e24] border-white/10 text-slate-200'}`}
+            data-pill-position-follower="true"
             style={{
               top: position.y,
               left: position.x + (isRetracted ? retractedPillSize : pillDimensions.width) + 16,
@@ -5607,9 +5525,7 @@ export default function App() {
                                 let statusLabel = '';
                                 if (p !== 'All Native') {
                                     const conf = getProviderConfig(p);
-                                    if (conf.badge === 'API Key Required') statusLabel = '[key]';
-                                    else if (!conf.isEnabled) statusLabel = '[off]';
-                                    else if (conf.badge === 'Connection Failed') statusLabel = '[!]';
+                                    if (!conf.isEnabled) statusLabel = '[off]';
                                 }
                                 
                                 return (
@@ -5617,7 +5533,7 @@ export default function App() {
                                     key={p}
                                     onClick={() => setSearchProvider(p)}
                                     className={`px-2 py-1 rounded-md text-[10px] font-medium transition-colors flex items-center justify-center gap-1 ${searchProvider === p ? 'bg-sky-500 text-white' : 'bg-black/5 dark:bg-white/5 text-slate-500 dark:text-slate-400 hover:bg-black/10 dark:hover:bg-white/10 hover:text-slate-900 dark:hover:text-white'} ${statusLabel === '[off]' ? 'opacity-50' : ''}`}
-                                    title={statusLabel === '[key]' ? 'API Key Required' : statusLabel === '[off]' ? 'Disabled in Settings' : statusLabel === '[!]' ? 'Connection Failed' : 'Ready'}
+                                    title={statusLabel === '[off]' ? 'Disabled in Settings' : 'Ready without an API key'}
                                     disabled={statusLabel === '[off]'}
                                 >
                                     {p} {statusLabel}
@@ -5688,7 +5604,7 @@ export default function App() {
                     
                     {searchStatus === 'no-results' && (
                         <div className="flex items-center justify-center p-4 text-slate-500 text-xs text-center border border-white/5 rounded mx-2 my-4 bg-white/5">
-                             No usable results found.<br/>Check the logs panel below to see if providers require API keys or if there were network errors.
+                             No usable results found.<br/>Check the logs panel below for source or network errors.
                         </div>
                     )}
                     
@@ -5726,7 +5642,7 @@ export default function App() {
                                                 <Plus className="w-3 h-3" />
                                             </button>
                                             <button 
-                                                onClick={() => window.open(res.url, '_blank')}
+                                                onClick={() => void openInWindowsDefaultBrowser(res.url)}
                                                 className="bg-slate-700 hover:bg-slate-600 text-white p-1.5 rounded"
                                                 title="Open Original"
                                             >
@@ -5776,7 +5692,7 @@ export default function App() {
                   </button>
                   <button 
                       className="w-full text-left px-4 py-2 hover:bg-sky-500 hover:text-white transition-colors text-xs flex items-center gap-2"
-                      onClick={() => { window.open(searchContextMenu.result.url, '_blank'); setSearchContextMenu(null); }}
+                      onClick={() => { void openInWindowsDefaultBrowser(searchContextMenu.result.url); setSearchContextMenu(null); }}
                   >
                       <LinkIcon className="w-3 h-3" /> Open Original Page
                   </button>
@@ -5808,6 +5724,8 @@ export default function App() {
       <AnimatePresence>
          {floatingContextMenu && (() => {
            const hasElectron = !!((window as any).require);
+           const isTextDocument = floatingContextMenu.type === 'pdf' || isOfficeDocument(floatingContextMenu.type);
+           const canCopySelection = Boolean(floatingContextMenu.selectedText?.length);
            return (
               <motion.div 
                   initial={{ opacity: 0, scale: 0.95 }}
@@ -5825,6 +5743,26 @@ export default function App() {
                   }}
                   onClick={(e) => e.stopPropagation()}
               >
+                  {isTextDocument && (
+                    <>
+                      <button
+                        type="button"
+                        disabled={!canCopySelection}
+                        className="context-menu-button w-full text-left px-4 py-2 hover:bg-sky-500 hover:text-white transition-colors text-xs flex items-center gap-2 disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent disabled:hover:text-inherit"
+                        title="Copy selected text"
+                        data-document-context-copy
+                        onClick={async () => {
+                          if (!floatingContextMenu.selectedText) return;
+                          await writeTextToSystemClipboard(floatingContextMenu.selectedText);
+                          setFloatingContextMenu(null);
+                        }}
+                      >
+                        <Copy className="h-3 w-3" /> Copy selected text
+                      </button>
+                      <div className={`my-1 border-t ${theme === 'light' ? 'border-black/10' : 'border-white/10'}`} />
+                    </>
+                  )}
+
                   {/* Reveal in Explorer */}
                   <button 
                       className={`w-full text-left px-4 py-2 transition-colors text-xs flex items-center gap-2 ${
@@ -5960,7 +5898,15 @@ export default function App() {
                setTopWindowId(img.id);
                setContextMenuTempPath('');
                applyCentralizedIgnoreMouseEvents(false);
-               setFloatingContextMenu({ x: e.clientX, y: e.clientY, id: img.id, url: img.url, type: img.type || 'image', fileName: img.fileName });
+               setFloatingContextMenu({
+                 x: e.clientX,
+                 y: e.clientY,
+                 id: img.id,
+                 url: img.url,
+                 type: img.type || 'image',
+                 fileName: img.fileName,
+                 selectedText: getSelectedDocumentText(e.target)
+               });
             }}
             style={{
               left: img.x,

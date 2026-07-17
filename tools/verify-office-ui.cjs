@@ -107,6 +107,12 @@ async function main() {
     });
     await page.goto(ORIGIN, { waitUntil: 'networkidle0' });
     const consoleCounts = { afterLoad: consoleErrorPromises.length };
+    await page.waitForSelector('[data-empty-board-prompt]');
+    await page.click('button[aria-label="Close start board menu"]');
+    await page.waitForFunction(() => !document.querySelector('[data-empty-board-prompt]'));
+    assert.ok(await page.$('.floating-pill'), 'Closing the welcome menu should leave the pill available.');
+    consoleCounts.afterWelcomeDismiss = consoleErrorPromises.length;
+
     const dragWindowTo = async (windowElement, dragElement, targetX, targetY, options = {}) => {
       const { alt = false, duringDrag } = options;
       const windowBox = await windowElement.boundingBox();
@@ -147,6 +153,22 @@ async function main() {
     await page.waitForSelector('textarea[aria-label="Editable Word document text"]', { timeout: 20_000 });
     await page.waitForSelector('input[aria-label="Budget cell A1"]', { timeout: 20_000 });
     await page.waitForSelector('.pdf-text-layer span', { timeout: 20_000 });
+    await page.waitForSelector('[data-pill-preview-type="pdf"][data-pill-label="sample.pdf"] [data-preview-status="ready"]', { timeout: 20_000 });
+    await page.waitForSelector('[data-pill-preview-type="docx"][data-pill-label="sample.docx"] [data-preview-status="ready"]', { timeout: 20_000 });
+    await page.waitForSelector('[data-pill-preview-type="xlsx"][data-pill-label="sample.xlsx"] [data-preview-status="ready"]', { timeout: 20_000 });
+    await page.waitForFunction(() => {
+      const docxPreview = document.querySelector('[data-pill-preview-type="docx"]');
+      const xlsxPreview = document.querySelector('[data-pill-preview-type="xlsx"]');
+      return docxPreview?.textContent?.includes('RefFlow Word fixture') && xlsxPreview?.textContent?.includes('Category');
+    }, { timeout: 20_000 });
+    const pillDocumentPreviews = await page.$$eval('[data-pill-preview-type="pdf"], [data-pill-preview-type="docx"], [data-pill-preview-type="xlsx"]', elements => elements.map(element => ({
+      type: element.getAttribute('data-pill-preview-type'),
+      label: element.getAttribute('data-pill-label'),
+      hasCanvas: Boolean(element.querySelector('canvas')),
+      text: element.textContent
+    })));
+    assert.deepStrictEqual(pillDocumentPreviews.map(preview => preview.label).sort(), ['sample.docx', 'sample.pdf', 'sample.xlsx']);
+    assert.ok(pillDocumentPreviews.find(preview => preview.type === 'pdf')?.hasCanvas, 'PDF pill items should render a first-page preview.');
     consoleCounts.afterOfficeLoad = consoleErrorPromises.length;
 
     const initialDocxText = await page.$eval('textarea[aria-label="Editable Word document text"]', element => element.value);
@@ -288,15 +310,47 @@ async function main() {
     const copiedDocxText = await page.evaluate(() => window.__refflowCopiedText);
     assert.match(copiedDocxText, /Edited inside RefFlow/);
 
+    const copySelectionFromContextMenu = async expectedText => {
+      await page.waitForSelector('button[data-document-context-copy]:not([disabled])');
+      await page.$eval('button[data-document-context-copy]', button => button.click());
+      await page.waitForFunction(() => !document.querySelector('button[data-document-context-copy]'));
+      const copiedText = await page.evaluate(() => window.__refflowCopiedText);
+      assert.strictEqual(copiedText, expectedText);
+    };
+
+    const selectedDocxText = await page.$eval('textarea[aria-label="Editable Word document text"]', element => {
+      const expected = 'RefFlow Word fixture';
+      const start = element.value.indexOf(expected);
+      element.focus();
+      element.setSelectionRange(start, start + expected.length);
+      window.__refflowCopiedText = '';
+      element.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 720, clientY: 360 }));
+      return expected;
+    });
+    await copySelectionFromContextMenu(selectedDocxText);
+
+    const selectedXlsxText = await page.$eval('input[aria-label="Budget cell A1"]', element => {
+      const expected = element.value;
+      element.focus();
+      element.setSelectionRange(0, expected.length);
+      window.__refflowCopiedText = '';
+      element.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 780, clientY: 390 }));
+      return expected;
+    });
+    await copySelectionFromContextMenu(selectedXlsxText);
+
     const selectedPdfText = await page.$eval('.pdf-text-layer span', element => {
       const range = document.createRange();
       range.selectNodeContents(element);
       const selection = window.getSelection();
       selection.removeAllRanges();
       selection.addRange(range);
+      window.__refflowCopiedText = '';
+      element.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 820, clientY: 420 }));
       return selection.toString();
     });
     assert.ok(selectedPdfText.length > 0, 'PDF text should be selectable.');
+    await copySelectionFromContextMenu(selectedPdfText);
 
     const pdfWindowHandle = await page.$('.pdf-text-layer');
     const pdfFloatingWindow = await pdfWindowHandle.evaluateHandle(element => element.closest('.floating-window'));
@@ -317,16 +371,22 @@ async function main() {
     consoleCounts.afterDocumentChecks = consoleErrorPromises.length;
 
     await page.click('button[title="Settings"]');
-    await page.waitForSelector('button[title="Manage Search Providers and API keys"]');
+    await page.waitForSelector('button[title="Manage no-key search sources"]');
     const mainSettingsProviderCards = await page.$$eval('.settings-panel [data-provider]', elements => elements.length);
     assert.strictEqual(mainSettingsProviderCards, 0, 'Provider cards should not lengthen the main Settings menu.');
-    await page.click('button[title="Manage Search Providers and API keys"]');
+    await page.click('button[title="Manage no-key search sources"]');
     await page.waitForSelector('[data-settings-section="providers"]');
     const providerMenuState = await page.$eval('[data-settings-section="providers"]', element => ({
       providerCards: element.querySelectorAll('[data-provider]').length,
-      hasShortcutEditor: Boolean(element.querySelector('input[aria-label="Minimize/Expand pill shortcut"]'))
+      providers: Array.from(element.querySelectorAll('[data-provider]')).map(card => card.getAttribute('data-provider')).sort(),
+      hasShortcutEditor: Boolean(element.querySelector('input[aria-label="Minimize/Expand pill shortcut"]')),
+      hasApiKeyField: Boolean(element.querySelector('#provider-api-key-input')),
+      configureButtons: Array.from(element.querySelectorAll('button')).filter(button => /configure/i.test(button.textContent || '')).length
     }));
-    assert.strictEqual(providerMenuState.providerCards, 9);
+    assert.strictEqual(providerMenuState.providerCards, 2);
+    assert.deepStrictEqual(providerMenuState.providers, ['Openverse', 'Wikimedia Commons']);
+    assert.strictEqual(providerMenuState.hasApiKeyField, false, 'No API-key controls should remain in Search Providers.');
+    assert.strictEqual(providerMenuState.configureButtons, 0, 'No provider should expose API configuration.');
     assert.strictEqual(providerMenuState.hasShortcutEditor, false, 'Search Providers should have its own focused menu.');
     await page.click('button[title="Back to Settings"]');
     await page.waitForSelector('input[aria-label="Minimize/Expand pill shortcut"]');
@@ -413,6 +473,14 @@ async function main() {
     const editNoteButton = await noteWindow.$('button[title="Edit Markdown"]');
     await editNoteButton.click();
     await page.waitForFunction(() => Boolean(document.querySelector('.floating-window[data-window-kind="note"] button[title="Preview Markdown"]')));
+    await noteWindow.$eval('textarea[placeholder^="Type a note"]', element => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set;
+      setter.call(element, 'Weekly layout note');
+      element.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    await page.waitForFunction(() => document.querySelector('[data-pill-preview-type="note"]')?.textContent?.includes('Weekly layout note'));
+    const notePillLabel = await page.$eval('[data-pill-preview-type="note"]', element => element.getAttribute('data-pill-label'));
+    assert.strictEqual(notePillLabel, 'Note 1');
     const previewNoteButton = await noteWindow.$('button[title="Preview Markdown"]');
     await previewNoteButton.click();
     const controlsAfterPreview = await noteWindow.$$eval('[data-note-format]', elements => elements.length);
@@ -487,6 +555,16 @@ async function main() {
     assert.strictEqual(sketchResizeFrame.visibleGripCount, 0, 'Sketch resize zones should have no visible grip graphics.');
     assert.strictEqual(sketchResizeFrame.frameCount, 1, 'Sketches should use one resize frame without duplicate handles.');
 
+    const sketchCanvas = await sketchWindow.$('canvas');
+    const sketchCanvasBox = await sketchCanvas.boundingBox();
+    await page.mouse.move(sketchCanvasBox.x + 70, sketchCanvasBox.y + 70);
+    await page.mouse.down();
+    await page.mouse.move(sketchCanvasBox.x + 145, sketchCanvasBox.y + 115, { steps: 6 });
+    await page.mouse.up();
+    await page.waitForSelector('[data-pill-preview-type="sketch"] svg path');
+    const sketchPillLabel = await page.$eval('[data-pill-preview-type="sketch"]', element => element.getAttribute('data-pill-label'));
+    assert.strictEqual(sketchPillLabel, 'Sketch 1');
+
     const sketchDragSpace = await sketchWindow.$('[data-sketch-drag-space]');
     const sketchDragSpaceBox = await sketchDragSpace.boundingBox();
     const sketchDragStart = await sketchWindow.boundingBox();
@@ -538,6 +616,44 @@ async function main() {
     const closeSketchButton = await sketchWindow.$('button[title="Close Sketch"]');
     await closeSketchButton.click();
     consoleCounts.afterSketches = consoleErrorPromises.length;
+
+    await page.evaluate(() => {
+      const originalSetItem = Storage.prototype.setItem;
+      window.__pillPositionWriteStats = { writes: 0 };
+      window.__restoreStorageSetItem = () => { Storage.prototype.setItem = originalSetItem; };
+      Storage.prototype.setItem = function (key, value) {
+        if (key === 'ref-flow-pill-position') window.__pillPositionWriteStats.writes++;
+        return originalSetItem.call(this, key, value);
+      };
+    });
+    const fastPillHandle = await page.$('.floating-pill .drag-handle');
+    const fastPillHandleBox = await fastPillHandle.boundingBox();
+    const fastPillStart = await page.$eval('.floating-pill', element => {
+      const rect = element.getBoundingClientRect();
+      return { x: rect.x, y: rect.y };
+    });
+    const fastPillDragStartedAt = Date.now();
+    await page.mouse.move(fastPillHandleBox.x + 8, fastPillHandleBox.y + 8);
+    await page.mouse.down();
+    await page.mouse.move(fastPillHandleBox.x + 148, fastPillHandleBox.y + 98, { steps: 90 });
+    await new Promise(resolve => setTimeout(resolve, 100));
+    const pillDuringFastDrag = await page.evaluate(() => {
+      const rect = document.querySelector('.floating-pill').getBoundingClientRect();
+      return { x: rect.x, y: rect.y, writes: window.__pillPositionWriteStats.writes };
+    });
+    assert.ok(pillDuringFastDrag.x - fastPillStart.x > 110 && pillDuringFastDrag.y - fastPillStart.y > 65, 'Fast pill movement should track the latest pointer position.');
+    assert.strictEqual(pillDuringFastDrag.writes, 0, 'Pill position should not rerender and persist the full workspace during mouse-move frames.');
+    await page.mouse.up();
+    await new Promise(resolve => setTimeout(resolve, 180));
+    const fastPillStats = await page.evaluate(() => {
+      const stats = { ...window.__pillPositionWriteStats };
+      window.__restoreStorageSetItem();
+      delete window.__restoreStorageSetItem;
+      return stats;
+    });
+    const fastPillDragDuration = Date.now() - fastPillDragStartedAt;
+    assert.ok(fastPillStats.writes <= 1, `Pill drag should commit at most once, but wrote ${fastPillStats.writes} times.`);
+    assert.ok(fastPillDragDuration < 3500, `Fast pill drag took too long (${fastPillDragDuration} ms).`);
 
     const pillBefore = await page.$eval('.floating-pill', element => element.getBoundingClientRect().x);
     const pillHandle = await page.$('.floating-pill .drag-handle');
@@ -623,6 +739,8 @@ async function main() {
     await startupPage.evaluateOnNewDocument(() => {
       window.__startupEnabled = true;
       window.__startupInvokeCalls = [];
+      localStorage.setItem('ref-flow-api-keys', JSON.stringify({ SerpAPI: 'legacy-key' }));
+      localStorage.setItem('ref-flow-provider-order', JSON.stringify(['SerpAPI', 'Openverse', 'Pixabay', 'Wikimedia Commons']));
       const ipcRenderer = {
         invoke: async (channel, ...args) => {
           window.__startupInvokeCalls.push([channel, ...args]);
@@ -649,6 +767,7 @@ async function main() {
           if (channel === 'get-update-status') return { phase: 'development', message: 'Test mode' };
           if (channel === 'get-display-layout') return null;
           if (channel === 'get-launch-context') return { shouldRevealPill: true };
+          if (channel === 'open-external-url') return true;
           return null;
         },
         send: () => {},
@@ -669,6 +788,23 @@ async function main() {
     await startupPage.waitForFunction(() => !document.querySelector('input[aria-label="Start on Boot"]')?.checked);
     const startupCalls = await startupPage.evaluate(() => window.__startupInvokeCalls);
     assert.ok(startupCalls.some(call => call[0] === 'set-start-on-boot' && call[1] === false), 'Start on Boot should wait for confirmed IPC registration changes.');
+    assert.strictEqual(await startupPage.evaluate(() => localStorage.getItem('ref-flow-api-keys')), null, 'The 1.0.6 migration should remove saved API keys.');
+    const migratedProviders = await startupPage.evaluate(() => JSON.parse(localStorage.getItem('ref-flow-provider-order') || '[]').sort());
+    assert.deepStrictEqual(migratedProviders, ['Openverse', 'Wikimedia Commons']);
+
+    await startupPage.click('button[title="Settings"]');
+    await startupPage.click('button[title="Quick Reference Search"]');
+    await startupPage.waitForSelector('input[placeholder="Search images..."]');
+    await startupPage.$$eval('button', buttons => {
+      const googleButton = buttons.find(button => button.textContent?.trim() === 'Google Images');
+      if (!googleButton) throw new Error('Google Images browser provider was not found.');
+      googleButton.click();
+    });
+    await startupPage.type('input[placeholder="Search images..."]', 'reference poses');
+    await startupPage.keyboard.press('Enter');
+    await startupPage.waitForFunction(() => window.__startupInvokeCalls.some(call => call[0] === 'open-external-url'));
+    const externalSearchCall = await startupPage.evaluate(() => window.__startupInvokeCalls.find(call => call[0] === 'open-external-url'));
+    assert.match(externalSearchCall[1], /^https:\/\/www\.google\.com\/search\?/);
     await startupPage.close();
 
     console.log(JSON.stringify({
@@ -676,18 +812,23 @@ async function main() {
       xlsx: 'view/edit/save passed',
       officeWindowMovement: 'DOCX and XLSX inner-header recovery dragging passed',
       officeWindowResize: 'bottom and bottom-corner resizing passed',
-      pdf: 'selectable text passed',
+      pdf: 'selectable text and compact first-page preview passed',
+      documentContextCopy: 'PDF, DOCX, and XLSX right-click copy passed',
+      pillDocumentPreviews: 'PDF, DOCX, and XLSX content previews with filenames passed',
+      welcomeMenu: 'dismissible empty-board welcome passed',
       universalMediaResize: 'all invisible edges and corners passed',
       shortcuts: 'custom modifier and unassign passed',
       shortcutLayout: 'wide non-overlapping settings layout passed',
-      notes: 'stable controls and free/proportional resize passed',
+      notes: 'stable controls, named pill preview, and free/proportional resize passed',
       noteMovement: 'empty toolbar drag surface, screen snapping, and Alt bypass passed',
       noteResizeFrame: 'all invisible edges and corners passed',
-      sketches: 'movement, neighboring-window snapping, and all invisible resize edges/corners passed',
+      sketches: 'drawn pill preview, movement, neighboring-window snapping, and all invisible resize edges/corners passed',
       documentControls: 'Reset label and rotate visibility passed',
-      providerSettings: 'dedicated submenu passed',
+      providerSettings: 'no-key provider migration and API-setting removal passed',
+      externalBrowserSearch: 'browser providers route through Windows external URL IPC',
       startOnBoot: 'verified IPC status and confirmed toggle passed',
-      pill: 'lost-release recovery passed',
+      pill: 'lost-release recovery and single-commit fast dragging passed',
+      fastPillDragMs: fastPillDragDuration,
       mediaToolbarDrag: 'empty toolbar drag surface passed',
       manyWindowDragMs: dragDuration
     }, null, 2));

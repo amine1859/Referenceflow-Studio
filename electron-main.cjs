@@ -825,9 +825,7 @@ ipcMain.handle('open-external-url', async (_event, targetUrl) => {
 
   try {
     const parsedUrl = new URL(targetUrl);
-    const isAllowedPatreonUrl = parsedUrl.protocol === 'https:' &&
-      (parsedUrl.hostname === 'patreon.com' || parsedUrl.hostname === 'www.patreon.com');
-    if (!isAllowedPatreonUrl) return false;
+    if (parsedUrl.protocol !== 'https:' && parsedUrl.protocol !== 'http:') return false;
 
     await shell.openExternal(parsedUrl.toString());
     return true;
@@ -997,23 +995,18 @@ function createWindow() {
   screen.on('display-removed', applyVirtualDisplayBounds);
   screen.on('display-metrics-changed', applyVirtualDisplayBounds);
 
-  // Allow child windows opened with window.open to share DOM/JavaScript context
-  mainWindow.webContents.setWindowOpenHandler(() => {
-    return {
-      action: 'allow',
-      overrideBrowserWindowOptions: {
-        frame: false,
-        transparent: true,
-        alwaysOnTop: true,
-        backgroundColor: '#00000000',
-        webPreferences: {
-          nodeIntegration: true,
-          contextIsolation: false,
-          sandbox: false,
-          webSecurity: false
-        }
+  // Links and browser-search providers belong in the user's normal browser,
+  // never in a second transparent RefFlow window.
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    try {
+      const parsedUrl = new URL(url);
+      if (parsedUrl.protocol === 'https:' || parsedUrl.protocol === 'http:') {
+        void shell.openExternal(parsedUrl.toString());
       }
-    };
+    } catch (error) {
+      console.warn('Blocked invalid child-window URL:', error);
+    }
+    return { action: 'deny' };
   });
 
   // Hide top menu bar for clean PureRef-like artistic focus flow
