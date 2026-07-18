@@ -178,6 +178,30 @@ async function main() {
     })));
     assert.deepStrictEqual(pillDocumentPreviews.map(preview => preview.label).sort(), ['sample.docx', 'sample.pdf', 'sample.xlsx']);
     assert.ok(pillDocumentPreviews.find(preview => preview.type === 'pdf')?.hasCanvas, 'PDF pill items should render a first-page preview.');
+    assert.strictEqual(await page.$$eval('[data-pill-preview-card] [data-preview-reorder-handle][data-reorder-kind="media"]', handles => handles.length), 3, 'Every pill media preview should expose a reorder grip.');
+    await page.evaluate(() => {
+      const cards = Array.from(document.querySelectorAll('[data-pill-preview-card]'));
+      const sourceCard = cards.find(card => card.getAttribute('data-pill-label') === 'sample.docx');
+      const targetCard = cards.find(card => card.getAttribute('data-pill-label') === 'sample.pdf');
+      const handle = sourceCard?.querySelector('[data-preview-reorder-handle][data-reorder-kind="media"]');
+      if (!sourceCard || !targetCard || !handle) throw new Error('Pill reorder fixtures were not found.');
+      const transfer = new DataTransfer();
+      handle.dispatchEvent(new DragEvent('dragstart', { dataTransfer: transfer, bubbles: true, cancelable: true }));
+      targetCard.dispatchEvent(new DragEvent('dragenter', { dataTransfer: transfer, bubbles: true, cancelable: true }));
+      targetCard.dispatchEvent(new DragEvent('dragover', { dataTransfer: transfer, bubbles: true, cancelable: true }));
+      targetCard.dispatchEvent(new DragEvent('drop', { dataTransfer: transfer, bubbles: true, cancelable: true }));
+      handle.dispatchEvent(new DragEvent('dragend', { dataTransfer: transfer, bubbles: true, cancelable: true }));
+    });
+    await page.waitForFunction(() => Array.from(document.querySelectorAll('[data-pill-preview-card]'))
+      .filter(card => ['docx', 'xlsx', 'pdf'].includes(card.getAttribute('data-pill-preview-type')))
+      .map(card => card.getAttribute('data-pill-label')).join('|') === 'sample.xlsx|sample.pdf|sample.docx');
+    assert.deepStrictEqual(
+      await page.$$eval('[data-pill-preview-card]', cards => cards
+        .filter(card => ['docx', 'xlsx', 'pdf'].includes(card.getAttribute('data-pill-preview-type')))
+        .map(card => card.getAttribute('data-pill-label'))),
+      ['sample.xlsx', 'sample.pdf', 'sample.docx'],
+      'Dragging a pill media grip should immediately change the persisted media order.'
+    );
     const pdfPillPreviewLayout = await page.$eval('[data-pill-preview-type="pdf"]', card => {
       const cardRect = card.getBoundingClientRect();
       const surface = card.querySelector('[data-pdf-preview-surface]');
@@ -555,6 +579,22 @@ async function main() {
     });
     await page.keyboard.press('Enter');
     await page.waitForSelector('[data-pill-preview-type="note"][data-pill-label="Layout notes"] [data-pill-note-name]');
+    await page.evaluate(() => {
+      const sourceCard = document.querySelector('[data-pill-preview-type="note"][data-pill-label="Layout notes"]');
+      const targetCard = document.querySelector('[data-pill-preview-type="xlsx"]');
+      const handle = sourceCard?.querySelector('[data-preview-reorder-handle][data-reorder-kind="note"]');
+      if (!sourceCard || !targetCard || !handle) throw new Error('Note reorder fixtures were not found.');
+      const transfer = new DataTransfer();
+      handle.dispatchEvent(new DragEvent('dragstart', { dataTransfer: transfer, bubbles: true, cancelable: true }));
+      targetCard.dispatchEvent(new DragEvent('dragover', { dataTransfer: transfer, bubbles: true, cancelable: true }));
+      targetCard.dispatchEvent(new DragEvent('drop', { dataTransfer: transfer, bubbles: true, cancelable: true }));
+      handle.dispatchEvent(new DragEvent('dragend', { dataTransfer: transfer, bubbles: true, cancelable: true }));
+    });
+    await page.waitForFunction(() => {
+      const cards = Array.from(document.querySelectorAll('.pill-preview-grid [data-pill-preview-card]'));
+      cards.sort((left, right) => Number(getComputedStyle(left).order) - Number(getComputedStyle(right).order));
+      return cards[0]?.getAttribute('data-pill-label') === 'Layout notes';
+    });
     const previewNoteButton = await noteWindow.$('button[title="Preview Markdown"]');
     await previewNoteButton.click();
     const controlsAfterPreview = await noteWindow.$$eval('[data-note-format]', elements => elements.length);
@@ -647,6 +687,22 @@ async function main() {
     });
     await page.keyboard.press('Enter');
     await page.waitForSelector('[data-pill-preview-type="sketch"][data-pill-label="Concept sketch"] [data-pill-sketch-name]');
+    await page.evaluate(() => {
+      const sourceCard = document.querySelector('[data-pill-preview-type="sketch"][data-pill-label="Concept sketch"]');
+      const targetCard = document.querySelector('[data-pill-preview-type="note"][data-pill-label="Layout notes"]');
+      const handle = sourceCard?.querySelector('[data-preview-reorder-handle][data-reorder-kind="sketch"]');
+      if (!sourceCard || !targetCard || !handle) throw new Error('Sketch reorder fixtures were not found.');
+      const transfer = new DataTransfer();
+      handle.dispatchEvent(new DragEvent('dragstart', { dataTransfer: transfer, bubbles: true, cancelable: true }));
+      targetCard.dispatchEvent(new DragEvent('dragover', { dataTransfer: transfer, bubbles: true, cancelable: true }));
+      targetCard.dispatchEvent(new DragEvent('drop', { dataTransfer: transfer, bubbles: true, cancelable: true }));
+      handle.dispatchEvent(new DragEvent('dragend', { dataTransfer: transfer, bubbles: true, cancelable: true }));
+    });
+    await page.waitForFunction(() => {
+      const cards = Array.from(document.querySelectorAll('.pill-preview-grid [data-pill-preview-card]'));
+      cards.sort((left, right) => Number(getComputedStyle(left).order) - Number(getComputedStyle(right).order));
+      return cards[0]?.getAttribute('data-pill-label') === 'Concept sketch';
+    });
 
     const sketchDragSpace = await sketchWindow.$('[data-sketch-drag-space]');
     const sketchDragSpaceBox = await sketchDragSpace.boundingBox();
@@ -910,6 +966,26 @@ async function main() {
     assert.ok(await page.$('[data-board-media-preview]'), 'Renaming media in board contents should keep the content editor open.');
     assert.ok(await page.$('[data-board-note-preview]'), 'The board editor should keep named note previews available.');
     assert.ok(await page.$('[data-board-sketch-preview]'), 'The board editor should expose sketch previews and names.');
+    assert.ok(await page.$$eval('[data-board-media-preview] [data-preview-reorder-handle][data-reorder-kind="media"]', handles => handles.length) >= 3, 'Every board-editor media preview should expose a reorder grip.');
+    await page.evaluate(() => {
+      const cards = Array.from(document.querySelectorAll('[data-board-media-preview]'));
+      const sourceCard = cards.find(card => card.querySelector('[data-board-media-name]')?.textContent?.trim() === 'Board brief.docx');
+      const targetCard = cards[0];
+      const handle = sourceCard?.querySelector('[data-preview-reorder-handle][data-reorder-kind="media"]');
+      if (!sourceCard || !targetCard || !handle) throw new Error('Board editor reorder fixtures were not found.');
+      const transfer = new DataTransfer();
+      handle.dispatchEvent(new DragEvent('dragstart', { dataTransfer: transfer, bubbles: true, cancelable: true }));
+      targetCard.dispatchEvent(new DragEvent('dragenter', { dataTransfer: transfer, bubbles: true, cancelable: true }));
+      targetCard.dispatchEvent(new DragEvent('dragover', { dataTransfer: transfer, bubbles: true, cancelable: true }));
+      targetCard.dispatchEvent(new DragEvent('drop', { dataTransfer: transfer, bubbles: true, cancelable: true }));
+      handle.dispatchEvent(new DragEvent('dragend', { dataTransfer: transfer, bubbles: true, cancelable: true }));
+    });
+    await page.waitForFunction(() => document.querySelector('[data-board-media-preview] [data-board-media-name]')?.textContent?.trim() === 'Board brief.docx');
+    assert.deepStrictEqual(
+      await page.$$eval('[data-board-media-preview] [data-board-media-name]', names => names.slice(0, 3).map(name => name.textContent.trim())),
+      ['Board brief.docx', 'sample.xlsx', 'sample.pdf'],
+      'Dragging in Edit Board should persist the new media order.'
+    );
     await page.click('button[aria-label="Back to all boards"]');
     await page.waitForSelector('button[title="Click to rename board"]');
 
@@ -964,10 +1040,27 @@ async function main() {
       'Pressing and dragging from the center of the round retracted pill should move it.'
     );
     assert.ok(await page.$('button[title="Expand Pill"]'), 'Dragging the round pill should not accidentally expand it.');
+    assert.ok(await page.$('button[title="Expand Pill"] [data-retracted-pill-logo]'), 'The retracted pill should use the supplied RefFlow logo.');
+    assert.strictEqual(await page.$$eval('button[title="Expand Pill"] svg', elements => elements.length), 0, 'The old sparkle icon should not remain in the retracted pill.');
+    const retractedLogoScale = await page.$eval('button[title="Expand Pill"]', button => {
+      const logo = button.querySelector('[data-retracted-pill-logo]');
+      const buttonRect = button.getBoundingClientRect();
+      const logoRect = logo.getBoundingClientRect();
+      return Math.max(logoRect.width / buttonRect.width, logoRect.height / buttonRect.height);
+    });
+    assert.ok(retractedLogoScale >= 0.48 && retractedLogoScale <= 0.56, `The retracted logo should be compact without becoming too small: ${retractedLogoScale}.`);
     await page.click('button[title="Expand Pill"]');
     await page.waitForSelector('[data-pill-preview-type="docx"][data-pill-label="Board brief.docx"]');
     await page.waitForSelector('[data-pill-preview-type="note"][data-pill-label="Client notes"]');
     await page.waitForSelector('[data-pill-preview-type="sketch"][data-pill-label="Hero sketch"]');
+    assert.deepStrictEqual(
+      await page.$$eval('.pill-preview-grid [data-pill-preview-card]', cards => cards
+        .sort((left, right) => Number(getComputedStyle(left).order) - Number(getComputedStyle(right).order))
+        .slice(0, 3)
+        .map(card => card.getAttribute('data-pill-label'))),
+      ['Hero sketch', 'Client notes', 'Board brief.docx'],
+      'Mixed sketch, note, and media order should survive Edit Board changes and pill retraction.'
+    );
 
     const pillWindow = await page.$('.floating-pill');
     const pillDragHandle = await pillWindow.$('.drag-handle');
@@ -1117,7 +1210,7 @@ async function main() {
     await startupPage.waitForFunction(() => !document.querySelector('input[aria-label="Start on Boot"]')?.checked);
     const startupCalls = await startupPage.evaluate(() => window.__startupInvokeCalls);
     assert.ok(startupCalls.some(call => call[0] === 'set-start-on-boot' && call[1] === false), 'Start on Boot should wait for confirmed IPC registration changes.');
-    assert.strictEqual(await startupPage.evaluate(() => localStorage.getItem('ref-flow-api-keys')), null, 'The 1.0.7 migration should remove saved API keys.');
+    assert.strictEqual(await startupPage.evaluate(() => localStorage.getItem('ref-flow-api-keys')), null, 'The 1.7.1 migration should remove saved API keys.');
     assert.strictEqual(await startupPage.evaluate(() => localStorage.getItem('ref-flow-pill-opacity')), null, 'The glass-control migration should remove the redundant legacy pill opacity value.');
     const migratedProviders = await startupPage.evaluate(() => JSON.parse(localStorage.getItem('ref-flow-provider-order') || '[]').sort());
     assert.deepStrictEqual(migratedProviders, ['Openverse', 'Wikimedia Commons']);
@@ -1125,6 +1218,10 @@ async function main() {
     await startupPage.click('button[title="Settings"]');
     await startupPage.click('button[title="Quick Reference Search"]');
     await startupPage.waitForSelector('input[placeholder="Search images..."]');
+    assert.strictEqual(await startupPage.evaluate(() => Array.from(document.querySelectorAll('.rf-card')).some(card => {
+      const text = (card.textContent || '').replace(/\s+/g, ' ');
+      return ['Searching', 'Response', 'Page', 'Loaded'].every(label => text.includes(label));
+    })), false, 'The legacy four-column search statistics bar should be removed.');
     await startupPage.$$eval('button', buttons => {
       const googleButton = buttons.find(button => button.textContent?.trim() === 'Google Images');
       if (!googleButton) throw new Error('Google Images browser provider was not found.');
@@ -1156,6 +1253,7 @@ async function main() {
       documentControls: 'Reset label and rotate visibility passed',
       providerSettings: 'no-key provider migration and API-setting removal passed',
       boardManager: 'unclipped collapsed expand control, sidebar and card renaming, content editor, and close flow passed',
+      previewOrdering: 'mixed media, note, and sketch drag-to-reorder persisted between the pill and Edit Board',
       mediaNames: 'original filenames plus pill and board-editor inline renaming passed',
       noteAndSketchNames: 'pill and board-editor rename persistence passed',
       pdfPreviewLayout: 'tile-filling first-page crop passed',
@@ -1163,6 +1261,8 @@ async function main() {
       pillActionIcons: 'white rest state and purple hover state passed',
       pillResize: 'single invisible eight-zone resize frame and top-left interaction passed',
       pillPreviewGrid: 'four-column expansion, overlap protection, and inset glass captions passed',
+      branding: 'supplied RefFlow logo shown in the retracted pill',
+      searchLayout: 'legacy search statistics strip removed',
       multiMonitorLayout: 'pill placement and connected-display clamping passed across two synthetic monitors',
       externalBrowserSearch: 'browser providers route through Windows external URL IPC',
       startOnBoot: 'verified IPC status and confirmed toggle passed',

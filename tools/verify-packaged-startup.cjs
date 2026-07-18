@@ -35,6 +35,12 @@ async function main() {
       await page.waitForFunction(() => !document.querySelector('[data-empty-board-prompt]'));
     }
 
+    if (await page.$('button[title="Expand Pill"]')) {
+      await page.click('button[title="Expand Pill"]');
+    }
+    await page.waitForSelector('[data-expanded-pill-brand]', { timeout: 10_000 });
+    await page.waitForFunction(() => document.querySelectorAll('[data-pill-main-action]').length === 4, { timeout: 10_000 });
+    await new Promise(resolve => setTimeout(resolve, 240));
     assert.strictEqual(await page.$$eval('[data-expanded-pill-brand] svg', elements => elements.length), 0, 'The packaged expanded pill should not show the stars icon.');
     const pillActionColors = await page.$$eval('[data-pill-main-action]', buttons => buttons.map(button => getComputedStyle(button).color));
     assert.strictEqual(pillActionColors.length, 4, 'The packaged pill should show all four primary actions.');
@@ -49,6 +55,11 @@ async function main() {
     assert.strictEqual(pillResizeFrame.edges, 8, 'The packaged pill should expose all invisible resize zones.');
     assert.strictEqual(pillResizeFrame.visibleGrips, 0, 'The packaged pill resize zones should have no visible grips.');
     await page.mouse.move(2200, 900);
+    await page.click('button[title="Retract"]');
+    await page.waitForSelector('button[title="Expand Pill"] [data-retracted-pill-logo]', { timeout: 10_000 });
+    assert.strictEqual(await page.$$eval('button[title="Expand Pill"] svg', elements => elements.length), 0, 'The packaged retracted pill should replace the old sparkle icon with the supplied logo.');
+    await page.click('button[title="Expand Pill"]');
+    await page.waitForSelector('[data-expanded-pill-brand]', { timeout: 10_000 });
 
     const readStartupEntry = () => page.evaluate(({ key, name }) => {
       try {
@@ -128,6 +139,7 @@ async function main() {
       expandedStarRemoved: true,
       pillActionColors: 'white at rest, purple on hover',
       pillResizeZones: pillResizeFrame.edges,
+      retractedPillBranding: 'supplied RefFlow logo',
       searchSources,
       enabled,
       disabled,

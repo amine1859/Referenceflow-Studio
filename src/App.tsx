@@ -1,7 +1,7 @@
 ﻿import React, { useState, useCallback, useRef, useEffect } from 'react';
 import { 
   Settings, Plus, X, Trash2, Maximize2, Minimize2, Move, Lock, Unlock, SlidersHorizontal, ChevronLeft, ChevronRight, RotateCw, Palette, FileText, Monitor, Check, Edit2, Download,
-  Pin, PinOff, Eye, EyeOff, Edit3, ChevronDown, ChevronUp, PenTool, Eraser, ZoomIn, ZoomOut, Maximize, Bold, Italic, List, Search, Loader2, Heart, Link as LinkIcon, Table2, Copy, Sparkles, FolderOpen, LayoutGrid, PanelLeftClose, PanelLeftOpen
+  Pin, PinOff, Eye, EyeOff, Edit3, ChevronDown, ChevronUp, PenTool, Eraser, ZoomIn, ZoomOut, Maximize, Bold, Italic, List, Search, Loader2, Heart, Link as LinkIcon, Table2, Copy, Sparkles, FolderOpen, LayoutGrid, PanelLeftClose, PanelLeftOpen, GripVertical
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import Markdown from 'react-markdown';
@@ -22,6 +22,7 @@ import { Switch } from './components/ui/switch';
 import { ToolbarButton } from './components/ui/toolbar-button';
 import { TooltipProvider } from './components/ui/tooltip';
 import { pdfjs } from 'react-pdf';
+import refFlowLogo from '../Logo/REF FLOW LOGO copy-02.svg';
 
 // PDF.js requires an explicit worker URL in packaged Electron builds. Keeping
 // this beside the pdfjs import ensures Vite emits the worker into dist/assets.
@@ -71,6 +72,83 @@ const getMediaDisplayName = (media: FloatingImage, index = 0) => {
 const getNoteDisplayName = (note: FloatingNote, index = 0) => String(note.name || '').trim() || `Note ${index + 1}`;
 
 const getSketchDisplayName = (sketch: FloatingSketch, index = 0) => String(sketch.name || '').trim() || `Sketch ${index + 1}`;
+
+type PreviewReorderKind = 'media' | 'note' | 'sketch';
+
+type PreviewReorderSession = {
+  surface: 'pill' | 'board';
+  projectId: string | null;
+  kind: PreviewReorderKind;
+  sourceId: string;
+};
+
+type PreviewCollections = {
+  media: FloatingImage[];
+  note: FloatingNote[];
+  sketch: FloatingSketch[];
+};
+
+type OrderedPreviewEntry = {
+  kind: PreviewReorderKind;
+  id: string;
+  item: FloatingImage | FloatingNote | FloatingSketch;
+  fallbackOrder: number;
+};
+
+const getPreviewItemKey = (kind: PreviewReorderKind, id: string) => `${kind}:${id}`;
+
+const getOrderedPreviewEntries = (collections: PreviewCollections): OrderedPreviewEntry[] => {
+  const entries: OrderedPreviewEntry[] = [];
+  let fallbackOrder = 0;
+  (Object.entries(collections) as Array<[PreviewReorderKind, PreviewCollections[PreviewReorderKind]]>).forEach(([kind, items]) => {
+    items.forEach(item => {
+      entries.push({ kind, id: item.id, item, fallbackOrder });
+      fallbackOrder += 1;
+    });
+  });
+
+  return entries.sort((left, right) => {
+    const leftHasOrder = Number.isFinite(left.item.previewOrder);
+    const rightHasOrder = Number.isFinite(right.item.previewOrder);
+    if (leftHasOrder && rightHasOrder) {
+      return (left.item.previewOrder as number) - (right.item.previewOrder as number) || left.fallbackOrder - right.fallbackOrder;
+    }
+    if (leftHasOrder) return -1;
+    if (rightHasOrder) return 1;
+    return left.fallbackOrder - right.fallbackOrder;
+  });
+};
+
+const reorderPreviewCollections = (
+  collections: PreviewCollections,
+  sourceKind: PreviewReorderKind,
+  sourceId: string,
+  targetKind: PreviewReorderKind,
+  targetId: string
+): PreviewCollections => {
+  const ordered = getOrderedPreviewEntries(collections);
+  const sourceIndex = ordered.findIndex(entry => entry.kind === sourceKind && entry.id === sourceId);
+  const targetIndex = ordered.findIndex(entry => entry.kind === targetKind && entry.id === targetId);
+  if (sourceIndex < 0 || targetIndex < 0 || sourceIndex === targetIndex) return collections;
+
+  const [moved] = ordered.splice(sourceIndex, 1);
+  ordered.splice(targetIndex, 0, moved);
+
+  const next: PreviewCollections = { media: [], note: [], sketch: [] };
+  ordered.forEach((entry, previewOrder) => {
+    if (entry.kind === 'media') next.media.push({ ...(entry.item as FloatingImage), previewOrder });
+    if (entry.kind === 'note') next.note.push({ ...(entry.item as FloatingNote), previewOrder });
+    if (entry.kind === 'sketch') next.sketch.push({ ...(entry.item as FloatingSketch), previewOrder });
+  });
+  return next;
+};
+
+const getPreviewReorderKey = (
+  surface: PreviewReorderSession['surface'],
+  projectId: string | null,
+  kind: PreviewReorderKind,
+  id: string
+) => `${surface}:${projectId || 'active'}:${kind}:${id}`;
 
 type AppUpdatePhase = 'idle' | 'development' | 'checking' | 'available' | 'downloading' | 'up-to-date' | 'ready' | 'installing' | 'error';
 
@@ -1401,8 +1479,6 @@ export default function App() {
       return [];
     }
   });
-  const [activeProviderSearching, setActiveProviderSearching] = useState<string>("None");
-  const [lastResultsCount, setLastResultsCount] = useState<number>(0);
   const [searchLog, setSearchLog] = useState<string[]>([]);
   const [searchPage, setSearchPage] = useState(1);
   const [searchContextMenu, setSearchContextMenu] = useState<{x: number, y: number, result: any} | null>(null);
@@ -1449,6 +1525,8 @@ export default function App() {
     projectId: string | null;
     name: string;
   } | null>(null);
+  const previewReorderSessionRef = useRef<PreviewReorderSession | null>(null);
+  const [previewReorderTarget, setPreviewReorderTarget] = useState<string | null>(null);
   const [needsPermission, setNeedsPermission] = useState(false);
   const [dragError, setDragError] = useState<string>('');
   const [defaultAutosaveRoot, setDefaultAutosaveRoot] = useState<string>("");
@@ -1478,6 +1556,17 @@ export default function App() {
   const [updateActionPending, setUpdateActionPending] = useState(false);
 
   const [floatingSketches, setFloatingSketches] = useState<FloatingSketch[]>([]);
+  const pillPreviewOrderSignature = [
+    ...floatingImages.map(item => getPreviewItemKey('media', `${item.id}:${item.previewOrder ?? ''}`)),
+    ...floatingNotes.map(item => getPreviewItemKey('note', `${item.id}:${item.previewOrder ?? ''}`)),
+    ...floatingSketches.map(item => getPreviewItemKey('sketch', `${item.id}:${item.previewOrder ?? ''}`))
+  ].join('|');
+  const pillPreviewOrderByKey = React.useMemo(() => new Map(
+    getOrderedPreviewEntries({ media: floatingImages, note: floatingNotes, sketch: floatingSketches })
+      .map((entry, index) => [getPreviewItemKey(entry.kind, entry.id), index])
+  // Window movement changes coordinates but not this signature, so it does not
+  // repeatedly sort every pill preview during high-frequency drag rendering.
+  ), [pillPreviewOrderSignature]);
   const hasAnyWorkspaceContent = floatingImages.length > 0 || floatingNotes.length > 0 || floatingSketches.length > 0;
 
   useEffect(() => {
@@ -1831,7 +1920,6 @@ export default function App() {
             if (!isLoadMore) setSearchLog(prev => [...prev, `[Search] Skipped ${p}: Disabled.`]);
             continue;
         }
-        setActiveProviderSearching(p);
         setSearchLog(prev => [...prev, `[Search] Querying ${p}...`]);
         const startTime = Date.now();
         let errorStr = '';
@@ -1909,9 +1997,6 @@ export default function App() {
           errors: errorStr ? [...prev.errors, `${p}: ${errorStr}`] : prev.errors
         }));
     }
-
-    setActiveProviderSearching("None");
-    setLastResultsCount(newResults.length);
 
     const rankedNewResults = rankSearchResults(newResults, searchQuery);
 
@@ -4789,6 +4874,156 @@ export default function App() {
     cancelCanvasItemRename();
   };
 
+  const applyPreviewReorder = async (
+    session: PreviewReorderSession,
+    targetKind: PreviewReorderKind,
+    targetId: string,
+    project: Project | null = null
+  ) => {
+    if (session.kind === targetKind && session.sourceId === targetId) return;
+
+    if (session.surface === 'pill') {
+      const reordered = reorderPreviewCollections(
+        { media: floatingImages, note: floatingNotes, sketch: floatingSketches },
+        session.kind,
+        session.sourceId,
+        targetKind,
+        targetId
+      );
+      setFloatingImages(reordered.media);
+      setFloatingNotes(reordered.note);
+      setFloatingSketches(reordered.sketch);
+      return;
+    }
+
+    if (!project || session.projectId !== project.id) return;
+    const latestProject = projectsRef.current.find(item => item.id === project.id) || project;
+    const reordered = reorderPreviewCollections(
+      {
+        media: latestProject.floatingImages || [],
+        note: latestProject.floatingNotes || [],
+        sketch: latestProject.floatingSketches || []
+      },
+      session.kind,
+      session.sourceId,
+      targetKind,
+      targetId
+    );
+    const updates: Partial<Project> = {
+      floatingImages: reordered.media,
+      floatingNotes: reordered.note,
+      floatingSketches: reordered.sketch
+    };
+    const updatedAt = Date.now();
+    const updatedProject = { ...latestProject, ...updates, updatedAt };
+
+    await updateProject(project.id, updates);
+    if (updatedProject.directoryPath) {
+      try {
+        await syncBoardToPath(updatedProject, updatedProject.directoryPath, false);
+      } catch (error) {
+        console.warn('Board order was saved, but the local manifest could not be refreshed:', error);
+      }
+    }
+
+    setProjects(current => {
+      const next = current.map(item => item.id === project.id ? updatedProject : item);
+      projectsRef.current = next;
+      return next;
+    });
+    if (project.id === activeProjectId) {
+      setFloatingImages(updatedProject.floatingImages || []);
+      setFloatingNotes(updatedProject.floatingNotes || []);
+      setFloatingSketches(updatedProject.floatingSketches || []);
+    }
+  };
+
+  const beginPreviewReorder = (
+    event: React.DragEvent<HTMLElement>,
+    surface: PreviewReorderSession['surface'],
+    projectId: string | null,
+    kind: PreviewReorderKind,
+    sourceId: string
+  ) => {
+    event.stopPropagation();
+    const session = { surface, projectId, kind, sourceId };
+    previewReorderSessionRef.current = session;
+    setPreviewReorderTarget(null);
+    event.dataTransfer.effectAllowed = 'move';
+    event.dataTransfer.setData('application/x-refflow-preview-order', JSON.stringify(session));
+  };
+
+  const allowPreviewReorder = (
+    event: React.DragEvent<HTMLElement>,
+    surface: PreviewReorderSession['surface'],
+    projectId: string | null,
+    kind: PreviewReorderKind,
+    targetId: string
+  ) => {
+    const session = previewReorderSessionRef.current;
+    if (!session
+      || session.surface !== surface
+      || session.projectId !== projectId
+      || (session.kind === kind && session.sourceId === targetId)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    event.dataTransfer.dropEffect = 'move';
+    setPreviewReorderTarget(getPreviewReorderKey(surface, projectId, kind, targetId));
+  };
+
+  const finishPreviewReorder = async (
+    event: React.DragEvent<HTMLElement>,
+    surface: PreviewReorderSession['surface'],
+    projectId: string | null,
+    kind: PreviewReorderKind,
+    targetId: string,
+    project: Project | null = null
+  ) => {
+    const session = previewReorderSessionRef.current;
+    if (!session
+      || session.surface !== surface
+      || session.projectId !== projectId) return;
+    event.preventDefault();
+    event.stopPropagation();
+    try {
+      await applyPreviewReorder(session, kind, targetId, project);
+    } finally {
+      previewReorderSessionRef.current = null;
+      setPreviewReorderTarget(null);
+    }
+  };
+
+  const endPreviewReorder = () => {
+    previewReorderSessionRef.current = null;
+    setPreviewReorderTarget(null);
+  };
+
+  const movePreviewWithKeyboard = (
+    event: React.KeyboardEvent<HTMLElement>,
+    surface: PreviewReorderSession['surface'],
+    projectId: string | null,
+    kind: PreviewReorderKind,
+    sourceId: string,
+    project: Project | null = null
+  ) => {
+    if (!event.altKey || !['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(event.key)) return;
+    const collections: PreviewCollections = surface === 'pill'
+      ? { media: floatingImages, note: floatingNotes, sketch: floatingSketches }
+      : {
+          media: project?.floatingImages || [],
+          note: project?.floatingNotes || [],
+          sketch: project?.floatingSketches || []
+        };
+    const ordered = getOrderedPreviewEntries(collections);
+    const sourceIndex = ordered.findIndex(item => item.kind === kind && item.id === sourceId);
+    const offset = event.key === 'ArrowLeft' || event.key === 'ArrowUp' ? -1 : 1;
+    const target = ordered[sourceIndex + offset];
+    if (!target) return;
+    event.preventDefault();
+    event.stopPropagation();
+    void applyPreviewReorder({ surface, projectId, kind, sourceId }, target.kind, target.id, project);
+  };
+
   const createNewProjectBoard = async () => {
     const project = await createProject(`Board ${projects.length + 1}`);
     let createdProject = project;
@@ -4985,7 +5220,14 @@ export default function App() {
                       title="Expand Pill"
                       aria-label="Expand Pill"
                     >
-                      <Sparkles className="pointer-events-none size-4" />
+                      <img
+                        src={refFlowLogo}
+                        alt=""
+                        aria-hidden="true"
+                        draggable={false}
+                        className="pointer-events-none h-[54%] w-[54%] object-contain drop-shadow-[0_4px_10px_rgba(65,72,240,0.3)]"
+                        data-retracted-pill-logo
+                      />
                     </button>
                   </motion.div>
               ) : (
@@ -5071,7 +5313,8 @@ export default function App() {
                          return (
                            <div
                              key={img.id}
-                             className={`rf-card rf-preview-card relative group aspect-square w-full min-w-0 self-start cursor-pointer overflow-hidden flex items-center justify-center ${img.isCollapsed ? 'border-dashed' : 'hover:border-primary/60 hover:-translate-y-0.5'}`}
+                             className={`rf-card rf-preview-card relative group aspect-square w-full min-w-0 self-start cursor-pointer overflow-hidden flex items-center justify-center ${img.isCollapsed ? 'border-dashed' : 'hover:border-primary/60 hover:-translate-y-0.5'} ${previewReorderTarget === getPreviewReorderKey('pill', null, 'media', img.id) ? 'ring-2 ring-primary ring-offset-2 ring-offset-background' : ''}`}
+                             style={{ order: pillPreviewOrderByKey.get(getPreviewItemKey('media', img.id)) ?? mediaIndex }}
                              data-pill-preview-card
                              data-pill-preview-type={previewType}
                              data-pill-label={mediaLabel}
@@ -5080,6 +5323,9 @@ export default function App() {
                                setFloatingImages(prev => prev.map(f => f.id === img.id ? { ...f, isCollapsed: false } : f));
                                setTopWindowId(img.id);
                              }}
+                             onDragEnter={(event) => allowPreviewReorder(event, 'pill', null, 'media', img.id)}
+                             onDragOver={(event) => allowPreviewReorder(event, 'pill', null, 'media', img.id)}
+                             onDrop={(event) => { void finishPreviewReorder(event, 'pill', null, 'media', img.id); }}
                            >
                              {img.type === 'pdf' ? (
                                <PillPdfPreview media={img} />
@@ -5132,6 +5378,22 @@ export default function App() {
                              )}
                              <div className="absolute top-1 right-1 z-30 opacity-0 group-hover:opacity-100 transition-opacity flex space-x-1">
                                <button
+                                 type="button"
+                                 draggable
+                                 onDragStart={(event) => beginPreviewReorder(event, 'pill', null, 'media', img.id)}
+                                 onDragEnd={endPreviewReorder}
+                                 onMouseDown={(event) => event.stopPropagation()}
+                                 onClick={(event) => event.stopPropagation()}
+                                 onKeyDown={(event) => movePreviewWithKeyboard(event, 'pill', null, 'media', img.id)}
+                                 className="cursor-grab rounded-lg border border-white/10 bg-black/65 p-1.5 text-white shadow-lg backdrop-blur-md transition-colors hover:bg-primary active:cursor-grabbing"
+                                 title="Drag to reorder. Alt+Arrow keys also work."
+                                 aria-label={`Reorder ${mediaLabel}`}
+                                 data-preview-reorder-handle
+                                 data-reorder-kind="media"
+                               >
+                                 <GripVertical className="size-3" />
+                               </button>
+                               <button
                                  onClick={(e) => { e.stopPropagation(); setFloatingImages(prev => prev.filter(f => f.id !== img.id)); }}
                                  className="rounded-lg border border-white/10 bg-black/65 p-1.5 text-white shadow-lg backdrop-blur-md transition-colors hover:bg-danger"
                                  title="Delete Permanently"
@@ -5149,8 +5411,11 @@ export default function App() {
                          return (
                            <div
                              key={note.id}
-                             className={`rf-card rf-preview-card relative group aspect-square w-full min-w-0 self-start cursor-pointer overflow-hidden ${note.isCollapsed ? 'border-dashed' : 'hover:border-primary/60 hover:-translate-y-0.5'}`}
-                             style={{ backgroundColor: note.color || '#fef3c7' }}
+                             className={`rf-card rf-preview-card relative group aspect-square w-full min-w-0 self-start cursor-pointer overflow-hidden ${note.isCollapsed ? 'border-dashed' : 'hover:border-primary/60 hover:-translate-y-0.5'} ${previewReorderTarget === getPreviewReorderKey('pill', null, 'note', note.id) ? 'ring-2 ring-primary ring-offset-2 ring-offset-background' : ''}`}
+                             style={{
+                               backgroundColor: note.color || '#fef3c7',
+                               order: pillPreviewOrderByKey.get(getPreviewItemKey('note', note.id)) ?? floatingImages.length + noteIndex
+                             }}
                              data-pill-preview-card
                              data-pill-preview-type="note"
                              data-pill-label={noteLabel}
@@ -5159,6 +5424,9 @@ export default function App() {
                                setFloatingNotes(prev => prev.map(f => f.id === note.id ? { ...f, isCollapsed: false } : f));
                                setTopWindowId(note.id);
                              }}
+                             onDragEnter={(event) => allowPreviewReorder(event, 'pill', null, 'note', note.id)}
+                             onDragOver={(event) => allowPreviewReorder(event, 'pill', null, 'note', note.id)}
+                             onDrop={(event) => { void finishPreviewReorder(event, 'pill', null, 'note', note.id); }}
                            >
                              <div className="h-full w-full overflow-hidden px-2 pb-6 pt-2 text-left text-[7px] font-medium leading-[9px] text-slate-800">
                                {notePreview || (
@@ -5205,6 +5473,22 @@ export default function App() {
                              )}
                              <div className="absolute top-1 right-1 z-30 opacity-0 group-hover:opacity-100 transition-opacity flex space-x-1">
                                <button
+                                 type="button"
+                                 draggable
+                                 onDragStart={(event) => beginPreviewReorder(event, 'pill', null, 'note', note.id)}
+                                 onDragEnd={endPreviewReorder}
+                                 onMouseDown={(event) => event.stopPropagation()}
+                                 onClick={(event) => event.stopPropagation()}
+                                 onKeyDown={(event) => movePreviewWithKeyboard(event, 'pill', null, 'note', note.id)}
+                                 className="cursor-grab rounded-lg border border-white/10 bg-black/65 p-1.5 text-white shadow-lg backdrop-blur-md transition-colors hover:bg-primary active:cursor-grabbing"
+                                 title="Drag to reorder. Alt+Arrow keys also work."
+                                 aria-label={`Reorder ${noteLabel}`}
+                                 data-preview-reorder-handle
+                                 data-reorder-kind="note"
+                               >
+                                 <GripVertical className="size-3" />
+                               </button>
+                               <button
                                  onClick={(e) => { e.stopPropagation(); setFloatingNotes(prev => prev.filter(f => f.id !== note.id)); }}
                                  className="rounded-lg border border-white/10 bg-black/65 p-1.5 text-white shadow-lg backdrop-blur-md transition-colors hover:bg-danger"
                                  title="Delete Permanently"
@@ -5221,7 +5505,8 @@ export default function App() {
                          return (
                            <div
                              key={sketch.id}
-                             className={`rf-card rf-preview-card relative group aspect-square w-full min-w-0 self-start cursor-pointer overflow-hidden flex items-center justify-center ${sketch.isCollapsed ? 'border-dashed' : 'hover:border-primary/60 hover:-translate-y-0.5'}`}
+                             className={`rf-card rf-preview-card relative group aspect-square w-full min-w-0 self-start cursor-pointer overflow-hidden flex items-center justify-center ${sketch.isCollapsed ? 'border-dashed' : 'hover:border-primary/60 hover:-translate-y-0.5'} ${previewReorderTarget === getPreviewReorderKey('pill', null, 'sketch', sketch.id) ? 'ring-2 ring-primary ring-offset-2 ring-offset-background' : ''}`}
+                             style={{ order: pillPreviewOrderByKey.get(getPreviewItemKey('sketch', sketch.id)) ?? floatingImages.length + floatingNotes.length + sketchIndex }}
                              data-pill-preview-card
                              data-pill-preview-type="sketch"
                              data-pill-label={sketchLabel}
@@ -5230,6 +5515,9 @@ export default function App() {
                                setFloatingSketches(prev => prev.map(f => f.id === sketch.id ? { ...f, isCollapsed: false } : f));
                                setTopWindowId(sketch.id);
                              }}
+                             onDragEnter={(event) => allowPreviewReorder(event, 'pill', null, 'sketch', sketch.id)}
+                             onDragOver={(event) => allowPreviewReorder(event, 'pill', null, 'sketch', sketch.id)}
+                             onDrop={(event) => { void finishPreviewReorder(event, 'pill', null, 'sketch', sketch.id); }}
                            >
                              <svg
                                viewBox={`0 0 ${Math.max(1, sketch.width)} ${Math.max(1, sketch.height)}`}
@@ -5295,6 +5583,22 @@ export default function App() {
                                <div className="pointer-events-none absolute left-1.5 top-1.5 z-20 rounded-md border border-primary/30 bg-primary/90 px-1 py-0.5 text-[6px] font-semibold uppercase tracking-wide text-white">Hidden</div>
                              )}
                              <div className="absolute top-1 right-1 z-30 opacity-0 group-hover:opacity-100 transition-opacity flex space-x-1">
+                               <button
+                                 type="button"
+                                 draggable
+                                 onDragStart={(event) => beginPreviewReorder(event, 'pill', null, 'sketch', sketch.id)}
+                                 onDragEnd={endPreviewReorder}
+                                 onMouseDown={(event) => event.stopPropagation()}
+                                 onClick={(event) => event.stopPropagation()}
+                                 onKeyDown={(event) => movePreviewWithKeyboard(event, 'pill', null, 'sketch', sketch.id)}
+                                 className="cursor-grab rounded-lg border border-white/10 bg-black/65 p-1.5 text-white shadow-lg backdrop-blur-md transition-colors hover:bg-primary active:cursor-grabbing"
+                                 title="Drag to reorder. Alt+Arrow keys also work."
+                                 aria-label={`Reorder ${sketchLabel}`}
+                                 data-preview-reorder-handle
+                                 data-reorder-kind="sketch"
+                               >
+                                 <GripVertical className="size-3" />
+                               </button>
                                <button
                                  onClick={(e) => { e.stopPropagation(); setFloatingSketches(prev => prev.filter(f => f.id !== sketch.id)); }}
                                  className="rounded-lg border border-white/10 bg-black/65 p-1.5 text-white shadow-lg backdrop-blur-md transition-colors hover:bg-danger"
@@ -5979,25 +6283,6 @@ export default function App() {
                     </div>
                 </div>
                 
-                <div className="rf-card grid shrink-0 grid-cols-4 gap-1.5 p-2.5 font-mono text-[9px] text-muted-foreground">
-                    <div className="flex flex-col">
-                        <span className="text-[8px] uppercase tracking-wider text-muted-foreground">Searching</span>
-                        <span className="truncate font-semibold text-secondary">{activeProviderSearching}</span>
-                    </div>
-                    <div className="flex flex-col">
-                        <span className="text-[8px] uppercase tracking-wider text-muted-foreground">Response</span>
-                        <span className="font-semibold text-secondary">+{lastResultsCount} hits</span>
-                    </div>
-                    <div className="flex flex-col">
-                        <span className="text-[8px] uppercase tracking-wider text-muted-foreground">Page</span>
-                        <span className="font-semibold text-secondary">#{searchPage}</span>
-                    </div>
-                    <div className="flex flex-col">
-                        <span className="text-[8px] uppercase tracking-wider text-muted-foreground">Loaded</span>
-                        <span className="font-semibold text-secondary">{searchResults.length} items</span>
-                    </div>
-                </div>
-
                 <div className="mb-1 flex shrink-0 flex-wrap gap-1.5 border-b border-border py-1 pb-3">
                     {FILTER_OPTIONS.map(f => (
                         <button
@@ -7374,7 +7659,7 @@ export default function App() {
                        </ToolbarButton>
                        <div>
                          <h2 className="text-lg font-semibold tracking-[-0.02em] text-foreground">Board contents</h2>
-                         <p className="mt-1 text-xs text-muted-foreground">Manage the references saved in {p.name}.</p>
+                         <p className="mt-1 text-xs text-muted-foreground">Manage the references saved in {p.name}. Drag a card grip to change its order.</p>
                        </div>
                      </div>
                      <div className="flex space-x-3">
@@ -7444,7 +7729,14 @@ export default function App() {
                          {p.floatingImages?.map((img, mediaIndex) => {
                            const mediaLabel = getMediaDisplayName(img, mediaIndex);
                            return (
-                             <div key={img.id} className="rf-card rf-preview-card relative group aspect-square overflow-hidden" data-board-media-preview={img.id}>
+                             <div
+                               key={img.id}
+                               className={`rf-card rf-preview-card relative group aspect-square overflow-hidden ${previewReorderTarget === getPreviewReorderKey('board', p.id, 'media', img.id) ? 'ring-2 ring-primary ring-offset-2 ring-offset-background' : ''}`}
+                               data-board-media-preview={img.id}
+                               onDragEnter={(event) => allowPreviewReorder(event, 'board', p.id, 'media', img.id)}
+                               onDragOver={(event) => allowPreviewReorder(event, 'board', p.id, 'media', img.id)}
+                               onDrop={(event) => { void finishPreviewReorder(event, 'board', p.id, 'media', img.id, p); }}
+                             >
                                 {img.type === 'pdf' ? (
                                   <PillPdfPreview media={img} />
                                 ) : isOfficeDocument(img.type) ? (
@@ -7483,19 +7775,37 @@ export default function App() {
                                     </button>
                                   )}
                                 </div>
-                                <button
-                                  onClick={async (e) => {
-                                    e.stopPropagation();
-                                    const newImages = p.floatingImages.filter(f => f.id !== img.id);
-                                    await updateProject(p.id, { floatingImages: newImages });
-                                    setProjects(await getProjects());
-                                    if(p.id === activeProjectId) setFloatingImages(newImages);
-                                  }}
-                                  className="absolute right-2 top-2 z-30 rounded-lg border border-white/10 bg-black/45 p-1.5 text-white opacity-0 backdrop-blur-md transition-all hover:bg-danger group-hover:opacity-100"
-                                  title="Remove reference"
-                                >
-                                  <Trash2 className="w-4 h-4" />
-                                </button>
+                                <div className="absolute right-2 top-2 z-30 flex gap-1 opacity-0 transition-opacity group-hover:opacity-100">
+                                  <button
+                                    type="button"
+                                    draggable
+                                    onDragStart={(event) => beginPreviewReorder(event, 'board', p.id, 'media', img.id)}
+                                    onDragEnd={endPreviewReorder}
+                                    onMouseDown={(event) => event.stopPropagation()}
+                                    onClick={(event) => event.stopPropagation()}
+                                    onKeyDown={(event) => movePreviewWithKeyboard(event, 'board', p.id, 'media', img.id, p)}
+                                    className="cursor-grab rounded-lg border border-white/10 bg-black/55 p-1.5 text-white backdrop-blur-md transition-colors hover:bg-primary active:cursor-grabbing"
+                                    title="Drag to reorder. Alt+Arrow keys also work."
+                                    aria-label={`Reorder ${mediaLabel}`}
+                                    data-preview-reorder-handle
+                                    data-reorder-kind="media"
+                                  >
+                                    <GripVertical className="size-4" />
+                                  </button>
+                                  <button
+                                    onClick={async (e) => {
+                                      e.stopPropagation();
+                                      const newImages = p.floatingImages.filter(f => f.id !== img.id);
+                                      await updateProject(p.id, { floatingImages: newImages });
+                                      setProjects(await getProjects());
+                                      if(p.id === activeProjectId) setFloatingImages(newImages);
+                                    }}
+                                    className="rounded-lg border border-white/10 bg-black/45 p-1.5 text-white backdrop-blur-md transition-colors hover:bg-danger"
+                                    title="Remove reference"
+                                  >
+                                    <Trash2 className="size-4" />
+                                  </button>
+                                </div>
                              </div>
                            );
                          })}
@@ -7514,9 +7824,12 @@ export default function App() {
                           return (
                             <div
                               key={note.id}
-                              className="rf-card rf-preview-card relative group h-32 overflow-hidden p-4 pb-10 text-sm text-slate-800"
+                              className={`rf-card rf-preview-card relative group h-32 overflow-hidden p-4 pb-10 text-sm text-slate-800 ${previewReorderTarget === getPreviewReorderKey('board', p.id, 'note', note.id) ? 'ring-2 ring-primary ring-offset-2 ring-offset-background' : ''}`}
                               style={{ backgroundColor: note.color }}
                               data-board-note-preview={note.id}
+                              onDragEnter={(event) => allowPreviewReorder(event, 'board', p.id, 'note', note.id)}
+                              onDragOver={(event) => allowPreviewReorder(event, 'board', p.id, 'note', note.id)}
+                              onDrop={(event) => { void finishPreviewReorder(event, 'board', p.id, 'note', note.id, p); }}
                             >
                                <p className="line-clamp-3 h-full w-full pr-6 whitespace-pre-wrap">{note.text || 'Empty note...'}</p>
                                <div className="pill-preview-caption" onMouseDown={(event) => event.stopPropagation()}>
@@ -7550,19 +7863,37 @@ export default function App() {
                                    </button>
                                  )}
                                </div>
-                               <button
-                                  onClick={async (e) => {
-                                    e.stopPropagation();
-                                    const newNotes = p.floatingNotes.filter(f => f.id !== note.id);
-                                    await updateProject(p.id, { floatingNotes: newNotes });
-                                    setProjects(await getProjects());
-                                    if(p.id === activeProjectId) setFloatingNotes(newNotes);
-                                  }}
-                                  className="absolute right-2 top-2 z-30 rounded-lg border border-white/10 bg-black/60 p-1.5 text-white opacity-0 backdrop-blur transition-all hover:bg-danger group-hover:opacity-100"
-                                  title="Remove Note"
-                                >
-                                  <Trash2 className="w-4 h-4" />
-                                </button>
+                               <div className="absolute right-2 top-2 z-30 flex gap-1 opacity-0 transition-opacity group-hover:opacity-100">
+                                 <button
+                                   type="button"
+                                   draggable
+                                   onDragStart={(event) => beginPreviewReorder(event, 'board', p.id, 'note', note.id)}
+                                   onDragEnd={endPreviewReorder}
+                                   onMouseDown={(event) => event.stopPropagation()}
+                                   onClick={(event) => event.stopPropagation()}
+                                   onKeyDown={(event) => movePreviewWithKeyboard(event, 'board', p.id, 'note', note.id, p)}
+                                   className="cursor-grab rounded-lg border border-white/10 bg-black/60 p-1.5 text-white backdrop-blur transition-colors hover:bg-primary active:cursor-grabbing"
+                                   title="Drag to reorder. Alt+Arrow keys also work."
+                                   aria-label={`Reorder ${noteLabel}`}
+                                   data-preview-reorder-handle
+                                   data-reorder-kind="note"
+                                 >
+                                   <GripVertical className="size-4" />
+                                 </button>
+                                 <button
+                                   onClick={async (e) => {
+                                     e.stopPropagation();
+                                     const newNotes = p.floatingNotes.filter(f => f.id !== note.id);
+                                     await updateProject(p.id, { floatingNotes: newNotes });
+                                     setProjects(await getProjects());
+                                     if(p.id === activeProjectId) setFloatingNotes(newNotes);
+                                   }}
+                                   className="rounded-lg border border-white/10 bg-black/60 p-1.5 text-white backdrop-blur transition-colors hover:bg-danger"
+                                   title="Remove Note"
+                                 >
+                                   <Trash2 className="size-4" />
+                                 </button>
+                               </div>
                             </div>
                           );
                         })}
@@ -7581,9 +7912,12 @@ export default function App() {
                           return (
                             <div
                               key={sketch.id}
-                              className="rf-card rf-preview-card group relative aspect-square overflow-hidden"
+                              className={`rf-card rf-preview-card group relative aspect-square overflow-hidden ${previewReorderTarget === getPreviewReorderKey('board', p.id, 'sketch', sketch.id) ? 'ring-2 ring-primary ring-offset-2 ring-offset-background' : ''}`}
                               style={{ backgroundColor: sketch.backgroundColor }}
                               data-board-sketch-preview={sketch.id}
+                              onDragEnter={(event) => allowPreviewReorder(event, 'board', p.id, 'sketch', sketch.id)}
+                              onDragOver={(event) => allowPreviewReorder(event, 'board', p.id, 'sketch', sketch.id)}
+                              onDrop={(event) => { void finishPreviewReorder(event, 'board', p.id, 'sketch', sketch.id, p); }}
                             >
                               <svg
                                 viewBox={`0 0 ${Math.max(1, sketch.width)} ${Math.max(1, sketch.height)}`}
@@ -7643,19 +7977,37 @@ export default function App() {
                                   </button>
                                 )}
                               </div>
-                              <button
-                                onClick={async (event) => {
-                                  event.stopPropagation();
-                                  const updatedSketches = (p.floatingSketches || []).filter(item => item.id !== sketch.id);
-                                  await updateProject(p.id, { floatingSketches: updatedSketches });
-                                  setProjects(await getProjects());
-                                  if (p.id === activeProjectId) setFloatingSketches(updatedSketches);
-                                }}
-                                className="absolute right-2 top-2 z-30 rounded-lg border border-white/10 bg-black/55 p-1.5 text-white opacity-0 backdrop-blur transition-all hover:bg-danger group-hover:opacity-100"
-                                title="Remove Sketch"
-                              >
-                                <Trash2 className="size-4" />
-                              </button>
+                              <div className="absolute right-2 top-2 z-30 flex gap-1 opacity-0 transition-opacity group-hover:opacity-100">
+                                <button
+                                  type="button"
+                                  draggable
+                                  onDragStart={(event) => beginPreviewReorder(event, 'board', p.id, 'sketch', sketch.id)}
+                                  onDragEnd={endPreviewReorder}
+                                  onMouseDown={(event) => event.stopPropagation()}
+                                  onClick={(event) => event.stopPropagation()}
+                                  onKeyDown={(event) => movePreviewWithKeyboard(event, 'board', p.id, 'sketch', sketch.id, p)}
+                                  className="cursor-grab rounded-lg border border-white/10 bg-black/55 p-1.5 text-white backdrop-blur transition-colors hover:bg-primary active:cursor-grabbing"
+                                  title="Drag to reorder. Alt+Arrow keys also work."
+                                  aria-label={`Reorder ${sketchLabel}`}
+                                  data-preview-reorder-handle
+                                  data-reorder-kind="sketch"
+                                >
+                                  <GripVertical className="size-4" />
+                                </button>
+                                <button
+                                  onClick={async (event) => {
+                                    event.stopPropagation();
+                                    const updatedSketches = (p.floatingSketches || []).filter(item => item.id !== sketch.id);
+                                    await updateProject(p.id, { floatingSketches: updatedSketches });
+                                    setProjects(await getProjects());
+                                    if (p.id === activeProjectId) setFloatingSketches(updatedSketches);
+                                  }}
+                                  className="rounded-lg border border-white/10 bg-black/55 p-1.5 text-white backdrop-blur transition-colors hover:bg-danger"
+                                  title="Remove Sketch"
+                                >
+                                  <Trash2 className="size-4" />
+                                </button>
+                              </div>
                             </div>
                           );
                         })}

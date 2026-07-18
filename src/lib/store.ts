@@ -22,6 +22,7 @@ export interface OfficeDocumentEdits {
 
 export interface FloatingImage {
   id: string;
+  previewOrder?: number;
   url: string; // Will store base64 string
   fileName?: string;
   x: number;
@@ -50,6 +51,7 @@ export interface FloatingImage {
 
 export interface FloatingNote {
   id: string;
+  previewOrder?: number;
   name?: string;
   text: string;
   x: number;
@@ -72,6 +74,7 @@ export interface FloatingSketchLine {
 
 export interface FloatingSketch {
   id: string;
+  previewOrder?: number;
   name?: string;
   lines: FloatingSketchLine[];
   x: number;
