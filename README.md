@@ -1,6 +1,6 @@
 # RefFlow Studio
 
-RefFlow Studio is a Windows desktop reference-board app for artists, designers, and developers. It provides a floating always-on-top workspace for images, PDFs, notes, sketches, local boards, and visual search.
+RefFlow Studio is a Windows desktop asset workspace and reference-board app for artists, designers, and developers. It keeps images, documents, Adobe source files, notes, sketches, Brand Kits, and visual search close to the creative apps where you work.
 
 ## Video Demo
 
@@ -30,8 +30,14 @@ RefFlow Studio is a Windows desktop reference-board app for artists, designers, 
 - Monitor-aware placement across mixed multi-display desktop layouts.
 - Native click-through for transparent desktop areas and locked references.
 - Notes and sketch pads for board annotations.
-- Project manager for multiple local boards.
-- Local board export and autosave folder support.
+- Brand Kits with Moodboard, Guidelines, Logos, Primary and Secondary Colors, Typography, Icons, Imagery, Textures, and Templates.
+- One-click logo palette extraction plus copyable HEX, RGB, HSL, and CMYK color values.
+- Brand Typography can use fonts already installed in Windows, while imported font files stay visible in the pill and Brand Kit.
+- Smart board folders for images, documents, PDFs, Illustrator/EPS, InDesign, Photoshop, notes, and sketches.
+- Local PSD/PSB, AI/AIT, EPS, INDD/INDT/IDML, OTF, TTF, WOFF, and WOFF2 assets with native-app opening, Explorer reveal, and drag-out.
+- Universal board and asset search with a customizable shortcut (Ctrl+Alt+F by default).
+- Portable `.refflow` packages for sharing and importing complete boards or Brand Kits.
+- Project manager for multiple local boards, with local autosave folders whose names match the boards.
 - Native Windows installer built with Electron Builder.
 
 ## Requirements
@@ -88,6 +94,7 @@ The installer is written to `dist_desktop/`.
 - Build artifacts such as `dist/`, `dist_desktop/`, `.exe`, and `.blockmap` files are ignored by Git.
 - The installer uses `assets/referenceflow.ico` for installer, uninstaller, and app executable branding.
 - The app executable runs as the current user so normal desktop interactions are not blocked by Windows elevation rules.
+- v2.0.0 is the unsigned asset-handling release: Brand Kits, Windows font selection, smart folders, Adobe/font source-file handling, universal asset search, and portable board packages. The signed build will replace it when the certificate is ready.
 
 ## Security and privacy
 

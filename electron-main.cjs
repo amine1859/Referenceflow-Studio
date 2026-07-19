@@ -4,6 +4,13 @@ const path = require('path');
 const fs = require('fs');
 const { execFile } = require('child_process');
 
+const isolatedUserDataArgument = process.argv.find(argument => argument.startsWith('--refflow-test-user-data-dir='));
+if (isolatedUserDataArgument) {
+  const isolatedUserDataPath = path.resolve(isolatedUserDataArgument.slice('--refflow-test-user-data-dir='.length));
+  fs.mkdirSync(isolatedUserDataPath, { recursive: true });
+  app.setPath('userData', isolatedUserDataPath);
+}
+
 const settingsPath = path.join(app.getPath('userData'), 'settings.json');
 let settings = {
   showInTaskbar: false,
@@ -831,6 +838,152 @@ ipcMain.handle('open-external-url', async (_event, targetUrl) => {
     return true;
   } catch (error) {
     console.error('Failed to open external URL:', error);
+    return false;
+  }
+});
+
+const supportedLocalAssetExtensions = new Set([
+  '.psd', '.psb', '.ai', '.ait', '.eps', '.indd', '.indt', '.idml',
+  '.otf', '.ttf', '.woff', '.woff2'
+]);
+
+const INSTALLED_FONT_CACHE_DURATION_MS = 10 * 60 * 1000;
+let installedFontCache = { loadedAt: 0, families: [], source: '' };
+let installedFontLoadPromise = null;
+
+function runFileCommand(executable, args, options = {}) {
+  return new Promise((resolve, reject) => {
+    execFile(executable, args, {
+      windowsHide: true,
+      timeout: 15_000,
+      maxBuffer: 2 * 1024 * 1024,
+      ...options
+    }, (error, stdout, stderr) => {
+      if (error) {
+        error.stderr = stderr;
+        reject(error);
+        return;
+      }
+      resolve(String(stdout || ''));
+    });
+  });
+}
+
+function normalizeInstalledFontFamilies(values) {
+  const source = Array.isArray(values) ? values : [values];
+  return [...new Set(source
+    .map(value => String(value || '').replace(/[\u0000-\u001F]/g, '').trim())
+    .filter(value => value && value.length <= 160))]
+    .sort((left, right) => left.localeCompare(right, undefined, { sensitivity: 'base' }));
+}
+
+async function readInstalledFontsFromSystemDrawing() {
+  const systemRoot = process.env.SystemRoot || 'C:\\Windows';
+  const powerShellPath = path.join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+  const command = [
+    "Add-Type -AssemblyName System.Drawing",
+    "$collection = New-Object System.Drawing.Text.InstalledFontCollection",
+    "@($collection.Families | ForEach-Object { $_.Name } | Sort-Object -Unique) | ConvertTo-Json -Compress"
+  ].join('; ');
+  const encodedCommand = Buffer.from(command, 'utf16le').toString('base64');
+  const output = await runFileCommand(powerShellPath, ['-NoProfile', '-NonInteractive', '-EncodedCommand', encodedCommand]);
+  const parsed = JSON.parse(output.trim() || '[]');
+  return normalizeInstalledFontFamilies(parsed);
+}
+
+function getRegistryFontFamilyName(displayName) {
+  let family = String(displayName || '')
+    .replace(/\s*\((?:TrueType|OpenType)\)\s*$/i, '')
+    .trim();
+  const styleSuffix = /\s+(?:Regular|Roman|Italic|Oblique|Bold|Semibold|Semi Bold|Demi Bold|Light|Extra Light|Ultra Light|Medium|Black|Heavy|Extra Bold|Ultra Bold)$/i;
+  while (styleSuffix.test(family)) family = family.replace(styleSuffix, '').trim();
+  return family;
+}
+
+async function readInstalledFontsFromRegistry() {
+  const systemRoot = process.env.SystemRoot || 'C:\\Windows';
+  const registryPath = path.join(systemRoot, 'System32', 'reg.exe');
+  const keys = [
+    'HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Fonts',
+    'HKCU\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Fonts'
+  ];
+  const outputs = await Promise.all(keys.map(key => runFileCommand(registryPath, ['QUERY', key]).catch(() => '')));
+  const families = outputs.flatMap(output => output.split(/\r?\n/).map(line => {
+    const match = line.match(/^\s+(.+?)\s+REG_(?:SZ|EXPAND_SZ)\s+.+$/i);
+    return match ? getRegistryFontFamilyName(match[1]) : '';
+  }));
+  return normalizeInstalledFontFamilies(families);
+}
+
+async function discoverInstalledWindowsFonts() {
+  if (process.platform !== 'win32') return { families: [], source: 'unsupported' };
+  try {
+    const families = await readInstalledFontsFromSystemDrawing();
+    if (families.length > 0) return { families, source: 'windows-font-collection' };
+  } catch (error) {
+    console.warn('Windows font collection lookup failed; trying the registry:', error.message);
+  }
+
+  const families = await readInstalledFontsFromRegistry();
+  return { families, source: 'windows-registry' };
+}
+
+ipcMain.handle('get-installed-fonts', async (_event, options = {}) => {
+  const forceRefresh = options?.forceRefresh === true;
+  const cacheIsFresh = installedFontCache.families.length > 0
+    && Date.now() - installedFontCache.loadedAt < INSTALLED_FONT_CACHE_DURATION_MS;
+  if (!forceRefresh && cacheIsFresh) return { ...installedFontCache };
+
+  if (!installedFontLoadPromise) {
+    installedFontLoadPromise = discoverInstalledWindowsFonts()
+      .then(result => {
+        installedFontCache = { ...result, loadedAt: Date.now() };
+        return { ...installedFontCache };
+      })
+      .finally(() => {
+        installedFontLoadPromise = null;
+      });
+  }
+
+  try {
+    return await installedFontLoadPromise;
+  } catch (error) {
+    console.error('Failed to discover installed Windows fonts:', error);
+    return { families: [], source: 'error', loadedAt: Date.now(), error: error.message };
+  }
+});
+
+ipcMain.handle('open-local-file', async (_event, requestedPath) => {
+  if (typeof requestedPath !== 'string' || !requestedPath.trim()) {
+    return { success: false, error: 'The local file path is missing.' };
+  }
+  try {
+    const filePath = path.resolve(requestedPath);
+    if (!supportedLocalAssetExtensions.has(path.extname(filePath).toLowerCase())) {
+      return { success: false, error: 'This file type is not enabled for native-app opening.' };
+    }
+    if (!fs.existsSync(filePath) || !fs.statSync(filePath).isFile()) {
+      return { success: false, error: 'The local file could not be found.' };
+    }
+    const errorMessage = await shell.openPath(filePath);
+    return errorMessage
+      ? { success: false, error: errorMessage }
+      : { success: true, error: '' };
+  } catch (error) {
+    console.error('Failed to open local design asset:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('reveal-local-file', async (_event, requestedPath) => {
+  if (typeof requestedPath !== 'string' || !requestedPath.trim()) return false;
+  try {
+    const filePath = path.resolve(requestedPath);
+    if (!supportedLocalAssetExtensions.has(path.extname(filePath).toLowerCase()) || !fs.existsSync(filePath)) return false;
+    shell.showItemInFolder(filePath);
+    return true;
+  } catch (error) {
+    console.error('Failed to reveal local design asset:', error);
     return false;
   }
 });

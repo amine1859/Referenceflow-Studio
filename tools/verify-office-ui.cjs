@@ -490,6 +490,21 @@ async function main() {
     });
     assert.ok(shortcutLayout.width >= 315, `Settings panel should be wide enough for shortcut controls (${shortcutLayout.width}px).`);
     assert.ok(shortcutLayout.rows.every(row => row.labelRight <= row.controlsLeft + 0.5), 'Shortcut labels should never overlap their assignment controls.');
+    const assetSearchShortcutInput = await page.$('input[aria-label="Search boards & assets shortcut"]');
+    assert.ok(assetSearchShortcutInput, 'Universal asset search should have a customizable shortcut row.');
+    assert.strictEqual(await assetSearchShortcutInput.evaluate(input => input.value), 'Ctrl + Alt + F');
+    await assetSearchShortcutInput.focus();
+    await page.keyboard.down('Shift');
+    await page.keyboard.press('F');
+    await page.keyboard.up('Shift');
+    assert.strictEqual(await page.evaluate(() => JSON.parse(localStorage.getItem('ref-flow-shortcuts') || '{}').assetSearch), 'shift+f');
+    await assetSearchShortcutInput.focus();
+    await page.keyboard.down('Control');
+    await page.keyboard.down('Alt');
+    await page.keyboard.press('F');
+    await page.keyboard.up('Alt');
+    await page.keyboard.up('Control');
+    assert.strictEqual(await page.evaluate(() => JSON.parse(localStorage.getItem('ref-flow-shortcuts') || '{}').assetSearch), 'ctrl+alt+f');
     const browserStartupStatus = await page.$eval('[data-start-on-boot-status]', element => element.textContent.trim());
     assert.match(browserStartupStatus, /packaged Windows app/i);
     const shortcutInput = await page.$('input[aria-label="Minimize/Expand pill shortcut"]');
@@ -989,6 +1004,93 @@ async function main() {
     await page.click('button[aria-label="Back to all boards"]');
     await page.waitForSelector('button[title="Click to rename board"]');
 
+    assert.ok(await page.$('[data-import-refflow-package]'), 'The Boards menu should expose portable .refflow package import.');
+    assert.ok(await page.$('[data-export-refflow-package]'), 'Every board should expose portable .refflow package export.');
+    assert.ok(await page.$('[data-brand-kit-template-card]'), 'The Boards menu should offer the Brand Kit template.');
+    await page.$eval('[data-brand-kit-template-card]', button => button.click());
+    await page.waitForFunction(() => Array.from(document.querySelectorAll('button[title="Click to rename board"]')).some(button => button.textContent?.trim() === 'Brand Kit'));
+    const overflowingBoardActions = await page.$$eval('[data-board-card]', cards => cards.flatMap(card => {
+      const cardRect = card.getBoundingClientRect();
+      return Array.from(card.querySelectorAll('[data-board-card-action-grid] button')).flatMap(button => {
+        const buttonRect = button.getBoundingClientRect();
+        return buttonRect.left < cardRect.left - 0.5 || buttonRect.right > cardRect.right + 0.5
+          ? [button.textContent?.trim() || 'unnamed action']
+          : [];
+      });
+    }));
+    assert.deepStrictEqual(overflowingBoardActions, [], 'Board action buttons should remain inside every card at the three-column manager width.');
+    await page.evaluate(({ png }) => {
+      const bytes = Uint8Array.from(atob(png), character => character.charCodeAt(0));
+      const transfer = new DataTransfer();
+      transfer.items.add(new File([bytes], 'brand-logo.png', { type: 'image/png' }));
+      window.dispatchEvent(new DragEvent('drop', { dataTransfer: transfer, clientX: 720, clientY: 240, bubbles: true, cancelable: true }));
+    }, { png: tinyPng });
+    await new Promise(resolve => setTimeout(resolve, 2200));
+    await page.$$eval('.rf-card', cards => {
+      const brandKitCard = cards.find(card => card.querySelector('button[title="Click to rename board"]')?.textContent?.trim() === 'Brand Kit');
+      const editButton = Array.from(brandKitCard?.querySelectorAll('button') || []).find(button => button.textContent?.trim() === 'Edit Content');
+      if (!editButton) throw new Error('The Brand Kit Edit Content action was not found.');
+      editButton.click();
+    });
+    await page.waitForSelector('[data-board-folder-filter]');
+    const brandKitFolders = await page.$$eval('[data-board-folder]', folders => folders.map(folder => folder.getAttribute('data-board-folder')));
+    assert.deepStrictEqual(brandKitFolders, [
+      'Overview', 'Moodboard', 'Guidelines', 'Logos', 'Colors', 'Typography', 'Icons', 'Imagery', 'Textures & Patterns', 'Templates',
+      'Images', 'Documents', 'PDFs', 'Illustration', 'InDesign', 'Photoshop', 'Notes', 'Sketches'
+    ], 'Brand Kits should combine the creative template with smart file-type folders.');
+
+    await page.click('[data-board-folder="Colors"]');
+    await page.waitForSelector('[data-brand-colors-panel]');
+    await page.waitForSelector('select[aria-label="Choose logo for color extraction"]:not(:disabled)');
+    await page.click('[data-extract-logo-colors]');
+    await page.waitForSelector('[data-extracted-logo-palette]');
+    await page.click('[data-add-extracted-logo-palette]');
+    await page.waitForFunction(() => document.querySelectorAll('[data-brand-color]').length > 0);
+    await page.type('input[aria-label="Brand color name"]', 'Primary');
+    await page.click('[data-add-brand-color]');
+    await page.waitForSelector('[data-brand-color="#5E6BFF"]');
+    assert.strictEqual(await page.$eval('[data-brand-color="#5E6BFF"] input[aria-label^="Rename"]', input => input.value), 'Primary');
+    assert.ok(await page.$('[data-brand-color-group="primary"] [data-brand-color="#5E6BFF"]'), 'The first color should be grouped as Primary.');
+    assert.strictEqual(await page.$$eval('[data-brand-color="#5E6BFF"] [data-brand-color-formats] button', buttons => buttons.length), 4, 'Each brand color should expose HEX, RGB, HSL, and CMYK copy actions.');
+    await page.evaluate(() => { window.__refflowCopiedText = ''; });
+    await page.click('button[aria-label="Copy Primary RGB"]');
+    await page.waitForFunction(() => document.querySelector('button[aria-label="Copy Primary RGB"]')?.textContent?.includes('Copied'));
+    await page.waitForFunction(() => window.__refflowCopiedText === 'rgb(94, 107, 255)');
+    assert.strictEqual(await page.evaluate(() => window.__refflowCopiedText), 'rgb(94, 107, 255)');
+    await page.select('select[aria-label="Brand color group"]', 'secondary');
+    await page.type('input[aria-label="Brand color name"]', 'Support');
+    await page.$eval('input[aria-label="Brand color hex code"]', element => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+      setter.call(element, '#22C55E');
+      element.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    await page.click('[data-add-brand-color]');
+    await page.waitForSelector('[data-brand-color-group="secondary"] [data-brand-color="#22C55E"]');
+
+    await page.click('[data-board-folder="Typography"]');
+    await page.waitForSelector('[data-brand-typography-panel]');
+    assert.ok(await page.$('[data-load-installed-fonts]'), 'Brand Typography should expose installed Windows font discovery.');
+    assert.strictEqual(await page.$eval('input[aria-label="Font family"]', input => input.getAttribute('list')), 'refflow-installed-font-families', 'Manual font entry should also offer installed-font suggestions.');
+    await page.click('[data-add-brand-typography]');
+    await page.waitForSelector('[data-brand-typography="Heading"]');
+    assert.strictEqual(await page.$eval('[data-brand-typography="Heading"] input[aria-label="Edit Heading font family"]', input => input.value), 'Inter');
+    assert.ok(await page.$('[data-export-current-refflow-package]'), 'Brand Kits should be exportable from their content editor.');
+
+    await page.$eval('button[aria-label="Back to all boards"]', button => button.click());
+    await page.waitForSelector('[data-board-search-input]');
+    await page.waitForFunction(() => document.querySelector('[data-manager-main] h1')?.textContent?.trim() === 'Project Boards'
+      && Array.from(document.querySelectorAll('button[title="Click to rename board"]')).some(button => button.textContent?.trim() === 'Brand Kit'));
+    await page.$eval('[data-board-search-input]', element => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+      setter.call(element, '#5E6BFF');
+      element.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    await page.waitForFunction(() => Array.from(document.querySelectorAll('[data-board-search-matches]')).some(element => element.textContent?.includes('#5E6BFF')));
+    assert.strictEqual(await page.$$eval('button[title="Click to rename board"]', buttons => buttons.filter(button => button.textContent?.trim() === 'Brand Kit').length), 1, 'Universal board search should find assets by hex value.');
+    await page.click('button[aria-label="Clear workspace search"]');
+    await page.click('button[title="Premium Reference Board"]');
+    await page.waitForFunction(() => document.querySelector('button[title="Premium Reference Board"]')?.closest('[data-sidebar-board-row]')?.className.includes('bg-surface-elevated'));
+
     await page.click('button[title="Collapse sidebar"]');
     await page.waitForFunction(() => (document.querySelector('[data-manager-sidebar]')?.getBoundingClientRect().width || 999) < 100);
     assert.ok(await page.$('button[title="Expand sidebar"]'), 'The collapsed sidebar should expose a clear expand action.');
@@ -1016,6 +1118,16 @@ async function main() {
     await page.waitForFunction(() => document.querySelector('[data-sidebar-board-name]')?.getAttribute('title') === 'Sidebar Reference Board');
     assert.strictEqual(await page.$eval('button[title="Click to rename board"]', element => element.textContent.trim()), 'Sidebar Reference Board', 'Renaming from the sidebar should update the board card immediately.');
     assert.ok(await page.$('[data-manager-sidebar]'), 'Sidebar renaming should keep the board manager open.');
+    await page.click('button[title="Close Manager"]');
+    await page.waitForFunction(() => !document.querySelector('[data-manager-sidebar]'));
+    await page.keyboard.down('Control');
+    await page.keyboard.down('Alt');
+    await page.keyboard.press('F');
+    await page.keyboard.up('Alt');
+    await page.keyboard.up('Control');
+    await page.waitForSelector('[data-board-search-input]');
+    await page.waitForFunction(() => document.activeElement?.hasAttribute('data-board-search-input'));
+    assert.strictEqual(await page.$eval('[data-manager-main] h1', element => element.textContent.trim()), 'Project Boards', 'The universal asset-search shortcut should open All Boards.');
     await page.click('button[title="Close Manager"]');
     await page.waitForFunction(() => !document.querySelector('[data-manager-sidebar]'));
     const retractedPill = await page.$('.floating-pill');
@@ -1048,7 +1160,7 @@ async function main() {
       const logoRect = logo.getBoundingClientRect();
       return Math.max(logoRect.width / buttonRect.width, logoRect.height / buttonRect.height);
     });
-    assert.ok(retractedLogoScale >= 0.48 && retractedLogoScale <= 0.56, `The retracted logo should be compact without becoming too small: ${retractedLogoScale}.`);
+    assert.ok(retractedLogoScale >= 0.36 && retractedLogoScale <= 0.44, `The retracted logo should be noticeably smaller while remaining legible: ${retractedLogoScale}.`);
     await page.click('button[title="Expand Pill"]');
     await page.waitForSelector('[data-pill-preview-type="docx"][data-pill-label="Board brief.docx"]');
     await page.waitForSelector('[data-pill-preview-type="note"][data-pill-label="Client notes"]');
@@ -1210,7 +1322,7 @@ async function main() {
     await startupPage.waitForFunction(() => !document.querySelector('input[aria-label="Start on Boot"]')?.checked);
     const startupCalls = await startupPage.evaluate(() => window.__startupInvokeCalls);
     assert.ok(startupCalls.some(call => call[0] === 'set-start-on-boot' && call[1] === false), 'Start on Boot should wait for confirmed IPC registration changes.');
-    assert.strictEqual(await startupPage.evaluate(() => localStorage.getItem('ref-flow-api-keys')), null, 'The 1.7.1 migration should remove saved API keys.');
+    assert.strictEqual(await startupPage.evaluate(() => localStorage.getItem('ref-flow-api-keys')), null, 'The no-key search migration should remove saved API keys.');
     assert.strictEqual(await startupPage.evaluate(() => localStorage.getItem('ref-flow-pill-opacity')), null, 'The glass-control migration should remove the redundant legacy pill opacity value.');
     const migratedProviders = await startupPage.evaluate(() => JSON.parse(localStorage.getItem('ref-flow-provider-order') || '[]').sort());
     assert.deepStrictEqual(migratedProviders, ['Openverse', 'Wikimedia Commons']);
@@ -1252,7 +1364,14 @@ async function main() {
       sketches: 'drawn pill preview, movement, neighboring-window snapping, and all invisible resize edges/corners passed',
       documentControls: 'Reset label and rotate visibility passed',
       providerSettings: 'no-key provider migration and API-setting removal passed',
-      boardManager: 'unclipped collapsed expand control, sidebar and card renaming, content editor, and close flow passed',
+      brandKit: 'Moodboard, guidelines, logos, colors, typography, creative assets, and templates passed',
+      smartFolders: '18 Brand Kit and file-type folders passed',
+      brandColors: 'primary and secondary groups with HEX, RGB, HSL, and CMYK copy passed',
+      logoColorExtraction: 'logo palette extraction and palette import passed',
+      brandTypography: 'editable role, installed Windows font picker, manual family, weight, and sample text passed',
+      portablePackages: 'board and Brand Kit package controls passed',
+      universalAssetSearch: 'board contents, hex values, and customizable Ctrl+Alt+F shortcut passed',
+      boardManager: 'contained card actions, unclipped collapsed expand control, sidebar and card renaming, content editor, and close flow passed',
       previewOrdering: 'mixed media, note, and sketch drag-to-reorder persisted between the pill and Edit Board',
       mediaNames: 'original filenames plus pill and board-editor inline renaming passed',
       noteAndSketchNames: 'pill and board-editor rename persistence passed',

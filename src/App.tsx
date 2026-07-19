@@ -1,13 +1,13 @@
 ﻿import React, { useState, useCallback, useRef, useEffect } from 'react';
 import { 
   Settings, Plus, X, Trash2, Maximize2, Minimize2, Move, Lock, Unlock, SlidersHorizontal, ChevronLeft, ChevronRight, RotateCw, Palette, FileText, Monitor, Check, Edit2, Download,
-  Pin, PinOff, Eye, EyeOff, Edit3, ChevronDown, ChevronUp, PenTool, Eraser, ZoomIn, ZoomOut, Maximize, Bold, Italic, List, Search, Loader2, Heart, Link as LinkIcon, Table2, Copy, Sparkles, FolderOpen, LayoutGrid, PanelLeftClose, PanelLeftOpen, GripVertical
+  Pin, PinOff, Eye, EyeOff, Edit3, ChevronDown, ChevronUp, PenTool, Eraser, ZoomIn, ZoomOut, Maximize, Bold, Italic, List, Search, Loader2, Heart, Link as LinkIcon, Table2, Copy, Sparkles, FolderOpen, LayoutGrid, PanelLeftClose, PanelLeftOpen, GripVertical, ExternalLink, Type, SwatchBook, FolderInput, PackageOpen, Upload
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import Markdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { FloatingImage, FloatingMediaType, FloatingNote, FloatingSketch, FloatingSketchLine, ImageAnnotationPoint, Project, getProjects, createProject, updateProject, deleteProject, getActiveProjectId, setActiveProjectId, fileToBase64 } from './lib/store';
-import { createLocalBoardManifest, createProjectMediaSnapshot, getBackgroundMediaFileName, getFloatingMediaFileName, getSavedMediaExtension, projectMediaSnapshotsEqual, sanitizeExportStem } from './lib/projectMedia';
+import { BRAND_KIT_FOLDER_NAMES, BrandColor, BrandTypographyStyle, DesignAsset, DesignAssetKind, FloatingImage, FloatingMediaType, FloatingNote, FloatingSketch, FloatingSketchLine, ImageAnnotationPoint, Project, ProjectTemplate, getProjects, createProject, updateProject, deleteProject, getActiveProjectId, setActiveProjectId, fileToBase64 } from './lib/store';
+import { createLocalBoardManifest, createProjectMediaSnapshot, getBackgroundMediaFileName, getFloatingMediaFileName, getFloatingMediaRelativePath, getSavedMediaExtension, projectMediaSnapshotsEqual, sanitizeExportStem } from './lib/projectMedia';
 import type { ProjectMediaSnapshot } from './lib/projectMedia';
 import { resizeWindowFromEdge, resizeWindowWithAspectRatio, snapWindowRect } from './lib/windowGeometry';
 import type { EdgeResizeStart, WindowRect, WindowResizeEdge } from './lib/windowGeometry';
@@ -32,9 +32,34 @@ pdfjs.GlobalWorkerOptions.workerSrc = new URL(
 ).toString();
 
 const PATREON_URL = 'https://www.patreon.com/RefFlowStudio';
+const REFLOW_PACKAGE_MAGIC = 'REFFLOW-PACKAGE-1\n';
 const DOCX_MIME_TYPE = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
 const XLSX_MIME_TYPE = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
-const SUPPORTED_MEDIA_ACCEPT = `image/*,application/pdf,${DOCX_MIME_TYPE},${XLSX_MIME_TYPE},.docx,.xlsx`;
+const DESIGN_ASSET_EXTENSIONS = ['psd', 'psb', 'ai', 'ait', 'eps', 'indd', 'indt', 'idml', 'otf', 'ttf', 'woff', 'woff2'] as const;
+const DESIGN_ASSET_EXTENSION_SET = new Set<string>(DESIGN_ASSET_EXTENSIONS);
+const SUPPORTED_MEDIA_ACCEPT = `image/*,application/pdf,${DOCX_MIME_TYPE},${XLSX_MIME_TYPE},.docx,.xlsx,${DESIGN_ASSET_EXTENSIONS.map(extension => `.${extension}`).join(',')}`;
+
+const getDesignAssetKind = (file: Pick<File, 'name'>): DesignAssetKind | null => {
+  const extension = String(file.name || '').toLowerCase().split('.').pop() || '';
+  return DESIGN_ASSET_EXTENSION_SET.has(extension) ? extension as DesignAssetKind : null;
+};
+
+const isFontAssetKind = (kind: DesignAssetKind) => ['otf', 'ttf', 'woff', 'woff2'].includes(kind);
+
+const getDesignAssetDisplayName = (asset: DesignAsset) => String(asset.displayName || asset.fileName || '').trim() || `${asset.kind.toUpperCase()} file`;
+
+const formatFileSize = (bytes: number) => {
+  if (!Number.isFinite(bytes) || bytes <= 0) return 'Local file';
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(bytes >= 10 * 1024 * 1024 ? 0 : 1)} MB`;
+};
+
+const sanitizeLocalFolderName = (value: string) => String(value || 'Folder')
+  .replace(/[<>:"/\\|?*\u0000-\u001F]/g, '-')
+  .replace(/[. ]+$/g, '')
+  .trim()
+  .slice(0, 80) || 'Folder';
 
 const getImportedMediaType = (file: Pick<File, 'name' | 'type'>): FloatingMediaType | null => {
   const lowerName = String(file.name || '').toLowerCase();
@@ -44,6 +69,19 @@ const getImportedMediaType = (file: Pick<File, 'name' | 'type'>): FloatingMediaT
   if (mimeType === DOCX_MIME_TYPE || lowerName.endsWith('.docx')) return 'docx';
   if (mimeType === XLSX_MIME_TYPE || lowerName.endsWith('.xlsx')) return 'xlsx';
   return null;
+};
+
+const getAutomaticFolderNameForFile = (file: Pick<File, 'name' | 'type'>) => {
+  const mediaType = getImportedMediaType(file);
+  if (mediaType === 'image') return 'Images';
+  if (mediaType === 'docx' || mediaType === 'xlsx') return 'Documents';
+  if (mediaType === 'pdf') return 'PDFs';
+  const assetKind = getDesignAssetKind(file);
+  if (assetKind === 'ai' || assetKind === 'ait' || assetKind === 'eps') return 'Illustration';
+  if (assetKind === 'indd' || assetKind === 'indt' || assetKind === 'idml') return 'InDesign';
+  if (assetKind === 'psd' || assetKind === 'psb') return 'Photoshop';
+  if (assetKind && isFontAssetKind(assetKind)) return 'Typography';
+  return '';
 };
 
 const isOfficeDocument = (type?: FloatingMediaType) => type === 'docx' || type === 'xlsx';
@@ -73,7 +111,7 @@ const getNoteDisplayName = (note: FloatingNote, index = 0) => String(note.name |
 
 const getSketchDisplayName = (sketch: FloatingSketch, index = 0) => String(sketch.name || '').trim() || `Sketch ${index + 1}`;
 
-type PreviewReorderKind = 'media' | 'note' | 'sketch';
+type PreviewReorderKind = 'media' | 'note' | 'sketch' | 'asset';
 
 type PreviewReorderSession = {
   surface: 'pill' | 'board';
@@ -86,12 +124,13 @@ type PreviewCollections = {
   media: FloatingImage[];
   note: FloatingNote[];
   sketch: FloatingSketch[];
+  asset: DesignAsset[];
 };
 
 type OrderedPreviewEntry = {
   kind: PreviewReorderKind;
   id: string;
-  item: FloatingImage | FloatingNote | FloatingSketch;
+  item: FloatingImage | FloatingNote | FloatingSketch | DesignAsset;
   fallbackOrder: number;
 };
 
@@ -134,11 +173,12 @@ const reorderPreviewCollections = (
   const [moved] = ordered.splice(sourceIndex, 1);
   ordered.splice(targetIndex, 0, moved);
 
-  const next: PreviewCollections = { media: [], note: [], sketch: [] };
+  const next: PreviewCollections = { media: [], note: [], sketch: [], asset: [] };
   ordered.forEach((entry, previewOrder) => {
     if (entry.kind === 'media') next.media.push({ ...(entry.item as FloatingImage), previewOrder });
     if (entry.kind === 'note') next.note.push({ ...(entry.item as FloatingNote), previewOrder });
     if (entry.kind === 'sketch') next.sketch.push({ ...(entry.item as FloatingSketch), previewOrder });
+    if (entry.kind === 'asset') next.asset.push({ ...(entry.item as DesignAsset), previewOrder });
   });
   return next;
 };
@@ -231,6 +271,39 @@ const normalizeHexColor = (value: string): string | null => {
   if (!rgbMatch) return null;
   const toHex = (channel: string) => Math.min(255, Number(channel)).toString(16).padStart(2, '0').toUpperCase();
   return `#${toHex(rgbMatch[1])}${toHex(rgbMatch[2])}${toHex(rgbMatch[3])}`;
+};
+
+const getBrandColorFormats = (rawHex: string) => {
+  const hex = normalizeHexColor(rawHex) || '#000000';
+  const r = parseInt(hex.slice(1, 3), 16);
+  const g = parseInt(hex.slice(3, 5), 16);
+  const b = parseInt(hex.slice(5, 7), 16);
+  const red = r / 255;
+  const green = g / 255;
+  const blue = b / 255;
+  const max = Math.max(red, green, blue);
+  const min = Math.min(red, green, blue);
+  const lightness = (max + min) / 2;
+  const delta = max - min;
+  let hue = 0;
+  let saturation = 0;
+  if (delta > 0) {
+    saturation = delta / (1 - Math.abs((2 * lightness) - 1));
+    if (max === red) hue = 60 * (((green - blue) / delta) % 6);
+    else if (max === green) hue = 60 * (((blue - red) / delta) + 2);
+    else hue = 60 * (((red - green) / delta) + 4);
+  }
+  if (hue < 0) hue += 360;
+  const black = 1 - max;
+  const cyan = black >= 1 ? 0 : (1 - red - black) / (1 - black);
+  const magenta = black >= 1 ? 0 : (1 - green - black) / (1 - black);
+  const yellow = black >= 1 ? 0 : (1 - blue - black) / (1 - black);
+  return [
+    { label: 'HEX', value: hex },
+    { label: 'RGB', value: `rgb(${r}, ${g}, ${b})` },
+    { label: 'HSL', value: `hsl(${Math.round(hue)}, ${Math.round(saturation * 100)}%, ${Math.round(lightness * 100)}%)` },
+    { label: 'CMYK', value: `cmyk(${Math.round(cyan * 100)}%, ${Math.round(magenta * 100)}%, ${Math.round(yellow * 100)}%, ${Math.round(black * 100)}%)` }
+  ];
 };
 
 const dataUrlToUint8Array = (dataUrl: string): Uint8Array => {
@@ -1463,6 +1536,7 @@ export default function App() {
   const [images, setImages] = useState<string[]>([]);
   const [floatingImages, setFloatingImages] = useState<FloatingImage[]>([]);
   const [floatingNotes, setFloatingNotes] = useState<FloatingNote[]>([]);
+  const [designAssets, setDesignAssets] = useState<DesignAsset[]>([]);
   const [showSettings, setShowSettings] = useState(false);
   const [showProviderSettings, setShowProviderSettings] = useState(false);
   const [showSearchComponent, setShowSearchComponent] = useState(false);
@@ -1510,6 +1584,10 @@ export default function App() {
   const [activeProjectId, setActiveProjectIdState] = useState<string | null>(null);
   const [showManager, setShowManager] = useState(false);
   const [isManagerSidebarCollapsed, setIsManagerSidebarCollapsed] = useState(false);
+  const [boardSearchQuery, setBoardSearchQuery] = useState('');
+  const universalAssetSearchInputRef = useRef<HTMLInputElement>(null);
+  const [managerFolderFilter, setManagerFolderFilter] = useState('all');
+  const [pillFolderFilter, setPillFolderFilter] = useState('all');
   const [isLoading, setIsLoading] = useState(true);
   const [isEmptyBoardPromptDismissed, setIsEmptyBoardPromptDismissed] = useState(false);
   const [managingProjectId, setManagingProjectId] = useState<string | null>(null);
@@ -1519,6 +1597,22 @@ export default function App() {
   const [editingMediaId, setEditingMediaId] = useState<string | null>(null);
   const [editingMediaProjectId, setEditingMediaProjectId] = useState<string | null>(null);
   const [editingMediaName, setEditingMediaName] = useState("");
+  const [editingAssetId, setEditingAssetId] = useState<string | null>(null);
+  const [editingAssetProjectId, setEditingAssetProjectId] = useState<string | null>(null);
+  const [editingAssetName, setEditingAssetName] = useState('');
+  const [brandColorDraft, setBrandColorDraft] = useState<{ name: string; hex: string; group: 'primary' | 'secondary' }>({ name: '', hex: '#5E6BFF', group: 'primary' });
+  const [brandLogoSourceId, setBrandLogoSourceId] = useState('');
+  const [extractedBrandPalette, setExtractedBrandPalette] = useState<{ projectId: string; colors: string[] }>({ projectId: '', colors: [] });
+  const [isExtractingBrandPalette, setIsExtractingBrandPalette] = useState(false);
+  const [brandTypographyDraft, setBrandTypographyDraft] = useState({
+    name: 'Heading',
+    fontFamily: 'Inter',
+    weight: 600,
+    sampleText: 'The quick brown fox jumps over the lazy dog.'
+  });
+  const [installedFontFamilies, setInstalledFontFamilies] = useState<string[]>([]);
+  const [isLoadingInstalledFonts, setIsLoadingInstalledFonts] = useState(false);
+  const [installedFontsError, setInstalledFontsError] = useState('');
   const [editingCanvasItem, setEditingCanvasItem] = useState<{
     kind: 'note' | 'sketch';
     id: string;
@@ -1559,15 +1653,16 @@ export default function App() {
   const pillPreviewOrderSignature = [
     ...floatingImages.map(item => getPreviewItemKey('media', `${item.id}:${item.previewOrder ?? ''}`)),
     ...floatingNotes.map(item => getPreviewItemKey('note', `${item.id}:${item.previewOrder ?? ''}`)),
-    ...floatingSketches.map(item => getPreviewItemKey('sketch', `${item.id}:${item.previewOrder ?? ''}`))
+    ...floatingSketches.map(item => getPreviewItemKey('sketch', `${item.id}:${item.previewOrder ?? ''}`)),
+    ...designAssets.map(item => getPreviewItemKey('asset', `${item.id}:${item.previewOrder ?? ''}`))
   ].join('|');
   const pillPreviewOrderByKey = React.useMemo(() => new Map(
-    getOrderedPreviewEntries({ media: floatingImages, note: floatingNotes, sketch: floatingSketches })
+    getOrderedPreviewEntries({ media: floatingImages, note: floatingNotes, sketch: floatingSketches, asset: designAssets })
       .map((entry, index) => [getPreviewItemKey(entry.kind, entry.id), index])
   // Window movement changes coordinates but not this signature, so it does not
   // repeatedly sort every pill preview during high-frequency drag rendering.
   ), [pillPreviewOrderSignature]);
-  const hasAnyWorkspaceContent = floatingImages.length > 0 || floatingNotes.length > 0 || floatingSketches.length > 0;
+  const hasAnyWorkspaceContent = floatingImages.length > 0 || floatingNotes.length > 0 || floatingSketches.length > 0 || designAssets.length > 0;
 
   useEffect(() => {
     if (hasAnyWorkspaceContent) setIsEmptyBoardPromptDismissed(false);
@@ -1643,14 +1738,19 @@ export default function App() {
     files: File[],
     urls: string[],
     origin: { x: number; y: number },
-    collapsed = false
+    collapsed = false,
+    folderId?: string,
+    folderProject?: Project
   ): FloatingImage[] => {
+    const owner = folderProject || projectsRef.current.find(project => project.id === activeProjectId);
     return urls.map((url, i) => {
       const mediaType = getImportedMediaType(files[i]) || 'image';
       const isPdf = mediaType === 'pdf';
       const isOffice = isOfficeDocument(mediaType);
+      const automaticFolderId = (owner?.folders || []).find(folder => folder.name === getAutomaticFolderNameForFile(files[i]))?.id;
       return {
         id: Math.random().toString(36).substr(2, 9),
+        folderId: folderId || automaticFolderId,
         url,
         x: origin.x + (i * 20),
         y: origin.y + (i * 20),
@@ -1672,16 +1772,138 @@ export default function App() {
   const importMediaFiles = async (
     files: File[],
     origin: { x: number; y: number } = { x: position.x + pillDimensions.width + 20, y: position.y },
-    collapsed = false
+    collapsed = false,
+    folderId?: string
   ): Promise<FloatingImage[]> => {
     const mediaFiles = files.filter(file => getImportedMediaType(file) !== null);
     if (mediaFiles.length === 0) return [];
 
     const newMedia = await Promise.all(mediaFiles.map(fileToBase64));
-    const newFloatingImages = createFloatingMediaItems(mediaFiles, newMedia, origin, collapsed);
+    const newFloatingImages = createFloatingMediaItems(mediaFiles, newMedia, origin, collapsed, folderId);
     setIsRetracted(false);
     setFloatingImages(prev => [...prev, ...newFloatingImages]);
     return newFloatingImages;
+  };
+
+  const getFileSystemPath = (file: File) => {
+    const nodeRequire = getNodeRequire();
+    if (!nodeRequire) return '';
+    try {
+      const electron = nodeRequire('electron');
+      return String(electron.webUtils?.getPathForFile?.(file) || (file as File & { path?: string }).path || '');
+    } catch {
+      return '';
+    }
+  };
+
+  const resolveDesignAssetPath = (project: Project, asset: DesignAsset) => {
+    const nodeRequire = getNodeRequire();
+    if (!nodeRequire || !project.directoryPath || !asset.relativePath) return '';
+    const path = nodeRequire('path');
+    const root = path.resolve(project.directoryPath);
+    const candidate = path.resolve(root, asset.relativePath);
+    const relative = path.relative(root, candidate);
+    if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) return '';
+    return candidate;
+  };
+
+  const copyDesignAssetIntoBoard = (file: File, project: Project, requestedFolderId?: string): DesignAsset => {
+    const nodeRequire = getNodeRequire();
+    if (!nodeRequire || !project.directoryPath) throw new Error('Choose a local board folder before adding Adobe or font files.');
+    const fs = nodeRequire('fs');
+    const path = nodeRequire('path');
+    const sourcePath = getFileSystemPath(file);
+    if (!sourcePath || !fs.existsSync(sourcePath)) throw new Error(`${file.name} does not expose a readable local file path.`);
+
+    const kind = getDesignAssetKind(file);
+    if (!kind) throw new Error(`${file.name} is not a supported design asset.`);
+
+    const automaticFolder = (project.folders || []).find(folder => folder.name === getAutomaticFolderNameForFile(file))?.id;
+    const folderId = (project.folders || []).some(folder => folder.id === requestedFolderId)
+      ? requestedFolderId
+      : automaticFolder;
+    const folder = (project.folders || []).find(item => item.id === folderId);
+    const destinationDirectory = path.join(project.directoryPath, folder ? sanitizeLocalFolderName(folder.name) : 'Unsorted');
+    fs.mkdirSync(destinationDirectory, { recursive: true });
+
+    const safeFileName = String(file.name || `${kind.toUpperCase()} file.${kind}`)
+      .replace(/[<>:"/\\|?*\u0000-\u001F]/g, '-')
+      .replace(/[. ]+$/g, '') || `asset.${kind}`;
+    const extension = path.extname(safeFileName);
+    const stem = path.basename(safeFileName, extension);
+    let destinationPath = path.join(destinationDirectory, safeFileName);
+    let suffix = 2;
+    while (fs.existsSync(destinationPath) && path.resolve(destinationPath).toLowerCase() !== path.resolve(sourcePath).toLowerCase()) {
+      destinationPath = path.join(destinationDirectory, `${stem} (${suffix})${extension}`);
+      suffix += 1;
+    }
+    if (path.resolve(destinationPath).toLowerCase() !== path.resolve(sourcePath).toLowerCase()) {
+      fs.copyFileSync(sourcePath, destinationPath);
+    }
+    const stat = fs.statSync(destinationPath);
+
+    return {
+      id: Math.random().toString(36).slice(2, 11),
+      fileName: path.basename(destinationPath),
+      kind,
+      relativePath: path.relative(project.directoryPath, destinationPath).split(path.sep).join('/'),
+      size: stat.size,
+      modifiedAt: stat.mtimeMs || Date.now(),
+      folderId
+    };
+  };
+
+  const importDesignAssetFiles = async (
+    files: File[],
+    targetProject?: Project,
+    requestedFolderId?: string
+  ): Promise<DesignAsset[]> => {
+    const assetFiles = files.filter(file => getDesignAssetKind(file) !== null);
+    if (assetFiles.length === 0) return [];
+    const project = targetProject || projectsRef.current.find(item => item.id === activeProjectId);
+    if (!project) return [];
+
+    const projectWithDirectory = await ensureProjectLocalDirectory(project);
+    if (!projectWithDirectory.directoryPath) {
+      setDragError('Choose an autosave folder before adding Adobe or font files.');
+      return [];
+    }
+
+    const added: DesignAsset[] = [];
+    const failed: string[] = [];
+    for (const file of assetFiles) {
+      try {
+        added.push(copyDesignAssetIntoBoard(file, projectWithDirectory, requestedFolderId));
+      } catch (error) {
+        failed.push(error instanceof Error ? error.message : String(error));
+      }
+    }
+    if (failed.length > 0) setDragError(failed[0]);
+    if (added.length === 0) return [];
+
+    const latestProject = (await getProjects()).find(item => item.id === project.id) || projectWithDirectory;
+    const nextAssets = [...(latestProject.designAssets || []), ...added];
+    await updateProject(project.id, { designAssets: nextAssets });
+    const updatedProject = { ...latestProject, designAssets: nextAssets };
+    if (updatedProject.directoryPath) await syncBoardToPath(updatedProject, updatedProject.directoryPath, false);
+    const refreshedProjects = await getProjects();
+    setProjects(refreshedProjects);
+    if (project.id === activeProjectId) {
+      setDesignAssets(nextAssets);
+      setIsRetracted(false);
+    }
+    return added;
+  };
+
+  const importWorkspaceFiles = async (
+    files: File[],
+    origin: { x: number; y: number },
+    collapsed = false,
+    targetProject?: Project,
+    requestedFolderId?: string
+  ) => {
+    await importMediaFiles(files, origin, collapsed, requestedFolderId);
+    await importDesignAssetFiles(files, targetProject, requestedFolderId);
   };
 
   const scoreResult = (resultTitle: string, queryStr: string): number => {
@@ -2423,7 +2645,8 @@ export default function App() {
       settings: 'ctrl+alt+c',
       closeApp: 'ctrl+alt+q',
       flipBoards: 'ctrl+alt+b',
-      toggleWindows: 'ctrl+alt+w'
+      toggleWindows: 'ctrl+alt+w',
+      assetSearch: 'ctrl+alt+f'
     };
     const saved = localStorage.getItem('ref-flow-shortcuts');
     if (saved) {
@@ -2467,6 +2690,9 @@ export default function App() {
     setFloatingImages(p.floatingImages || []);
     setFloatingNotes(p.floatingNotes || []);
     setFloatingSketches(p.floatingSketches || []);
+    setDesignAssets(p.designAssets || []);
+    setPillFolderFilter('all');
+    setManagerFolderFilter('all');
     
     if (p.directoryPath) {
         setNeedsPermission(false);
@@ -2498,6 +2724,72 @@ export default function App() {
   const getElectron = () => {
     const nodeRequire = getNodeRequire();
     return nodeRequire ? nodeRequire('electron') : null;
+  };
+
+  const loadInstalledWindowsFonts = async (forceRefresh = false) => {
+    if (isLoadingInstalledFonts) return;
+    const electron = getElectron();
+    if (!electron?.ipcRenderer) {
+      setInstalledFontsError('Installed Windows fonts are available in the desktop app.');
+      return;
+    }
+
+    setIsLoadingInstalledFonts(true);
+    setInstalledFontsError('');
+    try {
+      const result = await electron.ipcRenderer.invoke('get-installed-fonts', { forceRefresh });
+      const families = Array.isArray(result?.families)
+        ? [...new Set<string>(result.families.map((family: unknown) => String(family || '').trim()).filter(Boolean))]
+        : [];
+      setInstalledFontFamilies(families);
+      if (families.length === 0) {
+        setInstalledFontsError(result?.error || 'Windows did not return any installed font families.');
+      }
+    } catch (error) {
+      console.error('Installed Windows font lookup failed:', error);
+      setInstalledFontsError('Could not read the installed Windows fonts.');
+    } finally {
+      setIsLoadingInstalledFonts(false);
+    }
+  };
+
+  const openDesignAsset = async (asset: DesignAsset, project?: Project) => {
+    const owner = project || projectsRef.current.find(item => item.id === activeProjectId);
+    if (!owner) return;
+    const filePath = resolveDesignAssetPath(owner, asset);
+    const electron = getElectron();
+    if (!filePath || !electron?.ipcRenderer) {
+      setDragError('This local file is unavailable. Re-add it from the board folder.');
+      return;
+    }
+    const result = await electron.ipcRenderer.invoke('open-local-file', filePath);
+    if (!result?.success) setDragError(result?.error || `Windows could not open ${getDesignAssetDisplayName(asset)}.`);
+  };
+
+  const revealDesignAsset = async (asset: DesignAsset, project?: Project) => {
+    const owner = project || projectsRef.current.find(item => item.id === activeProjectId);
+    if (!owner) return;
+    const filePath = resolveDesignAssetPath(owner, asset);
+    const electron = getElectron();
+    const revealed = filePath && electron?.ipcRenderer
+      ? await electron.ipcRenderer.invoke('reveal-local-file', filePath)
+      : false;
+    if (!revealed) setDragError('The file could not be revealed in its board folder.');
+  };
+
+  const beginDesignAssetDrag = (event: React.DragEvent<HTMLElement>, asset: DesignAsset, project?: Project) => {
+    event.stopPropagation();
+    const owner = project || projectsRef.current.find(item => item.id === activeProjectId);
+    const filePath = owner ? resolveDesignAssetPath(owner, asset) : '';
+    const electron = getElectron();
+    if (!filePath || !electron?.ipcRenderer) {
+      event.preventDefault();
+      setDragError('This local file is unavailable for dragging.');
+      return;
+    }
+    event.dataTransfer.effectAllowed = 'copy';
+    event.dataTransfer.setData('text/plain', filePath);
+    electron.ipcRenderer.send('start-drag', filePath);
   };
 
   const copyPaletteColor = async (rawColor: string) => {
@@ -2544,6 +2836,21 @@ export default function App() {
     }
 
     setCopiedColor(copied ? color : `error:${color}`);
+    if (colorCopyTimerRef.current !== null) window.clearTimeout(colorCopyTimerRef.current);
+    colorCopyTimerRef.current = window.setTimeout(() => {
+      setCopiedColor(null);
+      colorCopyTimerRef.current = null;
+    }, 1800);
+  };
+
+  const copyBrandColorInfo = async (value: string, copyKey: string) => {
+    try {
+      await writeTextToSystemClipboard(value);
+      setCopiedColor(copyKey);
+    } catch (error) {
+      console.error('Brand color information copy failed:', error);
+      setCopiedColor(`error:${copyKey}`);
+    }
     if (colorCopyTimerRef.current !== null) window.clearTimeout(colorCopyTimerRef.current);
     colorCopyTimerRef.current = window.setTimeout(() => {
       setCopiedColor(null);
@@ -2620,15 +2927,23 @@ export default function App() {
           ? 'Restarting...'
           : 'Check for updates';
 
-  const sanitizeProjectFolderName = (name: string) =>
-    (name || 'board')
-      .replace(/[^a-z0-9._-]+/gi, '_')
-      .replace(/^_+|_+$/g, '')
-      .toLowerCase()
-      .slice(0, 80) || 'board';
-
   const getProjectFolderName = (project: Pick<Project, 'id' | 'name'>) =>
-    `${sanitizeProjectFolderName(project.name)}-${project.id.slice(0, 8)}`;
+    sanitizeLocalFolderName(project.name || 'Untitled Board');
+
+  const alignProjectLocalDirectoryName = async (project: Project, requestedName = project.name): Promise<Project> => {
+    const nodeRequire = getNodeRequire();
+    if (!nodeRequire || !project.directoryPath) return { ...project, name: requestedName };
+    const fs = nodeRequire('fs');
+    const path = nodeRequire('path');
+    const currentPath = path.resolve(project.directoryPath);
+    const targetPath = path.join(path.dirname(currentPath), sanitizeLocalFolderName(requestedName));
+    if (currentPath.toLowerCase() === path.resolve(targetPath).toLowerCase()) return project;
+    if (fs.existsSync(targetPath)) throw new Error(`A local folder named “${path.basename(targetPath)}” already exists.`);
+    if (fs.existsSync(currentPath)) fs.renameSync(currentPath, targetPath);
+    const alignedProject = { ...project, name: requestedName, directoryPath: targetPath };
+    await updateProject(project.id, { name: requestedName, directoryPath: targetPath });
+    return alignedProject;
+  };
 
   const getInstalledAutosaveRoot = async () => {
     const electron = getElectron();
@@ -2653,7 +2968,7 @@ export default function App() {
         fs.existsSync(path.join(imagesDirectory, getBackgroundMediaFileName(source, index)))
       );
       const floatingFilesExist = (project.floatingImages || []).every(image =>
-        fs.existsSync(path.join(imagesDirectory, getFloatingMediaFileName(image)))
+        fs.existsSync(path.join(directoryPath, getFloatingMediaRelativePath(project, image)))
       );
       return backgroundFilesExist && floatingFilesExist;
     } catch {
@@ -2663,10 +2978,17 @@ export default function App() {
 
   const ensureProjectLocalDirectory = async (project: Project, preferredRoot?: string): Promise<Project> => {
     if (project.directoryPath) {
-      if (hasCompleteLocalMediaMirror(project, project.directoryPath)) {
-        mirroredMediaSnapshotsRef.current.set(project.id, createProjectMediaSnapshot(project));
+      let alignedProject = project;
+      try {
+        alignedProject = await alignProjectLocalDirectoryName(project);
+        if (alignedProject.directoryPath !== project.directoryPath) setProjects(await getProjects());
+      } catch (error) {
+        console.warn('The board folder name could not be aligned:', error);
       }
-      return project;
+      if (hasCompleteLocalMediaMirror(alignedProject, alignedProject.directoryPath || '')) {
+        mirroredMediaSnapshotsRef.current.set(alignedProject.id, createProjectMediaSnapshot(alignedProject));
+      }
+      return alignedProject;
     }
     if (!getNodeRequire()) return project;
     const root = preferredRoot || defaultAutosaveRoot || await getInstalledAutosaveRoot();
@@ -2814,10 +3136,18 @@ export default function App() {
           setFloatingImages(activeProj.floatingImages || []);
           setFloatingNotes(activeProj.floatingNotes || []);
           setFloatingSketches(activeProj.floatingSketches || []);
+          setDesignAssets(activeProj.designAssets || []);
           
           if (activeProj.directoryPath) {
-             if (hasCompleteLocalMediaMirror(activeProj, activeProj.directoryPath)) {
-               mirroredMediaSnapshotsRef.current.set(activeProj.id, createProjectMediaSnapshot(activeProj));
+             let alignedActiveProject = activeProj;
+             try {
+               alignedActiveProject = await alignProjectLocalDirectoryName(activeProj);
+               if (alignedActiveProject.directoryPath !== activeProj.directoryPath) setProjects(await getProjects());
+             } catch (error) {
+               console.warn('The active board folder could not be renamed to match the board:', error);
+             }
+             if (hasCompleteLocalMediaMirror(alignedActiveProject, alignedActiveProject.directoryPath || '')) {
+               mirroredMediaSnapshotsRef.current.set(alignedActiveProject.id, createProjectMediaSnapshot(alignedActiveProject));
              }
              setNeedsPermission(false);
           } else if (installedRoot) {
@@ -2847,6 +3177,10 @@ export default function App() {
     try {
       if ((await dirHandle.queryPermission({ mode: 'readwrite' })) !== 'granted') {
           return;
+      }
+
+      for (const folder of project.folders || []) {
+        await dirHandle.getDirectoryHandle(sanitizeLocalFolderName(folder.name), { create: true });
       }
 
       const extensionForUrl = (url: string, fallback = 'bin') => {
@@ -2951,6 +3285,9 @@ export default function App() {
       fs.mkdirSync(directoryPath, { recursive: true });
       const imagesDirectory = path.join(directoryPath, 'images');
       fs.mkdirSync(imagesDirectory, { recursive: true });
+      for (const folder of project.folders || []) {
+        fs.mkdirSync(path.join(directoryPath, sanitizeLocalFolderName(folder.name)), { recursive: true });
+      }
 
       const writeText = (fileName: string, content: string) => {
         fs.writeFileSync(path.join(directoryPath, fileName), content, 'utf8');
@@ -2973,18 +3310,19 @@ export default function App() {
         return Buffer.from(await response.arrayBuffer());
       };
 
-      const saveMedia = async (source: string, fileStem: string, type: FloatingMediaType = 'image') => {
+      const saveMedia = async (source: string, destination: string, type: FloatingMediaType = 'image') => {
         const sourceBuffer = await readMedia(source);
         const extension = getSavedMediaExtension(source, type);
+        fs.mkdirSync(path.dirname(destination), { recursive: true });
         if (extension === 'pdf' || extension === 'docx' || extension === 'xlsx') {
-          fs.writeFileSync(path.join(imagesDirectory, `${fileStem}.${extension}`), sourceBuffer);
+          fs.writeFileSync(destination, sourceBuffer);
           return;
         }
 
         const decodedImage = electron.nativeImage.createFromBuffer(sourceBuffer);
         if (decodedImage.isEmpty()) throw new Error('The image could not be decoded.');
         const encodedImage = extension === 'jpg' ? decodedImage.toJPEG(95) : decodedImage.toPNG();
-        fs.writeFileSync(path.join(imagesDirectory, `${fileStem}.${extension}`), encodedImage);
+        fs.writeFileSync(destination, encodedImage);
       };
 
       const manifestProject = createLocalBoardManifest(project, 'images/');
@@ -3012,6 +3350,41 @@ export default function App() {
       }
       writeText('notes.md', notes);
 
+      const itemMirrorDirectories = new Set([
+        path.join(directoryPath, 'Unsorted'),
+        ...(project.folders || []).map(folder => path.join(directoryPath, sanitizeLocalFolderName(folder.name)))
+      ]);
+      const getItemMirrorDirectory = (folderId?: string) => {
+        const folder = (project.folders || []).find(item => item.id === folderId);
+        return path.join(directoryPath, folder ? sanitizeLocalFolderName(folder.name) : 'Unsorted');
+      };
+      const expectedNoteFiles = new Set<string>();
+      for (const note of project.floatingNotes || []) {
+        const noteDirectory = getItemMirrorDirectory(note.folderId);
+        fs.mkdirSync(noteDirectory, { recursive: true });
+        const notePath = path.join(noteDirectory, `note_${sanitizeExportStem(note.id)}.md`);
+        fs.writeFileSync(notePath, `# ${getNoteDisplayName(note)}\n\n${note.text || ''}\n`, 'utf8');
+        expectedNoteFiles.add(path.resolve(notePath).toLowerCase());
+      }
+      const expectedSketchFiles = new Set<string>();
+      for (const sketch of project.floatingSketches || []) {
+        const sketchDirectory = getItemMirrorDirectory(sketch.folderId);
+        fs.mkdirSync(sketchDirectory, { recursive: true });
+        const sketchPath = path.join(sketchDirectory, `sketch_${sanitizeExportStem(sketch.id)}.json`);
+        fs.writeFileSync(sketchPath, JSON.stringify(sketch, null, 2), 'utf8');
+        expectedSketchFiles.add(path.resolve(sketchPath).toLowerCase());
+      }
+      for (const mirrorDirectory of itemMirrorDirectories) {
+        if (!fs.existsSync(mirrorDirectory)) continue;
+        for (const fileName of fs.readdirSync(mirrorDirectory)) {
+          const filePath = path.join(mirrorDirectory, fileName);
+          if (!fs.statSync(filePath).isFile()) continue;
+          const normalizedPath = path.resolve(filePath).toLowerCase();
+          if (/^note_.*\.md$/i.test(fileName) && !expectedNoteFiles.has(normalizedPath)) fs.unlinkSync(filePath);
+          if (/^sketch_.*\.json$/i.test(fileName) && !expectedSketchFiles.has(normalizedPath)) fs.unlinkSync(filePath);
+        }
+      }
+
       let saved = 0;
       const failed: string[] = [];
       if (syncMedia) {
@@ -3019,43 +3392,45 @@ export default function App() {
         const previousFloatingSources = new Map(
           (previousSnapshot?.floatingSources || []).map(item => [item.id, item])
         );
-        const mediaIndexPath = path.join(imagesDirectory, '.refflow-media-index.json');
+        const mediaIndexPath = path.join(directoryPath, '.refflow-media-index.json');
+        const legacyMediaIndexPath = path.join(imagesDirectory, '.refflow-media-index.json');
         let previousMediaIndex: Record<string, string> = {};
         try {
-          if (fs.existsSync(mediaIndexPath)) {
-            previousMediaIndex = JSON.parse(fs.readFileSync(mediaIndexPath, 'utf8'));
+          const readableIndexPath = fs.existsSync(mediaIndexPath) ? mediaIndexPath : legacyMediaIndexPath;
+          if (fs.existsSync(readableIndexPath)) {
+            previousMediaIndex = JSON.parse(fs.readFileSync(readableIndexPath, 'utf8'));
           }
         } catch (error) {
           console.warn('Could not read the board media index; changed files will be rebuilt.', error);
         }
 
         const nextMediaIndex: Record<string, string> = {};
-        const expectedFileNames = new Set<string>();
+        const expectedRelativePaths = new Set<string>();
         const saveIndexedMedia = async (
           source: string,
-          fileStem: string,
-          fileName: string,
+          relativePath: string,
           label: string,
           type: FloatingMediaType = 'image',
           sourceUnchanged = false
         ) => {
-          expectedFileNames.add(fileName);
-          const destination = path.join(imagesDirectory, fileName);
+          const normalizedRelativePath = relativePath.split(path.sep).join('/');
+          expectedRelativePaths.add(normalizedRelativePath);
+          const destination = path.join(directoryPath, normalizedRelativePath);
           if (sourceUnchanged && fs.existsSync(destination)) {
-            nextMediaIndex[fileName] = previousMediaIndex[fileName]
+            nextMediaIndex[normalizedRelativePath] = previousMediaIndex[normalizedRelativePath]
               || crypto.createHash('sha256').update(source).digest('hex');
             saved++;
             return;
           }
           const fingerprint = crypto.createHash('sha256').update(source).digest('hex');
-          if (previousMediaIndex[fileName] === fingerprint && fs.existsSync(destination)) {
-            nextMediaIndex[fileName] = fingerprint;
+          if (previousMediaIndex[normalizedRelativePath] === fingerprint && fs.existsSync(destination)) {
+            nextMediaIndex[normalizedRelativePath] = fingerprint;
             saved++;
             return;
           }
           try {
-            await saveMedia(source, fileStem, type);
-            nextMediaIndex[fileName] = fingerprint;
+            await saveMedia(source, destination, type);
+            nextMediaIndex[normalizedRelativePath] = fingerprint;
             saved++;
           } catch (error: any) {
             failed.push(`${label}: ${error?.message || String(error)}`);
@@ -3066,8 +3441,7 @@ export default function App() {
           const source = project.images[index];
           await saveIndexedMedia(
             source,
-            `background_${index + 1}`,
-            getBackgroundMediaFileName(source, index),
+            `images/${getBackgroundMediaFileName(source, index)}`,
             `Background ${index + 1}`,
             'image',
             previousSnapshot?.backgroundSources[index] === source
@@ -3078,17 +3452,25 @@ export default function App() {
           const mediaType = image.type || 'image';
           await saveIndexedMedia(
             image.url,
-            `floating_${sanitizeExportStem(image.id)}`,
-            getFloatingMediaFileName(image),
+            getFloatingMediaRelativePath(project, image),
             `${mediaType === 'image' ? 'Image' : mediaType.toUpperCase()} ${image.id}`,
             mediaType,
             previousImage?.source === image.url && previousImage.type === mediaType
           );
         }
 
-        for (const fileName of fs.readdirSync(imagesDirectory)) {
-          if (/^(background_|floating_)/i.test(fileName) && !expectedFileNames.has(fileName)) {
-            fs.unlinkSync(path.join(imagesDirectory, fileName));
+        const cleanupDirectories = new Set([
+          imagesDirectory,
+          path.join(directoryPath, 'Unsorted'),
+          ...(project.folders || []).map(folder => path.join(directoryPath, sanitizeLocalFolderName(folder.name)))
+        ]);
+        for (const cleanupDirectory of cleanupDirectories) {
+          if (!fs.existsSync(cleanupDirectory)) continue;
+          for (const fileName of fs.readdirSync(cleanupDirectory)) {
+            const filePath = path.join(cleanupDirectory, fileName);
+            if (!fs.statSync(filePath).isFile() || !/^(background_|floating_)/i.test(fileName)) continue;
+            const relativePath = path.relative(directoryPath, filePath).split(path.sep).join('/');
+            if (!expectedRelativePaths.has(relativePath)) fs.unlinkSync(filePath);
           }
         }
         fs.writeFileSync(mediaIndexPath, JSON.stringify(nextMediaIndex, null, 2), 'utf8');
@@ -3136,7 +3518,8 @@ export default function App() {
       images,
       floatingImages,
       floatingNotes,
-      floatingSketches
+      floatingSketches,
+      designAssets
     };
 
     queue.timer = window.setTimeout(() => {
@@ -3147,7 +3530,8 @@ export default function App() {
           images: projectSnapshot.images,
           floatingImages: projectSnapshot.floatingImages,
           floatingNotes: projectSnapshot.floatingNotes,
-          floatingSketches: projectSnapshot.floatingSketches
+          floatingSketches: projectSnapshot.floatingSketches,
+          designAssets: projectSnapshot.designAssets
         });
         setProjects(current => {
           const next = current.map(project => project.id === activeProjectId
@@ -3157,6 +3541,7 @@ export default function App() {
                 floatingImages: projectSnapshot.floatingImages,
                 floatingNotes: projectSnapshot.floatingNotes,
                 floatingSketches: projectSnapshot.floatingSketches,
+                designAssets: projectSnapshot.designAssets,
                 updatedAt: savedAt
               }
             : project
@@ -3189,7 +3574,248 @@ export default function App() {
         queue.timer = null;
       }
     };
-  }, [images, floatingImages, floatingNotes, floatingSketches, activeProjectId, isLoading, drainAutosaveQueue]);
+  }, [images, floatingImages, floatingNotes, floatingSketches, designAssets, activeProjectId, isLoading, drainAutosaveQueue]);
+
+  const exportPortableBoard = async (project: Project) => {
+    const electron = getElectron();
+    const nodeRequire = getNodeRequire();
+    if (!electron?.ipcRenderer || !nodeRequire) {
+      setDragError('Portable board packages are available in the desktop app.');
+      return;
+    }
+    const fs = nodeRequire('fs');
+    const path = nodeRequire('path');
+    const BufferCtor = nodeRequire('buffer').Buffer;
+    const projectSnapshot: Project = project.id === activeProjectId ? {
+      ...project,
+      images,
+      floatingImages,
+      floatingNotes,
+      floatingSketches,
+      designAssets
+    } : project;
+    const localProject = await ensureProjectLocalDirectory(projectSnapshot);
+
+    const sources: Array<{ asset: DesignAsset; filePath: string; size: number }> = [];
+    for (const asset of localProject.designAssets || []) {
+      const filePath = resolveDesignAssetPath(localProject, asset);
+      if (!filePath || !fs.existsSync(filePath)) continue;
+      const stat = fs.statSync(filePath);
+      if (stat.isFile()) sources.push({ asset, filePath, size: stat.size });
+    }
+    const includedAssetIds = new Set(sources.map(source => source.asset.id));
+    const portableProject: any = {
+      ...localProject,
+      directoryPath: undefined,
+      directoryHandle: undefined,
+      designAssets: (localProject.designAssets || []).filter(asset => includedAssetIds.has(asset.id)),
+      updatedAt: Date.now()
+    };
+    const header = {
+      format: 'refflow-board',
+      formatVersion: 1,
+      appVersion: '2.0.0',
+      exportedAt: new Date().toISOString(),
+      project: portableProject,
+      files: sources.map(source => ({
+        assetId: source.asset.id,
+        relativePath: source.asset.relativePath,
+        length: source.size
+      }))
+    };
+    const headerBuffer = BufferCtor.from(JSON.stringify(header), 'utf8');
+    const result = await electron.ipcRenderer.invoke('show-save-dialog', {
+      title: `Export ${project.name} as a RefFlow package`,
+      defaultPath: path.join(defaultAutosaveRoot || '', `${sanitizeLocalFolderName(project.name)}.refflow`),
+      filters: [{ name: 'RefFlow board package', extensions: ['refflow'] }]
+    });
+    if (result.canceled || !result.filePath) return;
+    const packagePath = result.filePath.toLowerCase().endsWith('.refflow') ? result.filePath : `${result.filePath}.refflow`;
+
+    let outputHandle: number | null = null;
+    try {
+      outputHandle = fs.openSync(packagePath, 'w');
+      fs.writeSync(outputHandle, BufferCtor.from(REFLOW_PACKAGE_MAGIC, 'utf8'));
+      const headerLength = BufferCtor.alloc(4);
+      headerLength.writeUInt32LE(headerBuffer.length, 0);
+      fs.writeSync(outputHandle, headerLength);
+      fs.writeSync(outputHandle, headerBuffer);
+
+      const copyBuffer = BufferCtor.allocUnsafe(1024 * 1024);
+      for (const source of sources) {
+        const inputHandle = fs.openSync(source.filePath, 'r');
+        try {
+          let position = 0;
+          while (position < source.size) {
+            const bytesRead = fs.readSync(inputHandle, copyBuffer, 0, Math.min(copyBuffer.length, source.size - position), position);
+            if (bytesRead <= 0) throw new Error(`Could not finish reading ${source.asset.fileName}.`);
+            fs.writeSync(outputHandle, copyBuffer, 0, bytesRead);
+            position += bytesRead;
+          }
+        } finally {
+          fs.closeSync(inputHandle);
+        }
+      }
+      alert(`${project.name} was exported as a portable RefFlow package${sources.length ? ` with ${sources.length} local file(s)` : ''}.`);
+    } catch (error) {
+      console.error('Portable board export failed:', error);
+      setDragError(`Package export failed: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      if (outputHandle !== null) fs.closeSync(outputHandle);
+    }
+  };
+
+  const importPortableBoard = async () => {
+    const electron = getElectron();
+    const nodeRequire = getNodeRequire();
+    if (!electron?.ipcRenderer || !nodeRequire) {
+      setDragError('Portable board packages are available in the desktop app.');
+      return;
+    }
+    const fs = nodeRequire('fs');
+    const path = nodeRequire('path');
+    const BufferCtor = nodeRequire('buffer').Buffer;
+    const result = await electron.ipcRenderer.invoke('show-open-dialog', {
+      title: 'Import a RefFlow board or Brand Kit',
+      properties: ['openFile'],
+      filters: [{ name: 'RefFlow board package', extensions: ['refflow'] }]
+    });
+    if (result.canceled || !result.filePaths?.[0]) return;
+
+    let root = defaultAutosaveRoot || await getInstalledAutosaveRoot();
+    if (!root) {
+      const rootResult = await electron.ipcRenderer.invoke('show-open-dialog', {
+        title: 'Choose where imported RefFlow boards should be stored',
+        properties: ['openDirectory', 'createDirectory']
+      });
+      if (rootResult.canceled || !rootResult.filePaths?.[0]) return;
+      root = rootResult.filePaths[0];
+      await electron.ipcRenderer.invoke('set-default-data-directory', root);
+      setDefaultAutosaveRoot(root);
+    }
+
+    const packagePath = result.filePaths[0];
+    let inputHandle: number | null = null;
+    try {
+      inputHandle = fs.openSync(packagePath, 'r');
+      const packageSize = fs.statSync(packagePath).size;
+      const magicBuffer = BufferCtor.alloc(BufferCtor.byteLength(REFLOW_PACKAGE_MAGIC));
+      fs.readSync(inputHandle, magicBuffer, 0, magicBuffer.length, 0);
+      if (magicBuffer.toString('utf8') !== REFLOW_PACKAGE_MAGIC) throw new Error('This is not a valid RefFlow package.');
+
+      const headerLengthBuffer = BufferCtor.alloc(4);
+      fs.readSync(inputHandle, headerLengthBuffer, 0, 4, magicBuffer.length);
+      const headerLength = headerLengthBuffer.readUInt32LE(0);
+      if (headerLength <= 0 || headerLength > 512 * 1024 * 1024) throw new Error('The package metadata is invalid or too large.');
+      const headerStart = magicBuffer.length + 4;
+      const dataStart = headerStart + headerLength;
+      if (dataStart > packageSize) throw new Error('The package is incomplete.');
+      const headerBuffer = BufferCtor.alloc(headerLength);
+      fs.readSync(inputHandle, headerBuffer, 0, headerLength, headerStart);
+      const header = JSON.parse(headerBuffer.toString('utf8'));
+      if (header?.format !== 'refflow-board' || header?.formatVersion !== 1 || !header.project) throw new Error('This RefFlow package version is not supported.');
+
+      const sourceProject = header.project as Partial<Project>;
+      const baseName = String(sourceProject.name || 'Imported Board').trim() || 'Imported Board';
+      let importedName = baseName;
+      let suffix = 2;
+      while (
+        projectsRef.current.some(project => project.name.toLowerCase() === importedName.toLowerCase())
+        || fs.existsSync(path.join(root, sanitizeLocalFolderName(importedName)))
+      ) {
+        importedName = `${baseName} ${suffix}`;
+        suffix += 1;
+      }
+      const template: ProjectTemplate = sourceProject.boardTemplate === 'brand-kit' ? 'brand-kit' : 'blank';
+      const createdProject = await createProject(importedName, template);
+      const directoryPath = path.join(root, getProjectFolderName({ id: createdProject.id, name: importedName }));
+      fs.mkdirSync(directoryPath, { recursive: true });
+
+      const sourceAssets = Array.isArray(sourceProject.designAssets)
+        ? sourceProject.designAssets.filter((asset): asset is DesignAsset => Boolean(asset?.id && DESIGN_ASSET_EXTENSION_SET.has(String(asset.kind))))
+        : [];
+      const assetsById = new Map(sourceAssets.map(asset => [asset.id, asset]));
+      const importedAssetIds = new Set<string>();
+      let packageOffset = dataStart;
+      const copyBuffer = BufferCtor.allocUnsafe(1024 * 1024);
+      for (const fileEntry of Array.isArray(header.files) ? header.files : []) {
+        const length = Number(fileEntry?.length);
+        const asset = assetsById.get(String(fileEntry?.assetId || ''));
+        if (!Number.isSafeInteger(length) || length < 0 || packageOffset + length > packageSize) throw new Error('A packaged file has an invalid size.');
+        if (!asset) {
+          packageOffset += length;
+          continue;
+        }
+        const relativePath = String(asset.relativePath || fileEntry.relativePath || '').replace(/\\/g, '/');
+        const destinationPath = path.resolve(directoryPath, relativePath);
+        const relativeDestination = path.relative(directoryPath, destinationPath);
+        const extension = path.extname(destinationPath).slice(1).toLowerCase();
+        if (!relativeDestination || relativeDestination.startsWith('..') || path.isAbsolute(relativeDestination) || !DESIGN_ASSET_EXTENSION_SET.has(extension)) {
+          packageOffset += length;
+          continue;
+        }
+        fs.mkdirSync(path.dirname(destinationPath), { recursive: true });
+        const outputHandle = fs.openSync(destinationPath, 'w');
+        try {
+          let copied = 0;
+          while (copied < length) {
+            const bytesRead = fs.readSync(inputHandle, copyBuffer, 0, Math.min(copyBuffer.length, length - copied), packageOffset + copied);
+            if (bytesRead <= 0) throw new Error(`The packaged file ${asset.fileName} is incomplete.`);
+            fs.writeSync(outputHandle, copyBuffer, 0, bytesRead);
+            copied += bytesRead;
+          }
+        } finally {
+          fs.closeSync(outputHandle);
+        }
+        importedAssetIds.add(asset.id);
+        packageOffset += length;
+      }
+
+      const folders = Array.isArray(sourceProject.folders) && sourceProject.folders.length > 0
+        ? sourceProject.folders.map((folder, order) => ({ id: String(folder.id || Math.random().toString(36).slice(2, 11)), name: String(folder.name || `Folder ${order + 1}`), order: Number.isFinite(folder.order) ? Number(folder.order) : order }))
+        : createdProject.folders || [];
+      const importedProject: Project = {
+        ...createdProject,
+        name: importedName,
+        boardTemplate: template,
+        folders,
+        images: Array.isArray(sourceProject.images) ? sourceProject.images : [],
+        floatingImages: Array.isArray(sourceProject.floatingImages) ? sourceProject.floatingImages : [],
+        floatingNotes: Array.isArray(sourceProject.floatingNotes) ? sourceProject.floatingNotes : [],
+        floatingSketches: Array.isArray(sourceProject.floatingSketches) ? sourceProject.floatingSketches : [],
+        designAssets: sourceAssets.filter(asset => importedAssetIds.has(asset.id)),
+        brandColors: Array.isArray(sourceProject.brandColors) ? sourceProject.brandColors : [],
+        brandTypography: Array.isArray(sourceProject.brandTypography) ? sourceProject.brandTypography : [],
+        directoryPath,
+        directoryHandle: undefined,
+        updatedAt: Date.now()
+      };
+      await updateProject(createdProject.id, importedProject);
+      const syncResult = await syncBoardToPath(importedProject, directoryPath, true);
+      const refreshedProjects = await getProjects();
+      setProjects(refreshedProjects);
+      projectsRef.current = refreshedProjects;
+      setActiveProjectIdState(createdProject.id);
+      await setActiveProjectId(createdProject.id);
+      setImages(importedProject.images || []);
+      setFloatingImages(importedProject.floatingImages || []);
+      setFloatingNotes(importedProject.floatingNotes || []);
+      setFloatingSketches(importedProject.floatingSketches || []);
+      setDesignAssets(importedProject.designAssets || []);
+      setManagingProjectId(createdProject.id);
+      setManagerFolderFilter('all');
+      setPillFolderFilter('all');
+      setShowManager(true);
+      setIsRetracted(true);
+      if (syncResult.failed.length > 0) setDragError(`The board was imported, but ${syncResult.failed.length} media file(s) could not be restored.`);
+      else alert(`${importedName} was imported successfully.`);
+    } catch (error) {
+      console.error('Portable board import failed:', error);
+      setDragError(`Package import failed: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      if (inputHandle !== null) fs.closeSync(inputHandle);
+    }
+  };
 
   const exportBoard = async (project: Project) => {
     try {
@@ -3215,7 +3841,8 @@ export default function App() {
           images,
           floatingImages,
           floatingNotes,
-          floatingSketches
+          floatingSketches,
+          designAssets
         } : project;
         const updatedProject = {
           ...projectSnapshot,
@@ -3253,7 +3880,8 @@ export default function App() {
         images,
         floatingImages,
         floatingNotes,
-        floatingSketches
+        floatingSketches,
+        designAssets
       } : storedProject;
       await syncBoardToHandle(updatedProject, dirHandle);
       
@@ -3531,6 +4159,20 @@ export default function App() {
       case 'manager':
         setShowManager(prev => !prev);
         break;
+      case 'assetSearch':
+        setIsPillVisible(true);
+        setIsRetracted(true);
+        setShowSettings(false);
+        setShowProviderSettings(false);
+        setShowSearchComponent(false);
+        setManagingProjectId(null);
+        setManagerFolderFilter('all');
+        setShowManager(true);
+        window.setTimeout(() => {
+          universalAssetSearchInputRef.current?.focus();
+          universalAssetSearchInputRef.current?.select();
+        }, 80);
+        break;
       case 'settings':
         setShowSettings(prev => !prev);
         break;
@@ -3733,6 +4375,8 @@ export default function App() {
         executeShortcutAction('flipBoards');
       } else if (matchShortcut(shortcuts.toggleWindows, e)) {
         executeShortcutAction('toggleWindows');
+      } else if (matchShortcut(shortcuts.assetSearch, e)) {
+        executeShortcutAction('assetSearch');
       }
     };
     window.addEventListener('keydown', handleGlobalKeydown);
@@ -4411,7 +5055,8 @@ export default function App() {
       if (e.dataTransfer?.files && e.dataTransfer.files.length > 0) {
         try {
           const files = Array.from(e.dataTransfer.files) as File[];
-          await importMediaFiles(files, { x: e.clientX, y: e.clientY });
+          const requestedFolderId = pillFolderFilter === 'all' ? undefined : pillFolderFilter;
+          await importWorkspaceFiles(files, { x: e.clientX, y: e.clientY }, false, undefined, requestedFolderId);
         } catch (error) {
           console.error("Failed to load media", error);
         }
@@ -4427,7 +5072,7 @@ export default function App() {
       window.removeEventListener('dragleave', handleGlobalDragLeave);
       window.removeEventListener('drop', handleGlobalDrop);
     };
-  }, [position, pillDimensions]);
+  }, [position, pillDimensions, activeProjectId, pillFolderFilter]);
 
   const triggerNativeFilePicker = () => {
     const input = document.createElement('input');
@@ -4438,7 +5083,8 @@ export default function App() {
       if (e.target.files) {
         const files = Array.from(e.target.files) as File[];
         try {
-          await importMediaFiles(files, getPrimaryWorkspaceOrigin());
+          const requestedFolderId = pillFolderFilter === 'all' ? undefined : pillFolderFilter;
+          await importWorkspaceFiles(files, getPrimaryWorkspaceOrigin(), false, undefined, requestedFolderId);
         } catch (error) {
           console.error("Failed to load media", error);
         }
@@ -4713,10 +5359,15 @@ export default function App() {
   const createSketch = () => {
     const newId = Math.random().toString(36).substr(2, 9);
     const origin = getPrimaryWorkspaceOrigin();
+    const project = projectsRef.current.find(item => item.id === activeProjectId);
+    const folderId = pillFolderFilter !== 'all' && pillFolderFilter !== 'unassigned'
+      ? pillFolderFilter
+      : (project?.folders || []).find(folder => folder.name === 'Sketches')?.id;
     setFloatingSketches(prev => [
       ...prev,
       {
         id: newId,
+        folderId,
         name: `Sketch ${floatingSketches.length + 1}`,
         lines: [],
         x: origin.x,
@@ -4737,10 +5388,15 @@ export default function App() {
   const createNote = () => {
     const newId = Math.random().toString(36).substr(2, 9);
     const origin = getPrimaryWorkspaceOrigin();
+    const project = projectsRef.current.find(item => item.id === activeProjectId);
+    const folderId = pillFolderFilter !== 'all' && pillFolderFilter !== 'unassigned'
+      ? pillFolderFilter
+      : (project?.folders || []).find(folder => folder.name === 'Notes')?.id;
     setFloatingNotes(prev => [
       ...prev,
       {
         id: newId,
+        folderId,
         name: `Note ${floatingNotes.length + 1}`,
         text: '',
         x: origin.x,
@@ -4778,14 +5434,56 @@ export default function App() {
   const commitProjectRename = async (project: Project) => {
     if (editingProjectId !== project.id) return;
     const nextName = editingProjectName.trim() || 'Untitled Board';
-    await updateProject(project.id, { name: nextName });
-    if (project.directoryPath) {
-      await syncBoardToPath({ ...project, name: nextName }, project.directoryPath);
+    let renamedProject = { ...project, name: nextName };
+    const previousProjects = projectsRef.current;
+    try {
+      renamedProject = await alignProjectLocalDirectoryName(project, nextName);
+      const optimisticProjects = previousProjects.map(item => item.id === project.id
+        ? { ...item, name: nextName, directoryPath: renamedProject.directoryPath, updatedAt: Date.now() }
+        : item
+      );
+      projectsRef.current = optimisticProjects;
+      setProjects(optimisticProjects);
+      setEditingProjectId(null);
+      setEditingProjectSurface(null);
+      setEditingProjectName('');
+      await updateProject(project.id, { name: nextName, directoryPath: renamedProject.directoryPath });
+      if (renamedProject.directoryPath) {
+        await syncBoardToPath(renamedProject, renamedProject.directoryPath);
+      }
+    } catch (error) {
+      const refreshedProjects = await getProjects();
+      projectsRef.current = refreshedProjects;
+      setProjects(refreshedProjects);
+      setDragError(error instanceof Error ? error.message : String(error));
+      return;
     }
-    setProjects(await getProjects());
-    setEditingProjectId(null);
-    setEditingProjectSurface(null);
-    setEditingProjectName('');
+  };
+
+  const persistProjectMetadata = async (project: Project, updates: Partial<Project>, syncMedia = false) => {
+    const savedAt = Date.now();
+    const updatedProject = { ...project, ...updates, updatedAt: savedAt };
+    setProjects(current => {
+      const next = current.map(item => item.id === project.id
+        ? { ...item, ...updates, updatedAt: savedAt }
+        : item
+      );
+      projectsRef.current = next;
+      return next;
+    });
+    try {
+      await updateProject(project.id, updates);
+      const latestProject = (await getProjects()).find(item => item.id === project.id) || updatedProject;
+      if (latestProject.directoryPath) {
+        await syncBoardToPath(latestProject, latestProject.directoryPath, syncMedia);
+      }
+      return latestProject;
+    } catch (error) {
+      const refreshedProjects = await getProjects();
+      projectsRef.current = refreshedProjects;
+      setProjects(refreshedProjects);
+      throw error;
+    }
   };
 
   const beginMediaRename = (media: FloatingImage, projectId: string | null = null) => {
@@ -4798,6 +5496,182 @@ export default function App() {
     setEditingMediaId(null);
     setEditingMediaProjectId(null);
     setEditingMediaName('');
+  };
+
+  const beginAssetRename = (asset: DesignAsset, projectId: string | null = null) => {
+    setEditingAssetId(asset.id);
+    setEditingAssetProjectId(projectId);
+    setEditingAssetName(getDesignAssetDisplayName(asset));
+  };
+
+  const cancelAssetRename = () => {
+    setEditingAssetId(null);
+    setEditingAssetProjectId(null);
+    setEditingAssetName('');
+  };
+
+  const commitAssetRename = async (asset: DesignAsset, project: Project | null = null) => {
+    const expectedProjectId = project?.id || null;
+    if (editingAssetId !== asset.id || editingAssetProjectId !== expectedProjectId) return;
+    const nextName = editingAssetName.trim() || asset.fileName;
+    if (project) {
+      const updatedAssets = (project.designAssets || []).map(item => item.id === asset.id ? { ...item, displayName: nextName } : item);
+      await persistProjectMetadata(project, { designAssets: updatedAssets });
+      if (project.id === activeProjectId) setDesignAssets(updatedAssets);
+    } else {
+      setDesignAssets(current => current.map(item => item.id === asset.id ? { ...item, displayName: nextName } : item));
+    }
+    cancelAssetRename();
+  };
+
+  const moveDesignAssetToFolder = (project: Project, asset: DesignAsset, folderId?: string): DesignAsset => {
+    if (asset.folderId === folderId) return asset;
+    const nodeRequire = getNodeRequire();
+    const sourcePath = resolveDesignAssetPath(project, asset);
+    if (!nodeRequire || !sourcePath || !project.directoryPath) return { ...asset, folderId };
+    const fs = nodeRequire('fs');
+    const path = nodeRequire('path');
+    if (!fs.existsSync(sourcePath)) return { ...asset, folderId };
+    const folder = (project.folders || []).find(item => item.id === folderId);
+    const destinationDirectory = path.join(project.directoryPath, folder ? sanitizeLocalFolderName(folder.name) : 'Unsorted');
+    fs.mkdirSync(destinationDirectory, { recursive: true });
+    const extension = path.extname(asset.fileName);
+    const stem = path.basename(asset.fileName, extension);
+    let destinationPath = path.join(destinationDirectory, asset.fileName);
+    let suffix = 2;
+    while (fs.existsSync(destinationPath) && path.resolve(destinationPath).toLowerCase() !== path.resolve(sourcePath).toLowerCase()) {
+      destinationPath = path.join(destinationDirectory, `${stem} (${suffix})${extension}`);
+      suffix += 1;
+    }
+    if (path.resolve(destinationPath).toLowerCase() !== path.resolve(sourcePath).toLowerCase()) {
+      fs.renameSync(sourcePath, destinationPath);
+    }
+    return {
+      ...asset,
+      folderId,
+      fileName: path.basename(destinationPath),
+      relativePath: path.relative(project.directoryPath, destinationPath).split(path.sep).join('/')
+    };
+  };
+
+  const assignBoardItemToFolder = async (
+    project: Project,
+    kind: PreviewReorderKind,
+    id: string,
+    folderId?: string
+  ) => {
+    let updates: Partial<Project> = {};
+    if (kind === 'media') updates.floatingImages = (project.floatingImages || []).map(item => item.id === id ? { ...item, folderId } : item);
+    if (kind === 'note') updates.floatingNotes = (project.floatingNotes || []).map(item => item.id === id ? { ...item, folderId } : item);
+    if (kind === 'sketch') updates.floatingSketches = (project.floatingSketches || []).map(item => item.id === id ? { ...item, folderId } : item);
+    if (kind === 'asset') {
+      try {
+        updates.designAssets = (project.designAssets || []).map(item => item.id === id ? moveDesignAssetToFolder(project, item, folderId) : item);
+      } catch (error) {
+        setDragError(`The file could not be moved: ${error instanceof Error ? error.message : String(error)}`);
+        return;
+      }
+    }
+    const updatedProject = await persistProjectMetadata(project, updates, kind === 'media');
+    if (project.id !== activeProjectId) return;
+    if (updates.floatingImages) setFloatingImages(updatedProject.floatingImages || []);
+    if (updates.floatingNotes) setFloatingNotes(updatedProject.floatingNotes || []);
+    if (updates.floatingSketches) setFloatingSketches(updatedProject.floatingSketches || []);
+    if (updates.designAssets) setDesignAssets(updatedProject.designAssets || []);
+  };
+
+  const addBrandColor = async (project: Project) => {
+    const hex = normalizeHexColor(brandColorDraft.hex);
+    if (!hex) {
+      setDragError('Enter a valid hex color such as #5E6BFF.');
+      return;
+    }
+    const nextColor: BrandColor = {
+      id: Math.random().toString(36).slice(2, 11),
+      name: brandColorDraft.name.trim() || `Color ${(project.brandColors || []).length + 1}`,
+      hex,
+      group: brandColorDraft.group
+    };
+    await persistProjectMetadata(project, { brandColors: [...(project.brandColors || []), nextColor] });
+    setBrandColorDraft(current => ({ name: '', hex, group: current.group }));
+  };
+
+  const updateBrandColor = async (project: Project, id: string, patch: Partial<BrandColor>) => {
+    const normalizedPatch = patch.hex === undefined ? patch : { ...patch, hex: normalizeHexColor(patch.hex) || '#5E6BFF' };
+    await persistProjectMetadata(project, {
+      brandColors: (project.brandColors || []).map(color => color.id === id ? { ...color, ...normalizedPatch } : color)
+    });
+  };
+
+  const removeBrandColor = async (project: Project, id: string) => {
+    await persistProjectMetadata(project, { brandColors: (project.brandColors || []).filter(color => color.id !== id) });
+  };
+
+  const extractBrandPaletteFromLogo = async (project: Project, fallbackSourceId?: string) => {
+    const logoFolderId = (project.folders || []).find(folder => folder.name === 'Logos')?.id;
+    const allImages = (project.floatingImages || []).filter(media => (media.type || 'image') === 'image');
+    const logoImages = allImages.filter(media => media.folderId === logoFolderId);
+    const candidates = logoImages.length > 0 ? logoImages : allImages;
+    const sourceId = brandLogoSourceId || fallbackSourceId || candidates[0]?.id;
+    const source = candidates.find(media => media.id === sourceId) || candidates[0];
+    if (!source) {
+      setDragError('Add an image to the Logos section before extracting brand colors.');
+      return;
+    }
+    setBrandLogoSourceId(source.id);
+    setIsExtractingBrandPalette(true);
+    try {
+      const palette = (source.palette?.length ? source.palette : await extractPalette(source.url))
+        .map(color => normalizeHexColor(color))
+        .filter((color): color is string => Boolean(color));
+      const uniquePalette = [...new Set(palette)];
+      if (uniquePalette.length === 0) throw new Error('No usable colors were detected in this logo.');
+      setExtractedBrandPalette({ projectId: project.id, colors: uniquePalette });
+    } catch (error) {
+      setDragError(`Logo color extraction failed: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      setIsExtractingBrandPalette(false);
+    }
+  };
+
+  const addExtractedBrandPalette = async (project: Project) => {
+    if (extractedBrandPalette.projectId !== project.id || extractedBrandPalette.colors.length === 0) return;
+    const existingColors = new Set((project.brandColors || []).map(color => normalizeHexColor(color.hex)));
+    const additions = extractedBrandPalette.colors
+      .filter(hex => !existingColors.has(hex))
+      .map((hex, index): BrandColor => ({
+        id: Math.random().toString(36).slice(2, 11),
+        name: `Logo color ${(project.brandColors || []).length + index + 1}`,
+        hex,
+        group: brandColorDraft.group
+      }));
+    if (additions.length === 0) {
+      setDragError('Those logo colors are already in the Brand Colors palette.');
+      return;
+    }
+    await persistProjectMetadata(project, { brandColors: [...(project.brandColors || []), ...additions] });
+    setExtractedBrandPalette({ projectId: project.id, colors: [] });
+  };
+
+  const addBrandTypographyStyle = async (project: Project) => {
+    const nextStyle: BrandTypographyStyle = {
+      id: Math.random().toString(36).slice(2, 11),
+      name: brandTypographyDraft.name.trim() || `Type style ${(project.brandTypography || []).length + 1}`,
+      fontFamily: brandTypographyDraft.fontFamily.trim() || 'Inter',
+      weight: Number(brandTypographyDraft.weight) || 400,
+      sampleText: brandTypographyDraft.sampleText.trim() || 'The quick brown fox jumps over the lazy dog.'
+    };
+    await persistProjectMetadata(project, { brandTypography: [...(project.brandTypography || []), nextStyle] });
+  };
+
+  const updateBrandTypographyStyle = async (project: Project, id: string, patch: Partial<BrandTypographyStyle>) => {
+    await persistProjectMetadata(project, {
+      brandTypography: (project.brandTypography || []).map(style => style.id === id ? { ...style, ...patch } : style)
+    });
+  };
+
+  const removeBrandTypographyStyle = async (project: Project, id: string) => {
+    await persistProjectMetadata(project, { brandTypography: (project.brandTypography || []).filter(style => style.id !== id) });
   };
 
   const commitMediaRename = async (media: FloatingImage, project: Project | null = null) => {
@@ -4884,7 +5758,7 @@ export default function App() {
 
     if (session.surface === 'pill') {
       const reordered = reorderPreviewCollections(
-        { media: floatingImages, note: floatingNotes, sketch: floatingSketches },
+        { media: floatingImages, note: floatingNotes, sketch: floatingSketches, asset: designAssets },
         session.kind,
         session.sourceId,
         targetKind,
@@ -4893,6 +5767,7 @@ export default function App() {
       setFloatingImages(reordered.media);
       setFloatingNotes(reordered.note);
       setFloatingSketches(reordered.sketch);
+      setDesignAssets(reordered.asset);
       return;
     }
 
@@ -4902,7 +5777,8 @@ export default function App() {
       {
         media: latestProject.floatingImages || [],
         note: latestProject.floatingNotes || [],
-        sketch: latestProject.floatingSketches || []
+        sketch: latestProject.floatingSketches || [],
+        asset: latestProject.designAssets || []
       },
       session.kind,
       session.sourceId,
@@ -4912,7 +5788,8 @@ export default function App() {
     const updates: Partial<Project> = {
       floatingImages: reordered.media,
       floatingNotes: reordered.note,
-      floatingSketches: reordered.sketch
+      floatingSketches: reordered.sketch,
+      designAssets: reordered.asset
     };
     const updatedAt = Date.now();
     const updatedProject = { ...latestProject, ...updates, updatedAt };
@@ -4935,6 +5812,7 @@ export default function App() {
       setFloatingImages(updatedProject.floatingImages || []);
       setFloatingNotes(updatedProject.floatingNotes || []);
       setFloatingSketches(updatedProject.floatingSketches || []);
+      setDesignAssets(updatedProject.designAssets || []);
     }
   };
 
@@ -5008,11 +5886,12 @@ export default function App() {
   ) => {
     if (!event.altKey || !['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(event.key)) return;
     const collections: PreviewCollections = surface === 'pill'
-      ? { media: floatingImages, note: floatingNotes, sketch: floatingSketches }
+      ? { media: floatingImages, note: floatingNotes, sketch: floatingSketches, asset: designAssets }
       : {
           media: project?.floatingImages || [],
           note: project?.floatingNotes || [],
-          sketch: project?.floatingSketches || []
+          sketch: project?.floatingSketches || [],
+          asset: project?.designAssets || []
         };
     const ordered = getOrderedPreviewEntries(collections);
     const sourceIndex = ordered.findIndex(item => item.kind === kind && item.id === sourceId);
@@ -5024,8 +5903,15 @@ export default function App() {
     void applyPreviewReorder({ surface, projectId, kind, sourceId }, target.kind, target.id, project);
   };
 
-  const createNewProjectBoard = async () => {
-    const project = await createProject(`Board ${projects.length + 1}`);
+  const createNewProjectBoard = async (template: ProjectTemplate = 'blank') => {
+    const baseName = template === 'brand-kit' ? 'Brand Kit' : `Board ${projects.length + 1}`;
+    let projectName = baseName;
+    let suffix = 2;
+    while (projects.some(project => project.name.toLowerCase() === projectName.toLowerCase())) {
+      projectName = `${baseName} ${suffix}`;
+      suffix += 1;
+    }
+    const project = await createProject(projectName, template);
     let createdProject = project;
     const autosaveRoot = defaultAutosaveRoot || await getInstalledAutosaveRoot();
     if (autosaveRoot) {
@@ -5039,14 +5925,18 @@ export default function App() {
         await syncBoardToPath(createdProject, directoryPath);
       }
     }
+    await setActiveProjectId(project.id);
     const allProjects = await getProjects();
+    projectsRef.current = allProjects;
     setProjects(allProjects);
     setActiveProjectIdState(project.id);
-    await setActiveProjectId(project.id);
     setImages([]);
     setFloatingImages([]);
     setFloatingNotes([]);
     setFloatingSketches([]);
+    setDesignAssets([]);
+    setManagerFolderFilter('all');
+    setPillFolderFilter('all');
   };
 
   const openProjectManager = () => {
@@ -5062,7 +5952,32 @@ export default function App() {
   const visibleReferenceCount = floatingImages.filter(image => !image.isCollapsed).length
     + floatingNotes.filter(note => !note.isCollapsed).length
     + floatingSketches.filter(sketch => !sketch.isCollapsed).length;
-  const totalReferenceCount = floatingImages.length + floatingNotes.length + floatingSketches.length;
+  const totalReferenceCount = floatingImages.length + floatingNotes.length + floatingSketches.length + designAssets.length;
+  const activeProject = projects.find(project => project.id === activeProjectId);
+  const activeFolders = [...(activeProject?.folders || [])].sort((left, right) => left.order - right.order);
+  const matchesPillFolder = (folderId?: string) => pillFolderFilter === 'all'
+    || (pillFolderFilter === 'unassigned' ? !folderId : folderId === pillFolderFilter);
+  const pillFloatingImages = floatingImages.filter(item => matchesPillFolder(item.folderId));
+  const pillFloatingNotes = floatingNotes.filter(item => matchesPillFolder(item.folderId));
+  const pillFloatingSketches = floatingSketches.filter(item => matchesPillFolder(item.folderId));
+  const pillDesignAssets = designAssets.filter(item => matchesPillFolder(item.folderId));
+  const normalizedBoardSearch = boardSearchQuery.trim().toLowerCase();
+  const getProjectSearchValues = (project: Project) => [
+    project.name,
+    ...(project.folders || []).map(folder => folder.name),
+    ...(project.floatingImages || []).map((media, index) => getMediaDisplayName(media, index)),
+    ...(project.floatingNotes || []).flatMap((note, index) => [getNoteDisplayName(note, index), note.text]),
+    ...(project.floatingSketches || []).map((sketch, index) => getSketchDisplayName(sketch, index)),
+    ...(project.designAssets || []).flatMap(asset => [getDesignAssetDisplayName(asset), asset.fileName, asset.kind]),
+    ...(project.brandColors || []).flatMap(color => [color.name, color.hex, color.group || 'primary']),
+    ...(project.brandTypography || []).flatMap(style => [style.name, style.fontFamily, style.sampleText])
+  ].map(value => String(value || ''));
+  const filteredProjects = normalizedBoardSearch
+    ? projects.filter(project => getProjectSearchValues(project).some(value => value.toLowerCase().includes(normalizedBoardSearch)))
+    : projects;
+  const getProjectSearchMatches = (project: Project) => normalizedBoardSearch
+    ? getProjectSearchValues(project).filter(value => value.toLowerCase().includes(normalizedBoardSearch)).filter((value, index, values) => values.indexOf(value) === index).slice(0, 3)
+    : [];
   const pillPreviewColumnCount = pillDimensions.width >= 520
     ? 4
     : pillDimensions.width >= 360
@@ -5225,7 +6140,7 @@ export default function App() {
                         alt=""
                         aria-hidden="true"
                         draggable={false}
-                        className="pointer-events-none h-[54%] w-[54%] object-contain drop-shadow-[0_4px_10px_rgba(65,72,240,0.3)]"
+                        className="pointer-events-none h-[42%] w-[42%] object-contain drop-shadow-[0_3px_8px_rgba(65,72,240,0.28)]"
                         data-retracted-pill-logo
                       />
                     </button>
@@ -5247,6 +6162,20 @@ export default function App() {
                         <div className="mt-1 truncate text-[9px] text-muted-foreground">{totalReferenceCount} {totalReferenceCount === 1 ? 'reference' : 'references'}</div>
                       </div>
                     </div>
+                    {activeFolders.length > 0 && (
+                      <select
+                        value={pillFolderFilter}
+                        onChange={(event) => setPillFolderFilter(event.target.value)}
+                        onMouseDown={(event) => event.stopPropagation()}
+                        className="h-7 max-w-[116px] min-w-0 rounded-lg border border-border bg-card px-2 text-[9px] font-medium text-secondary outline-none transition-colors hover:border-primary/45 focus:border-primary"
+                        aria-label="Filter pill by Brand Kit section"
+                        data-pill-folder-filter
+                      >
+                        <option value="all">All sections</option>
+                        {activeFolders.map(folder => <option key={folder.id} value={folder.id}>{folder.name}</option>)}
+                        <option value="unassigned">Unsorted</option>
+                      </select>
+                    )}
                     <div className="flex shrink-0 items-center gap-0.5" onMouseDown={(event) => event.stopPropagation()}>
                       <ToolbarButton
                         label="Quick Minimize / Restore All"
@@ -5297,17 +6226,17 @@ export default function App() {
                        <Skeleton className="aspect-square opacity-70" />
                        <Skeleton className="aspect-square opacity-50" />
                      </div>
-                   ) : floatingImages.length === 0 && floatingNotes.length === 0 && floatingSketches.length === 0 ? (
+                   ) : pillFloatingImages.length === 0 && pillFloatingNotes.length === 0 && pillFloatingSketches.length === 0 && pillDesignAssets.length === 0 ? (
                      <div className="drag-handle col-span-full flex min-h-40 w-full cursor-move flex-col items-center justify-center rounded-2xl border border-dashed border-border bg-surface-elevated/35 px-4 py-6 text-center">
                        <div className="mb-3 flex size-9 items-center justify-center rounded-xl border border-primary/20 bg-primary/10 text-primary">
                          <Plus className="size-4" />
                        </div>
                        <div className="text-[11px] font-medium text-secondary">Drop references here</div>
-                       <div className="mt-1 text-[9px] leading-4 text-muted-foreground">Images, documents, notes, and sketches</div>
+                       <div className="mt-1 text-[9px] leading-4 text-muted-foreground">Images, documents, design files, notes, and sketches</div>
                      </div>
                    ) : (
                      <>
-                       {floatingImages.map((img, mediaIndex) => {
+                       {pillFloatingImages.map((img, mediaIndex) => {
                          const previewType = img.type || 'image';
                          const mediaLabel = getMediaDisplayName(img, mediaIndex);
                          return (
@@ -5405,7 +6334,7 @@ export default function App() {
                          );
                        })}
 
-                       {floatingNotes.map((note, noteIndex) => {
+                       {pillFloatingNotes.map((note, noteIndex) => {
                          const noteLabel = getNoteDisplayName(note, noteIndex);
                          const notePreview = note.text.replace(/\s+/g, ' ').trim();
                          return (
@@ -5500,7 +6429,7 @@ export default function App() {
                          );
                        })}
 
-                       {floatingSketches.map((sketch, sketchIndex) => {
+                       {pillFloatingSketches.map((sketch, sketchIndex) => {
                          const sketchLabel = getSketchDisplayName(sketch, sketchIndex);
                          return (
                            <div
@@ -5605,6 +6534,105 @@ export default function App() {
                                  title="Delete Permanently"
                                >
                                  <Trash2 className="w-3 h-3" />
+                               </button>
+                             </div>
+                           </div>
+                         );
+                       })}
+
+                       {pillDesignAssets.map((asset, assetIndex) => {
+                         const assetLabel = getDesignAssetDisplayName(asset);
+                         return (
+                           <div
+                             key={asset.id}
+                             className={`rf-card rf-preview-card group relative aspect-square w-full min-w-0 self-start overflow-hidden bg-[radial-gradient(circle_at_35%_20%,rgba(94,107,255,0.2),transparent_55%)] ${previewReorderTarget === getPreviewReorderKey('pill', null, 'asset', asset.id) ? 'ring-2 ring-primary ring-offset-2 ring-offset-background' : 'hover:border-primary/60 hover:-translate-y-0.5'}`}
+                             style={{ order: pillPreviewOrderByKey.get(getPreviewItemKey('asset', asset.id)) ?? floatingImages.length + floatingNotes.length + floatingSketches.length + assetIndex }}
+                             data-pill-preview-card
+                             data-pill-preview-type="design-asset"
+                             data-design-kind={asset.kind}
+                             data-pill-label={assetLabel}
+                             title={`${assetLabel} — double-click to open`}
+                             onDoubleClick={() => { void openDesignAsset(asset); }}
+                             onDragEnter={(event) => allowPreviewReorder(event, 'pill', null, 'asset', asset.id)}
+                             onDragOver={(event) => allowPreviewReorder(event, 'pill', null, 'asset', asset.id)}
+                             onDrop={(event) => { void finishPreviewReorder(event, 'pill', null, 'asset', asset.id); }}
+                           >
+                             <div className="flex h-full w-full flex-col items-center justify-center gap-2 px-2 pb-6 text-center">
+                               <div className="flex size-10 items-center justify-center rounded-2xl border border-primary/25 bg-primary/12 text-[11px] font-bold uppercase tracking-[0.08em] text-primary shadow-[0_10px_24px_rgba(94,107,255,0.14)]">
+                                 {asset.kind}
+                               </div>
+                               <div className="text-[7px] font-medium text-muted-foreground">{formatFileSize(asset.size)}</div>
+                               <button
+                                 type="button"
+                                 onClick={(event) => { event.stopPropagation(); void openDesignAsset(asset); }}
+                                 className="flex items-center gap-1 rounded-md border border-border bg-card/80 px-1.5 py-1 text-[7px] font-semibold text-secondary opacity-80 transition-colors hover:border-primary/40 hover:text-primary group-hover:opacity-100"
+                                 title="Open in the Windows default app"
+                               >
+                                 <ExternalLink className="size-2.5" /> Open
+                               </button>
+                             </div>
+                             <div className="pill-preview-caption" onMouseDown={(event) => event.stopPropagation()} onClick={(event) => event.stopPropagation()}>
+                               {editingAssetId === asset.id && editingAssetProjectId === null ? (
+                                 <input
+                                   autoFocus
+                                   value={editingAssetName}
+                                   onChange={(event) => setEditingAssetName(event.target.value)}
+                                   onBlur={() => { void commitAssetRename(asset); }}
+                                   onKeyDown={(event) => {
+                                     event.stopPropagation();
+                                     if (event.key === 'Enter') event.currentTarget.blur();
+                                     if (event.key === 'Escape') cancelAssetRename();
+                                   }}
+                                   className="h-5 w-full rounded-md border border-white/20 bg-black/25 px-1.5 text-center text-[8px] font-medium text-white outline-none focus:border-primary"
+                                   aria-label={`Rename ${assetLabel}`}
+                                   data-pill-asset-name-input
+                                 />
+                               ) : (
+                                 <button
+                                   type="button"
+                                   className="block w-full truncate rounded text-[8px] font-medium text-white/95 outline-none transition-colors hover:text-primary focus-visible:text-primary"
+                                   onClick={() => beginAssetRename(asset)}
+                                   title="Click to rename design asset"
+                                   data-pill-asset-name
+                                 >
+                                   {assetLabel}
+                                 </button>
+                               )}
+                             </div>
+                             <div className="absolute right-1 top-1 z-30 flex gap-1 opacity-0 transition-opacity group-hover:opacity-100">
+                               <button
+                                 type="button"
+                                 draggable
+                                 onDragStart={(event) => beginPreviewReorder(event, 'pill', null, 'asset', asset.id)}
+                                 onDragEnd={endPreviewReorder}
+                                 onMouseDown={(event) => event.stopPropagation()}
+                                 onKeyDown={(event) => movePreviewWithKeyboard(event, 'pill', null, 'asset', asset.id)}
+                                 className="cursor-grab rounded-lg border border-white/10 bg-black/65 p-1.5 text-white shadow-lg backdrop-blur-md transition-colors hover:bg-primary active:cursor-grabbing"
+                                 title="Reorder this card"
+                                 aria-label={`Reorder ${assetLabel}`}
+                                 data-preview-reorder-handle
+                                 data-reorder-kind="asset"
+                               >
+                                 <GripVertical className="size-3" />
+                               </button>
+                               <button
+                                 type="button"
+                                 draggable
+                                 onDragStart={(event) => beginDesignAssetDrag(event, asset)}
+                                 onMouseDown={(event) => event.stopPropagation()}
+                                 className="cursor-grab rounded-lg border border-white/10 bg-black/65 p-1.5 text-white shadow-lg backdrop-blur-md transition-colors hover:bg-primary active:cursor-grabbing"
+                                 title="Drag the original file into another app"
+                                 aria-label={`Drag ${assetLabel} into another app`}
+                               >
+                                 <FolderInput className="size-3" />
+                               </button>
+                               <button
+                                 type="button"
+                                 onClick={(event) => { event.stopPropagation(); setDesignAssets(current => current.filter(item => item.id !== asset.id)); }}
+                                 className="rounded-lg border border-white/10 bg-black/65 p-1.5 text-white shadow-lg backdrop-blur-md transition-colors hover:bg-danger"
+                                 title="Remove from board (keeps the local file)"
+                               >
+                                 <Trash2 className="size-3" />
                                </button>
                              </div>
                            </div>
@@ -5919,6 +6947,7 @@ export default function App() {
                 { key: 'closeApp', label: 'Close Application' },
                 { key: 'flipBoards', label: 'Flip Boards' },
                 { key: 'toggleWindows', label: 'Show/Hide Windows' },
+                { key: 'assetSearch', label: 'Search boards & assets' },
               ].map(({ key, label }) => {
                 const combo = (shortcuts as Record<string, string>)[key] || '';
                 const parsed = parseShortcut(combo);
@@ -7373,9 +8402,27 @@ export default function App() {
                 {!isManagerSidebarCollapsed && <span className="truncate">All Boards</span>}
               </button>
 
+              {!isManagerSidebarCollapsed && (
+                <label className="mt-3 flex h-9 items-center gap-2 rounded-xl border border-border bg-card px-3 transition-colors focus-within:border-primary/55" data-board-sidebar-search>
+                  <Search className="size-3.5 shrink-0 text-muted-foreground" />
+                  <input
+                    value={boardSearchQuery}
+                    onChange={(event) => setBoardSearchQuery(event.target.value)}
+                    className="min-w-0 flex-1 bg-transparent text-[10px] text-foreground outline-none placeholder:text-muted-foreground"
+                    placeholder="Find boards or assets…"
+                    aria-label="Search boards and assets"
+                  />
+                  {boardSearchQuery && (
+                    <button type="button" onClick={() => setBoardSearchQuery('')} className="text-muted-foreground hover:text-foreground" aria-label="Clear board search">
+                      <X className="size-3" />
+                    </button>
+                  )}
+                </label>
+              )}
+
               {!isManagerSidebarCollapsed && <div className="rf-kicker mb-2 mt-6 px-2">Boards</div>}
               <div className={`${isManagerSidebarCollapsed ? 'mt-3' : ''} space-y-1`}>
-                {projects.map(project => {
+                {filteredProjects.map(project => {
                   const projectLabel = project.name || 'Untitled Board';
                   const isEditingSidebarName = editingProjectId === project.id && editingProjectSurface === 'sidebar' && !isManagerSidebarCollapsed;
                   return (
@@ -7459,7 +8506,7 @@ export default function App() {
               </div>
             </nav>
 
-            <div className="shrink-0 border-t border-border p-3">
+            <div className="shrink-0 space-y-2 border-t border-border p-3">
               <Button
                 type="button"
                 variant="primary"
@@ -7471,11 +8518,35 @@ export default function App() {
                 <Plus className="size-4" />
                 {!isManagerSidebarCollapsed && <span>New Board</span>}
               </Button>
+              <Button
+                type="button"
+                variant="secondary"
+                size={isManagerSidebarCollapsed ? 'icon' : 'md'}
+                onClick={() => { void createNewProjectBoard('brand-kit'); }}
+                className="w-full"
+                title="New Brand Kit"
+                data-create-brand-kit
+              >
+                <SwatchBook className="size-4" />
+                {!isManagerSidebarCollapsed && <span>Brand Kit</span>}
+              </Button>
+              <Button
+                type="button"
+                variant="outline"
+                size={isManagerSidebarCollapsed ? 'icon' : 'md'}
+                onClick={() => { void importPortableBoard(); }}
+                className="w-full"
+                title="Import RefFlow package"
+                data-import-refflow-package
+              >
+                <Upload className="size-4" />
+                {!isManagerSidebarCollapsed && <span>Import Package</span>}
+              </Button>
             </div>
           </aside>
 
           <main data-manager-main className="rf-panel flex min-w-0 flex-1 flex-col overflow-hidden rounded-3xl">
-          <div className="flex shrink-0 items-center justify-between border-b border-border px-8 py-5">
+          <div className="flex shrink-0 items-center justify-between gap-5 border-b border-border px-8 py-5">
             <div className="min-w-0">
               <div className="rf-kicker mb-1">Workspace / Boards</div>
               <h1 className="truncate text-2xl font-semibold tracking-[-0.025em] text-foreground">
@@ -7485,18 +8556,34 @@ export default function App() {
                 {managingProjectId ? 'Review and organize this board’s saved content.' : `${projects.length} ${projects.length === 1 ? 'board' : 'boards'} in your local workspace`}
               </p>
             </div>
-            <Button onClick={() => setShowManager(false)} variant="outline" size="sm" title="Close Manager">
-               <span>Close</span> <X className="size-4"/>
-            </Button>
+            <div className="flex shrink-0 items-center gap-3">
+              <label className="hidden h-9 w-64 items-center gap-2 rounded-xl border border-border bg-card px-3 transition-colors focus-within:border-primary/55 md:flex">
+                <Search className="size-3.5 text-muted-foreground" />
+                <input
+                  ref={universalAssetSearchInputRef}
+                  value={boardSearchQuery}
+                  onChange={(event) => setBoardSearchQuery(event.target.value)}
+                  className="min-w-0 flex-1 bg-transparent text-xs text-foreground outline-none placeholder:text-muted-foreground"
+                  placeholder="Search this workspace…"
+                  aria-label="Search project boards and contents"
+                  data-board-search-input
+                />
+                {boardSearchQuery && <button type="button" onClick={() => setBoardSearchQuery('')} className="text-muted-foreground hover:text-foreground" aria-label="Clear workspace search"><X className="size-3.5" /></button>}
+              </label>
+              <Button onClick={() => setShowManager(false)} variant="outline" size="sm" title="Close Manager">
+                 <span>Close</span> <X className="size-4"/>
+              </Button>
+            </div>
           </div>
           <div className="min-h-0 flex-1 overflow-y-auto px-8 py-7">
           
           {!managingProjectId ? (
             <div className="mx-auto grid w-full max-w-6xl grid-cols-1 gap-5 pb-12 md:grid-cols-2 xl:grid-cols-3">
-              {projects.map(p => (
+              {filteredProjects.map(p => (
                 <div 
                   key={p.id} 
                   className={`rf-card group flex min-h-[220px] cursor-pointer flex-col p-5 ${p.id === activeProjectId ? 'border-primary/60 ring-1 ring-primary/25 shadow-[0_18px_44px_rgba(94,107,255,0.14)]' : ''}`}
+                  data-board-card={p.id}
                   onClick={async () => {
                     if (p.id !== activeProjectId) {
                        await selectProjectOfId(p.id);
@@ -7580,9 +8667,10 @@ export default function App() {
                        )}
                      </div>
                    </div>
-                   <div className="mt-2 grid grid-cols-3 gap-2">
+                   <div className="mt-2 grid grid-cols-4 gap-2">
                      {[
                        { label: 'Media', value: p.floatingImages?.length || 0 },
+                       { label: 'Files', value: p.designAssets?.length || 0 },
                        { label: 'Notes', value: p.floatingNotes?.length || 0 },
                        { label: 'Sketches', value: p.floatingSketches?.length || 0 },
                      ].map(stat => (
@@ -7592,56 +8680,109 @@ export default function App() {
                        </div>
                      ))}
                    </div>
+                   {normalizedBoardSearch && getProjectSearchMatches(p).length > 0 && (
+                     <div className="mt-3 flex flex-wrap gap-1.5" data-board-search-matches>
+                       {getProjectSearchMatches(p).map(match => (
+                         <span key={match} className="max-w-full truncate rounded-lg border border-primary/20 bg-primary/8 px-2 py-1 text-[9px] text-primary">{match}</span>
+                       ))}
+                     </div>
+                   )}
                    <div className="mt-3 text-xs text-muted-foreground">Updated {new Date(p.updatedAt).toLocaleDateString()}</div>
                    
-                   <div className="mt-auto flex items-center justify-between pt-5">
-                     {p.id === activeProjectId ? (
+                   <div className="mt-auto pt-5" data-board-card-actions>
+                     <div className="mb-2 flex min-h-6 items-center">
+                       {p.id === activeProjectId ? (
                         <div className="rounded-full border border-primary/25 bg-primary/12 px-2.5 py-1 text-[9px] font-semibold uppercase tracking-[0.1em] text-primary">
                           Active
                         </div>
-                     ) : <div />}
-                     <div className="flex gap-2">
+                       ) : null}
+                     </div>
+                     <div className="grid w-full min-w-0 grid-cols-3 gap-1.5" data-board-card-action-grid>
                        <Button
                          type="button"
                          variant="ghost"
                          size="sm"
+                         className="w-full min-w-0 px-2"
+                         onClick={(event) => {
+                           event.stopPropagation();
+                           void exportPortableBoard(p);
+                         }}
+                         title="Export portable RefFlow package"
+                         data-export-refflow-package={p.id}
+                       >
+                         <PackageOpen className="size-3.5"/><span className="min-w-0 truncate">Package</span>
+                       </Button>
+                       <Button
+                         type="button"
+                         variant="ghost"
+                         size="sm"
+                         className="w-full min-w-0 px-2"
                          onClick={(e) => {
                            e.stopPropagation();
                            exportBoard(p);
                          }}
                          title="Export to Folder"
                        >
-                         <Download className="size-3.5"/><span>Export</span>
+                         <Download className="size-3.5"/><span className="min-w-0 truncate">Export</span>
                        </Button>
                        <Button
                          type="button"
                          variant="secondary"
                          size="sm"
+                         className="w-full min-w-0 px-2"
                          onClick={(e) => {
                            e.stopPropagation();
                            setManagingProjectId(p.id);
                          }}
                        >
-                         Edit Content
+                         <span className="min-w-0 truncate">Edit Content</span>
                        </Button>
                      </div>
                    </div>
                 </div>
               ))}
-              <div 
-                onClick={() => { void createNewProjectBoard(); }}
-                className="group flex min-h-[220px] cursor-pointer items-center justify-center rounded-2xl border border-dashed border-border bg-surface-elevated/25 p-5 transition-all duration-200 hover:-translate-y-0.5 hover:border-primary/45 hover:bg-primary/5"
-              >
-                <div className="flex flex-col items-center gap-3 text-muted-foreground transition-colors group-hover:text-primary">
-                  <div className="flex size-11 items-center justify-center rounded-2xl border border-border bg-card shadow-sm transition-transform duration-200 group-hover:scale-105 group-hover:border-primary/30">
-                    <Plus className="size-5" />
-                  </div>
-                  <div className="text-center">
-                    <div className="text-sm font-semibold tracking-tight text-foreground">New Board</div>
-                    <div className="mt-1 text-[10px] text-muted-foreground">Create a fresh visual workspace</div>
-                  </div>
+              {!normalizedBoardSearch && (
+                <>
+                  <button
+                    type="button"
+                    onClick={() => { void createNewProjectBoard(); }}
+                    className="group flex min-h-[220px] cursor-pointer items-center justify-center rounded-2xl border border-dashed border-border bg-surface-elevated/25 p-5 transition-all duration-200 hover:-translate-y-0.5 hover:border-primary/45 hover:bg-primary/5"
+                  >
+                    <div className="flex flex-col items-center gap-3 text-muted-foreground transition-colors group-hover:text-primary">
+                      <div className="flex size-11 items-center justify-center rounded-2xl border border-border bg-card shadow-sm transition-transform duration-200 group-hover:scale-105 group-hover:border-primary/30">
+                        <Plus className="size-5" />
+                      </div>
+                      <div className="text-center">
+                        <div className="text-sm font-semibold tracking-tight text-foreground">New Board</div>
+                        <div className="mt-1 text-[10px] text-muted-foreground">Create a fresh visual workspace</div>
+                      </div>
+                    </div>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => { void createNewProjectBoard('brand-kit'); }}
+                    className="group flex min-h-[220px] cursor-pointer items-center justify-center rounded-2xl border border-dashed border-primary/30 bg-primary/5 p-5 transition-all duration-200 hover:-translate-y-0.5 hover:border-primary/60 hover:bg-primary/10"
+                    data-brand-kit-template-card
+                  >
+                    <div className="flex flex-col items-center gap-3 text-primary">
+                      <div className="flex size-11 items-center justify-center rounded-2xl border border-primary/25 bg-primary/12 shadow-sm transition-transform duration-200 group-hover:scale-105">
+                        <SwatchBook className="size-5" />
+                      </div>
+                      <div className="text-center">
+                        <div className="text-sm font-semibold tracking-tight text-foreground">New Brand Kit</div>
+                        <div className="mt-1 max-w-48 text-[10px] leading-4 text-muted-foreground">Moodboard, guidelines, logos, colors, typography, assets, and templates</div>
+                      </div>
+                    </div>
+                  </button>
+                </>
+              )}
+              {normalizedBoardSearch && filteredProjects.length === 0 && (
+                <div className="col-span-full rounded-2xl border border-dashed border-border bg-surface-elevated/25 px-6 py-14 text-center">
+                  <Search className="mx-auto size-5 text-primary" />
+                  <div className="mt-3 text-sm font-semibold text-foreground">No board or asset matches “{boardSearchQuery.trim()}”</div>
+                  <button type="button" onClick={() => setBoardSearchQuery('')} className="mt-2 text-xs text-primary hover:underline">Clear search</button>
                 </div>
-              </div>
+              )}
             </div>
           ) : (
             (() => {
@@ -7650,9 +8791,34 @@ export default function App() {
                 setManagingProjectId(null);
                 return null;
               }
+              const folders = [...(p.folders || [])].sort((left, right) => left.order - right.order);
+              const selectedFolder = folders.find(folder => folder.id === managerFolderFilter);
+              const matchesManagerFolder = (folderId?: string) => managerFolderFilter === 'all'
+                || (managerFolderFilter === 'unassigned' ? !folderId : folderId === managerFolderFilter);
+              const matchesManagerSearch = (...values: unknown[]) => !normalizedBoardSearch
+                || values.some(value => String(value || '').toLowerCase().includes(normalizedBoardSearch));
+              const filteredMedia = (p.floatingImages || []).filter((item, index) => matchesManagerFolder(item.folderId) && matchesManagerSearch(getMediaDisplayName(item, index)));
+              const filteredNotes = (p.floatingNotes || []).filter((item, index) => matchesManagerFolder(item.folderId) && matchesManagerSearch(getNoteDisplayName(item, index), item.text));
+              const filteredSketches = (p.floatingSketches || []).filter((item, index) => matchesManagerFolder(item.folderId) && matchesManagerSearch(getSketchDisplayName(item, index)));
+              const filteredAssets = (p.designAssets || []).filter(item => matchesManagerFolder(item.folderId) && matchesManagerSearch(getDesignAssetDisplayName(item), item.fileName, item.kind));
+              const colorsFolder = folders.find(folder => folder.name === 'Colors');
+              const typographyFolder = folders.find(folder => folder.name === 'Typography');
+              const logoFolder = folders.find(folder => folder.name === 'Logos');
+              const allBrandImages = (p.floatingImages || []).filter(media => (media.type || 'image') === 'image');
+              const logoFolderImages = allBrandImages.filter(media => media.folderId === logoFolder?.id);
+              const brandLogoSources = logoFolderImages.length > 0 ? logoFolderImages : allBrandImages;
+              const showBrandColors = p.boardTemplate === 'brand-kit'
+                && (managerFolderFilter === 'all' || managerFolderFilter === colorsFolder?.id)
+                && (!normalizedBoardSearch || (p.brandColors || []).some(color => matchesManagerSearch(color.name, color.hex)) || matchesManagerSearch('Colors'));
+              const showBrandTypography = p.boardTemplate === 'brand-kit'
+                && (managerFolderFilter === 'all' || managerFolderFilter === typographyFolder?.id)
+                && (!normalizedBoardSearch || (p.brandTypography || []).some(style => matchesManagerSearch(style.name, style.fontFamily, style.sampleText)) || matchesManagerSearch('Typography'));
+              const targetFolderId = managerFolderFilter !== 'all' && managerFolderFilter !== 'unassigned'
+                ? managerFolderFilter
+                : undefined;
               return (
                 <div className="rf-card mx-auto flex w-full max-w-6xl flex-col space-y-7 p-6 pb-12">
-                  <div className="flex items-center justify-between">
+                  <div className="sticky top-0 z-20 -mx-6 -mt-6 flex items-center justify-between rounded-t-2xl border-b border-border bg-surface/90 px-6 py-4 shadow-[0_10px_30px_rgba(0,0,0,0.16)] backdrop-blur-xl">
                      <div className="flex items-center space-x-4">
                        <ToolbarButton label="Back to all boards" tooltipSide="bottom" onClick={() => setManagingProjectId(null)}>
                           <ChevronLeft className="size-4"/>
@@ -7662,9 +8828,19 @@ export default function App() {
                          <p className="mt-1 text-xs text-muted-foreground">Manage the references saved in {p.name}. Drag a card grip to change its order.</p>
                        </div>
                      </div>
-                     <div className="flex space-x-3">
+                     <div className="flex flex-wrap justify-end gap-2">
+                       <Button
+                         type="button"
+                         variant="outline"
+                         size="sm"
+                         onClick={() => { void exportPortableBoard(p); }}
+                         title="Export this board as a portable RefFlow package"
+                         data-export-current-refflow-package
+                       >
+                         <PackageOpen className="size-4" /><span>Export Package</span>
+                       </Button>
                        <label className="flex h-9 cursor-pointer items-center gap-2 rounded-xl border border-primary/70 bg-primary px-3 text-xs font-medium text-white shadow-[0_8px_24px_rgba(94,107,255,0.2)] transition-all hover:-translate-y-px hover:bg-primary/90">
-                          <Plus className="w-4 h-4"/><span className="text-sm font-medium pr-1">Add Media</span>
+                          <Plus className="w-4 h-4"/><span className="pr-1 text-sm font-medium">Add Files</span>
                          <input 
                             type="file" 
                             accept={SUPPORTED_MEDIA_ACCEPT}
@@ -7677,16 +8853,25 @@ export default function App() {
                                   const projectWithDirectory = await ensureProjectLocalDirectory(p);
                                   const mediaFiles = files.filter(file => getImportedMediaType(file) !== null);
                                   const base64Images = await Promise.all(mediaFiles.map(fileToBase64));
-                                  const newFloatingImages = createFloatingMediaItems(mediaFiles, base64Images, { x: 100 + Math.random() * 50, y: 100 + Math.random() * 50 });
+                                  const newFloatingImages = createFloatingMediaItems(
+                                    mediaFiles,
+                                    base64Images,
+                                    { x: 100 + Math.random() * 50, y: 100 + Math.random() * 50 },
+                                    false,
+                                    targetFolderId,
+                                    projectWithDirectory
+                                  );
                                   const updatedFloatingImages = [...(projectWithDirectory.floatingImages || []), ...newFloatingImages];
                                   await updateProject(p.id, { floatingImages: updatedFloatingImages });
                                   if (projectWithDirectory.directoryPath) {
                                     await syncBoardToPath({ ...projectWithDirectory, floatingImages: updatedFloatingImages }, projectWithDirectory.directoryPath);
                                   }
-                                  setProjects(await getProjects());
                                   if (p.id === activeProjectId) setFloatingImages(updatedFloatingImages);
+                                  await importDesignAssetFiles(files, { ...projectWithDirectory, floatingImages: updatedFloatingImages }, targetFolderId);
+                                  setProjects(await getProjects());
                                 } catch (error) {
-                                  console.error("Failed to add image", error);
+                                  console.error("Failed to add files", error);
+                                  setDragError(error instanceof Error ? error.message : String(error));
                                 }
                               }
                             }} 
@@ -7699,6 +8884,7 @@ export default function App() {
                          onClick={async () => {
                             const newNote: FloatingNote = {
                               id: Math.random().toString(36).substr(2, 9),
+                              folderId: targetFolderId || folders.find(folder => folder.name === 'Notes')?.id,
                               name: `Note ${(p.floatingNotes?.length || 0) + 1}`,
                               text: 'New Note',
                               x: 100 + Math.random() * 50, 
@@ -7717,16 +8903,345 @@ export default function App() {
                        >
                          <Plus className="w-4 h-4"/><span className="text-sm">Add Note</span>
                        </Button>
+                       <Button
+                         type="button"
+                         variant="secondary"
+                         size="sm"
+                         onClick={async () => {
+                           const newSketch: FloatingSketch = {
+                             id: Math.random().toString(36).slice(2, 11),
+                             folderId: targetFolderId || folders.find(folder => folder.name === 'Sketches')?.id,
+                             name: `Sketch ${(p.floatingSketches?.length || 0) + 1}`,
+                             lines: [],
+                             x: 120 + Math.random() * 50,
+                             y: 120 + Math.random() * 50,
+                             width: 300,
+                             height: 300,
+                             backgroundColor: '#ffffff',
+                             isLocked: false,
+                             isCollapsed: true
+                           };
+                           const updatedSketches = [...(p.floatingSketches || []), newSketch];
+                           await persistProjectMetadata(p, { floatingSketches: updatedSketches });
+                           if (p.id === activeProjectId) setFloatingSketches(updatedSketches);
+                         }}
+                       >
+                         <PenTool className="size-4" /><span className="text-sm">Add Sketch</span>
+                       </Button>
                      </div>
+                  </div>
+
+                  {folders.length > 0 && (
+                    <div className="flex flex-wrap items-center gap-2 rounded-2xl border border-border bg-surface-elevated/35 p-2.5" data-board-folder-filter>
+                      <button
+                        type="button"
+                        onClick={() => setManagerFolderFilter('all')}
+                        className={`rounded-xl px-3 py-2 text-[10px] font-semibold transition-colors ${managerFolderFilter === 'all' ? 'bg-primary text-white shadow-[0_8px_20px_rgba(94,107,255,0.22)]' : 'text-muted-foreground hover:bg-card hover:text-foreground'}`}
+                      >
+                        All
+                      </button>
+                      {folders.map(folder => (
+                        <button
+                          key={folder.id}
+                          type="button"
+                          onClick={() => setManagerFolderFilter(folder.id)}
+                          className={`rounded-xl px-3 py-2 text-[10px] font-semibold transition-colors ${managerFolderFilter === folder.id ? 'bg-primary text-white shadow-[0_8px_20px_rgba(94,107,255,0.22)]' : 'text-muted-foreground hover:bg-card hover:text-foreground'}`}
+                          data-board-folder={folder.name}
+                        >
+                          {folder.name}
+                        </button>
+                      ))}
+                      <button
+                        type="button"
+                        onClick={() => setManagerFolderFilter('unassigned')}
+                        className={`rounded-xl px-3 py-2 text-[10px] font-semibold transition-colors ${managerFolderFilter === 'unassigned' ? 'bg-primary text-white shadow-[0_8px_20px_rgba(94,107,255,0.22)]' : 'text-muted-foreground hover:bg-card hover:text-foreground'}`}
+                      >
+                        Unsorted
+                      </button>
+                      <span className="ml-auto pr-2 text-[9px] text-muted-foreground">Adding files to {selectedFolder?.name || (managerFolderFilter === 'unassigned' ? 'Unsorted' : 'the board')}</span>
+                    </div>
+                  )}
+
+                  {showBrandColors && (
+                    <section className="rounded-2xl border border-border bg-surface-elevated/25 p-5" data-brand-colors-panel>
+                      <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
+                        <div>
+                          <div className="flex items-center gap-2 text-sm font-semibold text-foreground"><SwatchBook className="size-4 text-primary" /> Brand colors</div>
+                          <p className="mt-1 text-[10px] text-muted-foreground">Choose visually or paste a hex code. Click a saved swatch to copy it.</p>
+                        </div>
+                        <div className="grid flex-1 grid-cols-[44px_minmax(110px,1fr)_105px_120px_auto] gap-2 lg:max-w-3xl">
+                          <input
+                            type="color"
+                            value={normalizeHexColor(brandColorDraft.hex) || '#5E6BFF'}
+                            onChange={(event) => setBrandColorDraft(current => ({ ...current, hex: event.target.value.toUpperCase() }))}
+                            className="h-10 w-11 cursor-pointer rounded-xl border border-border bg-card p-1"
+                            aria-label="Choose a brand color"
+                          />
+                          <input
+                            value={brandColorDraft.name}
+                            onChange={(event) => setBrandColorDraft(current => ({ ...current, name: event.target.value }))}
+                            onKeyDown={(event) => { if (event.key === 'Enter') void addBrandColor(p); }}
+                            placeholder="Primary, Accent…"
+                            className="h-10 min-w-0 rounded-xl border border-border bg-card px-3 text-xs text-foreground outline-none focus:border-primary"
+                            aria-label="Brand color name"
+                          />
+                          <select
+                            value={brandColorDraft.group}
+                            onChange={(event) => setBrandColorDraft(current => ({ ...current, group: event.target.value as 'primary' | 'secondary' }))}
+                            className="h-10 rounded-xl border border-border bg-card px-3 text-xs text-foreground outline-none focus:border-primary"
+                            aria-label="Brand color group"
+                          >
+                            <option value="primary">Primary</option>
+                            <option value="secondary">Secondary</option>
+                          </select>
+                          <input
+                            value={brandColorDraft.hex}
+                            onChange={(event) => setBrandColorDraft(current => ({ ...current, hex: event.target.value }))}
+                            onKeyDown={(event) => { if (event.key === 'Enter') void addBrandColor(p); }}
+                            placeholder="#5E6BFF"
+                            className="h-10 min-w-0 rounded-xl border border-border bg-card px-3 font-mono text-xs uppercase text-foreground outline-none focus:border-primary"
+                            aria-label="Brand color hex code"
+                          />
+                          <Button type="button" variant="primary" size="md" onClick={() => { void addBrandColor(p); }} data-add-brand-color>
+                            <Plus className="size-3.5" /> Add
+                          </Button>
+                        </div>
+                      </div>
+                      <div className="mt-4 rounded-2xl border border-border bg-card/65 p-3" data-logo-palette-extractor>
+                        <div className="flex flex-col gap-3 lg:flex-row lg:items-center">
+                          <div className="min-w-0 flex-1">
+                            <div className="text-[10px] font-semibold text-foreground">Extract from a logo</div>
+                            <div className="mt-0.5 text-[9px] text-muted-foreground">Logo-section images appear first; other board images remain available as a fallback.</div>
+                          </div>
+                          <select
+                            value={brandLogoSources.some(source => source.id === brandLogoSourceId) ? brandLogoSourceId : (brandLogoSources[0]?.id || '')}
+                            onChange={(event) => setBrandLogoSourceId(event.target.value)}
+                            disabled={brandLogoSources.length === 0}
+                            className="h-9 min-w-48 rounded-xl border border-border bg-background px-3 text-[10px] text-foreground outline-none focus:border-primary disabled:opacity-50"
+                            aria-label="Choose logo for color extraction"
+                          >
+                            {brandLogoSources.length === 0 ? <option value="">No logo images yet</option> : brandLogoSources.map((source, index) => <option key={source.id} value={source.id}>{getMediaDisplayName(source, index)}</option>)}
+                          </select>
+                          <Button type="button" variant="secondary" size="sm" disabled={brandLogoSources.length === 0 || isExtractingBrandPalette} onClick={() => { void extractBrandPaletteFromLogo(p, brandLogoSourceId || brandLogoSources[0]?.id); }} data-extract-logo-colors>
+                            {isExtractingBrandPalette ? <Loader2 className="size-3.5 animate-spin" /> : <Palette className="size-3.5" />}
+                            Extract
+                          </Button>
+                        </div>
+                        {extractedBrandPalette.projectId === p.id && extractedBrandPalette.colors.length > 0 && (
+                          <div className="mt-3 flex flex-wrap items-center gap-2" data-extracted-logo-palette>
+                            {extractedBrandPalette.colors.map(color => <div key={color} className="size-8 rounded-lg border border-white/15 shadow-sm" style={{ backgroundColor: color }} title={color} />)}
+                            <span className="ml-auto text-[9px] text-muted-foreground">Add as {brandColorDraft.group}</span>
+                            <Button type="button" variant="primary" size="sm" onClick={() => { void addExtractedBrandPalette(p); }} data-add-extracted-logo-palette>
+                              <Plus className="size-3.5" /> Add palette
+                            </Button>
+                          </div>
+                        )}
+                      </div>
+                      {(p.brandColors || []).length === 0 ? (
+                        <div className="mt-5 rounded-2xl border border-dashed border-border px-5 py-8 text-center text-xs text-muted-foreground">Add the first approved brand color.</div>
+                      ) : (
+                        <div className="mt-5 space-y-5">
+                          {([
+                            { id: 'primary', label: 'Primary colors' },
+                            { id: 'secondary', label: 'Secondary colors' }
+                          ] as const).map(group => {
+                            const groupColors = (p.brandColors || []).filter(color => (color.group || 'primary') === group.id && matchesManagerSearch(color.name, color.hex, group.label));
+                            return (
+                              <div key={group.id} data-brand-color-group={group.id}>
+                                <div className="mb-2 flex items-center justify-between">
+                                  <div className="text-[10px] font-semibold uppercase tracking-[0.1em] text-secondary">{group.label}</div>
+                                  <div className="text-[9px] text-muted-foreground">{groupColors.length}</div>
+                                </div>
+                                {groupColors.length === 0 ? (
+                                  <div className="rounded-xl border border-dashed border-border px-4 py-5 text-center text-[10px] text-muted-foreground">No {group.label.toLowerCase()} yet.</div>
+                                ) : (
+                                  <div className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-4">
+                                    {groupColors.map(color => (
+                                      <div key={color.id} className="overflow-hidden rounded-2xl border border-border bg-card" data-brand-color={color.hex}>
+                                        <button type="button" className="flex h-20 w-full items-end justify-end p-2 transition-transform active:scale-[0.99]" style={{ backgroundColor: color.hex }} onClick={() => { void copyPaletteColor(color.hex); }} title={`Copy ${color.hex}`}>
+                                          <span className="rounded-lg bg-black/55 px-2 py-1 font-mono text-[9px] text-white backdrop-blur-sm">{copiedColor === color.hex ? 'Copied' : color.hex}</span>
+                                        </button>
+                                        <div className="grid grid-cols-[1fr_86px_auto] gap-1.5 p-2">
+                                          <input defaultValue={color.name} onBlur={(event) => { if (event.target.value.trim() !== color.name) void updateBrandColor(p, color.id, { name: event.target.value.trim() || color.name }); }} className="h-8 min-w-0 rounded-lg border border-border bg-surface-elevated px-2 text-[10px] text-foreground outline-none focus:border-primary" aria-label={`Rename ${color.name}`} />
+                                          <input defaultValue={color.hex} onBlur={(event) => { const next = normalizeHexColor(event.target.value); if (next && next !== color.hex) void updateBrandColor(p, color.id, { hex: next }); else event.target.value = color.hex; }} className="h-8 min-w-0 rounded-lg border border-border bg-surface-elevated px-2 font-mono text-[9px] uppercase text-foreground outline-none focus:border-primary" aria-label={`Edit ${color.name} hex code`} />
+                                          <ToolbarButton label={`Remove ${color.name}`} danger onClick={() => { void removeBrandColor(p, color.id); }} className="size-8"><Trash2 className="size-3.5" /></ToolbarButton>
+                                          <select value={color.group || 'primary'} onChange={(event) => { void updateBrandColor(p, color.id, { group: event.target.value as 'primary' | 'secondary' }); }} className="col-span-full h-8 rounded-lg border border-border bg-surface-elevated px-2 text-[9px] text-foreground outline-none focus:border-primary" aria-label={`Move ${color.name} color group`}>
+                                            <option value="primary">Primary</option>
+                                            <option value="secondary">Secondary</option>
+                                          </select>
+                                          <div className="col-span-full grid grid-cols-2 gap-1.5" data-brand-color-formats>
+                                            {getBrandColorFormats(color.hex).map(format => {
+                                              const copyKey = `${color.id}:${format.label}`;
+                                              return (
+                                                <button
+                                                  key={format.label}
+                                                  type="button"
+                                                  onClick={() => { void copyBrandColorInfo(format.value, copyKey); }}
+                                                  className="min-w-0 rounded-lg border border-border bg-background/55 px-2 py-1.5 text-left transition-colors hover:border-primary/40 hover:bg-primary/8"
+                                                  title={`Copy ${format.value}`}
+                                                  aria-label={`Copy ${color.name} ${format.label}`}
+                                                >
+                                                  <span className="block text-[7px] font-bold uppercase tracking-[0.08em] text-primary">{copiedColor === copyKey ? 'Copied' : format.label}</span>
+                                                  <span className="mt-0.5 block truncate font-mono text-[8px] text-secondary">{format.value}</span>
+                                                </button>
+                                              );
+                                            })}
+                                          </div>
+                                        </div>
+                                      </div>
+                                    ))}
+                                  </div>
+                                )}
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </section>
+                  )}
+
+                  {showBrandTypography && (
+                    <section className="rounded-2xl border border-border bg-surface-elevated/25 p-5" data-brand-typography-panel>
+                      <div className="flex flex-wrap items-start justify-between gap-3">
+                        <div>
+                          <div className="flex items-center gap-2 text-sm font-semibold text-foreground"><Type className="size-4 text-primary" /> Brand typography</div>
+                          <p className="mt-1 text-[10px] text-muted-foreground">Choose a font already installed in Windows, type any family manually, or keep the matching font file in this Brand Kit.</p>
+                        </div>
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          onClick={() => { void loadInstalledWindowsFonts(installedFontFamilies.length > 0); }}
+                          disabled={isLoadingInstalledFonts}
+                          data-load-installed-fonts
+                        >
+                          {isLoadingInstalledFonts ? <Loader2 className="size-3.5 animate-spin" /> : <Monitor className="size-3.5" />}
+                          <span>{installedFontFamilies.length > 0 ? `${installedFontFamilies.length} Windows fonts` : 'Load Windows fonts'}</span>
+                        </Button>
+                      </div>
+                      {installedFontFamilies.length > 0 && (
+                        <label className="mt-4 flex flex-col gap-2 rounded-xl border border-primary/20 bg-primary/5 p-3 sm:flex-row sm:items-center" data-installed-font-picker>
+                          <span className="shrink-0 text-[10px] font-semibold text-secondary">Installed font</span>
+                          <select
+                            value={installedFontFamilies.includes(brandTypographyDraft.fontFamily) ? brandTypographyDraft.fontFamily : ''}
+                            onChange={(event) => setBrandTypographyDraft(current => ({ ...current, fontFamily: event.target.value || current.fontFamily }))}
+                            className="h-9 min-w-0 flex-1 rounded-lg border border-border bg-card px-3 text-xs text-foreground outline-none focus:border-primary"
+                            aria-label="Choose installed Windows font"
+                          >
+                            <option value="">Choose from {installedFontFamilies.length} installed fonts…</option>
+                            {installedFontFamilies.map(family => <option key={family} value={family} data-installed-font-family={family}>{family}</option>)}
+                          </select>
+                        </label>
+                      )}
+                      {installedFontsError && <p className="mt-3 text-[10px] text-warning" role="status">{installedFontsError}</p>}
+                      <datalist id="refflow-installed-font-families">
+                        {installedFontFamilies.map(family => <option key={family} value={family} />)}
+                      </datalist>
+                      <div className="mt-4 grid grid-cols-1 gap-2 md:grid-cols-[130px_1fr_110px_1.5fr_auto]">
+                        <input value={brandTypographyDraft.name} onChange={(event) => setBrandTypographyDraft(current => ({ ...current, name: event.target.value }))} placeholder="Heading" className="h-10 rounded-xl border border-border bg-card px-3 text-xs text-foreground outline-none focus:border-primary" aria-label="Typography role" />
+                        <input value={brandTypographyDraft.fontFamily} onChange={(event) => setBrandTypographyDraft(current => ({ ...current, fontFamily: event.target.value }))} placeholder="Inter" className="h-10 rounded-xl border border-border bg-card px-3 text-xs text-foreground outline-none focus:border-primary" aria-label="Font family" list="refflow-installed-font-families" />
+                        <select value={brandTypographyDraft.weight} onChange={(event) => setBrandTypographyDraft(current => ({ ...current, weight: Number(event.target.value) }))} className="h-10 rounded-xl border border-border bg-card px-3 text-xs text-foreground outline-none focus:border-primary" aria-label="Font weight">
+                          {[300, 400, 500, 600, 700, 800, 900].map(weight => <option key={weight} value={weight}>{weight}</option>)}
+                        </select>
+                        <input value={brandTypographyDraft.sampleText} onChange={(event) => setBrandTypographyDraft(current => ({ ...current, sampleText: event.target.value }))} onKeyDown={(event) => { if (event.key === 'Enter') void addBrandTypographyStyle(p); }} placeholder="Sample text" className="h-10 rounded-xl border border-border bg-card px-3 text-xs text-foreground outline-none focus:border-primary" aria-label="Typography sample text" />
+                        <Button type="button" variant="primary" size="md" onClick={() => { void addBrandTypographyStyle(p); }} data-add-brand-typography><Plus className="size-3.5" /> Add</Button>
+                      </div>
+                      {(p.brandTypography || []).length === 0 ? (
+                        <div className="mt-5 rounded-2xl border border-dashed border-border px-5 py-8 text-center text-xs text-muted-foreground">Add a heading, body, or display style.</div>
+                      ) : (
+                        <div className="mt-5 grid gap-3 lg:grid-cols-2">
+                          {(p.brandTypography || []).filter(style => matchesManagerSearch(style.name, style.fontFamily, style.sampleText)).map(style => (
+                            <div key={style.id} className="rounded-2xl border border-border bg-card p-4" data-brand-typography={style.name}>
+                              <div className="flex items-start gap-3">
+                                <div className="min-w-0 flex-1">
+                                  <div className="grid grid-cols-[130px_1fr_90px] gap-2">
+                                    <input defaultValue={style.name} onBlur={(event) => { if (event.target.value.trim() !== style.name) void updateBrandTypographyStyle(p, style.id, { name: event.target.value.trim() || style.name }); }} className="h-8 min-w-0 rounded-lg border border-border bg-surface-elevated px-2 text-[10px] font-semibold text-foreground outline-none focus:border-primary" aria-label={`Edit ${style.name} role`} />
+                                    <input defaultValue={style.fontFamily} onBlur={(event) => { if (event.target.value.trim() !== style.fontFamily) void updateBrandTypographyStyle(p, style.id, { fontFamily: event.target.value.trim() || style.fontFamily }); }} className="h-8 min-w-0 rounded-lg border border-border bg-surface-elevated px-2 text-[10px] text-foreground outline-none focus:border-primary" aria-label={`Edit ${style.name} font family`} list="refflow-installed-font-families" />
+                                    <select defaultValue={style.weight} onChange={(event) => { void updateBrandTypographyStyle(p, style.id, { weight: Number(event.target.value) }); }} className="h-8 rounded-lg border border-border bg-surface-elevated px-2 text-[10px] text-foreground outline-none focus:border-primary" aria-label={`Edit ${style.name} weight`}>
+                                      {[300, 400, 500, 600, 700, 800, 900].map(weight => <option key={weight} value={weight}>{weight}</option>)}
+                                    </select>
+                                  </div>
+                                  <input
+                                    defaultValue={style.sampleText}
+                                    onBlur={(event) => { if (event.target.value.trim() !== style.sampleText) void updateBrandTypographyStyle(p, style.id, { sampleText: event.target.value.trim() || style.sampleText }); }}
+                                    className="mt-3 h-10 w-full min-w-0 rounded-lg border border-border bg-surface-elevated px-3 text-sm text-foreground outline-none focus:border-primary"
+                                    style={{ fontFamily: style.fontFamily, fontWeight: style.weight }}
+                                    aria-label={`Edit ${style.name} sample`}
+                                  />
+                                </div>
+                                <ToolbarButton label={`Remove ${style.name}`} danger onClick={() => { void removeBrandTypographyStyle(p, style.id); }}><Trash2 className="size-3.5" /></ToolbarButton>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </section>
+                  )}
+
+                  <div>
+                    <h3 className="rf-kicker mb-4 border-b border-border pb-3">Design & font files ({filteredAssets.length})</h3>
+                    {filteredAssets.length === 0 ? (
+                      <p className="rounded-2xl border border-dashed border-border bg-surface-elevated/30 p-6 text-center text-sm text-muted-foreground">No matching Adobe or font files in this section.</p>
+                    ) : (
+                      <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5">
+                        {filteredAssets.map(asset => {
+                          const assetLabel = getDesignAssetDisplayName(asset);
+                          return (
+                            <div
+                              key={asset.id}
+                              className={`rf-card rf-preview-card group relative aspect-square overflow-hidden bg-[radial-gradient(circle_at_35%_20%,rgba(94,107,255,0.22),transparent_58%)] ${previewReorderTarget === getPreviewReorderKey('board', p.id, 'asset', asset.id) ? 'ring-2 ring-primary ring-offset-2 ring-offset-background' : ''}`}
+                              onDoubleClick={() => { void openDesignAsset(asset, p); }}
+                              onDragEnter={(event) => allowPreviewReorder(event, 'board', p.id, 'asset', asset.id)}
+                              onDragOver={(event) => allowPreviewReorder(event, 'board', p.id, 'asset', asset.id)}
+                              onDrop={(event) => { void finishPreviewReorder(event, 'board', p.id, 'asset', asset.id, p); }}
+                              data-board-design-asset={asset.kind}
+                            >
+                              <div className="flex h-full flex-col items-center justify-center gap-2 px-3 pb-8 text-center">
+                                <div className="flex size-14 items-center justify-center rounded-2xl border border-primary/25 bg-primary/12 text-sm font-bold uppercase tracking-[0.08em] text-primary">{asset.kind}</div>
+                                <div className="text-[9px] text-muted-foreground">{formatFileSize(asset.size)}</div>
+                                <div className="flex gap-1.5">
+                                  <button type="button" onClick={(event) => { event.stopPropagation(); void openDesignAsset(asset, p); }} className="rounded-lg border border-border bg-card px-2 py-1 text-[9px] font-semibold text-secondary hover:border-primary/40 hover:text-primary"><ExternalLink className="mr-1 inline size-3" />Open</button>
+                                  <button type="button" onClick={(event) => { event.stopPropagation(); void revealDesignAsset(asset, p); }} className="rounded-lg border border-border bg-card px-2 py-1 text-[9px] font-semibold text-secondary hover:border-primary/40 hover:text-primary"><FolderOpen className="mr-1 inline size-3" />Folder</button>
+                                </div>
+                              </div>
+                              {folders.length > 0 && (
+                                <select
+                                  value={asset.folderId || ''}
+                                  onChange={(event) => { event.stopPropagation(); void assignBoardItemToFolder(p, 'asset', asset.id, event.target.value || undefined); }}
+                                  onMouseDown={(event) => event.stopPropagation()}
+                                  className="absolute left-2 top-2 z-30 h-7 max-w-[110px] rounded-lg border border-white/10 bg-black/65 px-2 text-[8px] text-white outline-none backdrop-blur-md focus:border-primary"
+                                  aria-label={`Move ${assetLabel} to section`}
+                                >
+                                  <option value="">Unsorted</option>
+                                  {folders.map(folder => <option key={folder.id} value={folder.id}>{folder.name}</option>)}
+                                </select>
+                              )}
+                              <div className="pill-preview-caption" onMouseDown={(event) => event.stopPropagation()}>
+                                {editingAssetId === asset.id && editingAssetProjectId === p.id ? (
+                                  <input autoFocus value={editingAssetName} onChange={(event) => setEditingAssetName(event.target.value)} onBlur={() => { void commitAssetRename(asset, p); }} onKeyDown={(event) => { event.stopPropagation(); if (event.key === 'Enter') event.currentTarget.blur(); if (event.key === 'Escape') cancelAssetRename(); }} className="h-6 w-full rounded-md border border-white/20 bg-black/25 px-2 text-center text-[9px] font-medium text-white outline-none focus:border-primary" aria-label={`Rename ${assetLabel}`} data-board-asset-name-input />
+                                ) : (
+                                  <button type="button" onClick={(event) => { event.stopPropagation(); beginAssetRename(asset, p.id); }} className="block w-full truncate rounded text-[9px] font-medium text-white/95 outline-none hover:text-primary" title="Click to rename design asset" data-board-asset-name>{assetLabel}</button>
+                                )}
+                              </div>
+                              <div className="absolute right-2 top-2 z-30 flex gap-1 opacity-0 transition-opacity group-hover:opacity-100">
+                                <button type="button" draggable onDragStart={(event) => beginPreviewReorder(event, 'board', p.id, 'asset', asset.id)} onDragEnd={endPreviewReorder} onMouseDown={(event) => event.stopPropagation()} onKeyDown={(event) => movePreviewWithKeyboard(event, 'board', p.id, 'asset', asset.id, p)} className="cursor-grab rounded-lg border border-white/10 bg-black/65 p-1.5 text-white backdrop-blur-md hover:bg-primary" aria-label={`Reorder ${assetLabel}`} data-preview-reorder-handle data-reorder-kind="asset"><GripVertical className="size-4" /></button>
+                                <button type="button" draggable onDragStart={(event) => beginDesignAssetDrag(event, asset, p)} onMouseDown={(event) => event.stopPropagation()} className="cursor-grab rounded-lg border border-white/10 bg-black/65 p-1.5 text-white backdrop-blur-md hover:bg-primary" title="Drag original file into another app" aria-label={`Drag ${assetLabel} into another app`}><FolderInput className="size-4" /></button>
+                                <button type="button" onClick={async (event) => { event.stopPropagation(); const nextAssets = (p.designAssets || []).filter(item => item.id !== asset.id); await persistProjectMetadata(p, { designAssets: nextAssets }); if (p.id === activeProjectId) setDesignAssets(nextAssets); }} className="rounded-lg border border-white/10 bg-black/65 p-1.5 text-white backdrop-blur-md hover:bg-danger" title="Remove from board (keeps the local file)"><Trash2 className="size-4" /></button>
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
                   </div>
                   
                   <div>
-                    <h3 className="rf-kicker mb-4 border-b border-border pb-3">Media ({p.floatingImages?.length || 0})</h3>
-                    {p.floatingImages?.length === 0 ? (
-                      <p className="rounded-2xl border border-dashed border-border bg-surface-elevated/30 p-6 text-center text-sm text-muted-foreground">No media in this board yet.</p>
+                    <h3 className="rf-kicker mb-4 border-b border-border pb-3">Media ({filteredMedia.length})</h3>
+                    {filteredMedia.length === 0 ? (
+                      <p className="rounded-2xl border border-dashed border-border bg-surface-elevated/30 p-6 text-center text-sm text-muted-foreground">No matching media in this section.</p>
                     ) : (
                       <div className="grid grid-cols-2 flex-wrap gap-4 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5">
-                         {p.floatingImages?.map((img, mediaIndex) => {
+                         {filteredMedia.map((img, mediaIndex) => {
                            const mediaLabel = getMediaDisplayName(img, mediaIndex);
                            return (
                              <div
@@ -7775,6 +9290,18 @@ export default function App() {
                                     </button>
                                   )}
                                 </div>
+                                {folders.length > 0 && (
+                                  <select
+                                    value={img.folderId || ''}
+                                    onChange={(event) => { event.stopPropagation(); void assignBoardItemToFolder(p, 'media', img.id, event.target.value || undefined); }}
+                                    onMouseDown={(event) => event.stopPropagation()}
+                                    className="absolute left-2 top-2 z-30 h-7 max-w-[110px] rounded-lg border border-white/10 bg-black/65 px-2 text-[8px] text-white outline-none backdrop-blur-md focus:border-primary"
+                                    aria-label={`Move ${mediaLabel} to section`}
+                                  >
+                                    <option value="">Unsorted</option>
+                                    {folders.map(folder => <option key={folder.id} value={folder.id}>{folder.name}</option>)}
+                                  </select>
+                                )}
                                 <div className="absolute right-2 top-2 z-30 flex gap-1 opacity-0 transition-opacity group-hover:opacity-100">
                                   <button
                                     type="button"
@@ -7814,12 +9341,12 @@ export default function App() {
                   </div>
 
                   <div>
-                    <h3 className="rf-kicker mb-4 mt-6 border-b border-border pb-3">Notes ({p.floatingNotes?.length || 0})</h3>
-                    {p.floatingNotes?.length === 0 ? (
-                      <p className="rounded-2xl border border-dashed border-border bg-surface-elevated/30 p-6 text-center text-sm text-muted-foreground">No notes in this board yet.</p>
+                    <h3 className="rf-kicker mb-4 mt-6 border-b border-border pb-3">Notes ({filteredNotes.length})</h3>
+                    {filteredNotes.length === 0 ? (
+                      <p className="rounded-2xl border border-dashed border-border bg-surface-elevated/30 p-6 text-center text-sm text-muted-foreground">No matching notes in this section.</p>
                     ) : (
                       <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-4">
-                        {p.floatingNotes?.map((note, noteIndex) => {
+                        {filteredNotes.map((note, noteIndex) => {
                           const noteLabel = getNoteDisplayName(note, noteIndex);
                           return (
                             <div
@@ -7863,6 +9390,18 @@ export default function App() {
                                    </button>
                                  )}
                                </div>
+                               {folders.length > 0 && (
+                                 <select
+                                   value={note.folderId || ''}
+                                   onChange={(event) => { event.stopPropagation(); void assignBoardItemToFolder(p, 'note', note.id, event.target.value || undefined); }}
+                                   onMouseDown={(event) => event.stopPropagation()}
+                                   className="absolute left-2 top-2 z-30 h-7 max-w-[110px] rounded-lg border border-white/10 bg-black/65 px-2 text-[8px] text-white outline-none backdrop-blur-md focus:border-primary"
+                                   aria-label={`Move ${noteLabel} to section`}
+                                 >
+                                   <option value="">Unsorted</option>
+                                   {folders.map(folder => <option key={folder.id} value={folder.id}>{folder.name}</option>)}
+                                 </select>
+                               )}
                                <div className="absolute right-2 top-2 z-30 flex gap-1 opacity-0 transition-opacity group-hover:opacity-100">
                                  <button
                                    type="button"
@@ -7902,12 +9441,12 @@ export default function App() {
                   </div>
 
                   <div>
-                    <h3 className="rf-kicker mb-4 mt-6 border-b border-border pb-3">Sketches ({p.floatingSketches?.length || 0})</h3>
-                    {!p.floatingSketches || p.floatingSketches.length === 0 ? (
-                      <p className="rounded-2xl border border-dashed border-border bg-surface-elevated/30 p-6 text-center text-sm text-muted-foreground">No sketches in this board yet.</p>
+                    <h3 className="rf-kicker mb-4 mt-6 border-b border-border pb-3">Sketches ({filteredSketches.length})</h3>
+                    {filteredSketches.length === 0 ? (
+                      <p className="rounded-2xl border border-dashed border-border bg-surface-elevated/30 p-6 text-center text-sm text-muted-foreground">No matching sketches in this section.</p>
                     ) : (
                       <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-4">
-                        {p.floatingSketches.map((sketch, sketchIndex) => {
+                        {filteredSketches.map((sketch, sketchIndex) => {
                           const sketchLabel = getSketchDisplayName(sketch, sketchIndex);
                           return (
                             <div
@@ -7977,6 +9516,18 @@ export default function App() {
                                   </button>
                                 )}
                               </div>
+                              {folders.length > 0 && (
+                                <select
+                                  value={sketch.folderId || ''}
+                                  onChange={(event) => { event.stopPropagation(); void assignBoardItemToFolder(p, 'sketch', sketch.id, event.target.value || undefined); }}
+                                  onMouseDown={(event) => event.stopPropagation()}
+                                  className="absolute left-2 top-2 z-30 h-7 max-w-[110px] rounded-lg border border-white/10 bg-black/65 px-2 text-[8px] text-white outline-none backdrop-blur-md focus:border-primary"
+                                  aria-label={`Move ${sketchLabel} to section`}
+                                >
+                                  <option value="">Unsorted</option>
+                                  {folders.map(folder => <option key={folder.id} value={folder.id}>{folder.name}</option>)}
+                                </select>
+                              )}
                               <div className="absolute right-2 top-2 z-30 flex gap-1 opacity-0 transition-opacity group-hover:opacity-100">
                                 <button
                                   type="button"

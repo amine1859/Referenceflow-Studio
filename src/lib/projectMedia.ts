@@ -23,6 +23,18 @@ export const getBackgroundMediaFileName = (source: string, index: number) =>
 export const getFloatingMediaFileName = (image: FloatingImage) =>
   `floating_${sanitizeExportStem(image.id)}.${getSavedMediaExtension(image.url, image.type || 'image')}`;
 
+const sanitizeLocalFolderName = (value: string) => String(value || 'Folder')
+  .replace(/[<>:"/\\|?*\u0000-\u001F]/g, '-')
+  .replace(/[. ]+$/g, '')
+  .trim()
+  .slice(0, 80) || 'Folder';
+
+export const getFloatingMediaRelativePath = (project: Pick<Project, 'folders'>, image: FloatingImage) => {
+  const folder = (project.folders || []).find(item => item.id === image.folderId);
+  const folderName = folder ? sanitizeLocalFolderName(folder.name) : 'Unsorted';
+  return `${folderName}/${getFloatingMediaFileName(image)}`;
+};
+
 export const createProjectMediaSnapshot = (project: Pick<Project, 'images' | 'floatingImages'>): ProjectMediaSnapshot => ({
   backgroundSources: [...(project.images || [])],
   floatingSources: (project.floatingImages || []).map(image => ({
@@ -53,7 +65,7 @@ export const createLocalBoardManifest = (project: Project, mediaPrefix: string) 
   images: (project.images || []).map((source, index) => `${mediaPrefix}${getBackgroundMediaFileName(source, index)}`),
   floatingImages: (project.floatingImages || []).map(image => ({
     ...image,
-    url: `${mediaPrefix}${getFloatingMediaFileName(image)}`
+    url: getFloatingMediaRelativePath(project, image)
   })),
   exportedAt: new Date().toISOString()
 });
